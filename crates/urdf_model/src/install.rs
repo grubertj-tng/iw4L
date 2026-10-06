@@ -1,5 +1,6 @@
-//! Puts the imported robot into one match: two stand-in materials, one
-//! catalog XModel and one script model placed in front of a spawn point.
+//! Puts the imported robot into one match: stand-in materials for its
+//! colours, then a script model standing in front of a spawn point and/or a
+//! soldier body the chosen teams wear.
 
 use std::sync::Arc;
 
@@ -14,8 +15,10 @@ use asset_world::{
 use bevy::math::{Quat, Vec3};
 use bevy::prelude::Transform;
 
-use crate::Placement;
+use asset_model::{BodyMeshBuild, SoldierKit, SoldierKits};
+
 use crate::skel::RobotModel;
+use crate::{Config, Placement, body};
 
 /// Map entity ordinals count up from zero and GSC-spawned movers start at
 /// 0x4000_0000; the robot takes an ordinal neither will reach.
@@ -49,38 +52,162 @@ pub struct MatchSlots<'a> {
     pub materials: &'a mut MaterialCatalog,
     pub scene_assets: &'a mut MapXModelSceneCatalog,
     pub script_models: &'a mut Vec<ScriptModelSceneInstance>,
+    pub bodies: &'a mut BodyMeshBuild,
     pub spawns: &'a [SpawnPoint],
     pub clip: Option<&'a ClipCollision>,
 }
 
+/// One report line per installed part.
 pub fn install(
     model: &RobotModel,
-    placement: Placement,
+    config: &Config,
     slots: MatchSlots<'_>,
-) -> Result<String, String> {
-    let key = MapXModelAssetKey(model.name.clone());
-    if slots.scene_assets.get(&key).is_some() {
-        return Err(format!(
-            "the map already has an XModel named {}",
-            model.name
-        ));
-    }
+) -> Result<Vec<String>, String> {
     // Everything that can refuse is settled before the match is touched.
-    let (origin, yaw, from) = match placement {
-        Placement::At { origin, yaw } => (origin, yaw, "configured".to_owned()),
-        Placement::InFrontOfSpawn => {
+    let key = MapXModelAssetKey(model.name.clone());
+    let prop = match config.prop {
+        None => None,
+        Some(_) if slots.scene_assets.get(&key).is_some() => {
+            return Err(format!(
+                "the map already has an XModel named {}",
+                model.name
+            ));
+        }
+        Some(Placement::At { origin, yaw }) => Some((origin, yaw, "configured".to_owned())),
+        Some(Placement::InFrontOfSpawn) => {
             let (origin, yaw, spawn) = in_front_of_spawn(slots.spawns, slots.clip)
                 .ok_or("the map has no spawn point to stand the robot near")?;
-            (origin, yaw, format!("in front of {spawn}"))
+            Some((origin, yaw, format!("in front of {spawn}")))
         }
     };
+    let body = match config.body {
+        None => None,
+        Some(sides) => {
+            let (rig_name, rig) = body::rig_for(model).ok_or_else(|| {
+                format!(
+                    "no soldier rig fits robot {}; known: {}",
+                    model.name,
+                    body::RIGS
+                        .iter()
+                        .map(|(name, _)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            let kits = slots.bodies.kits().clone();
+            // A replaced team's own soldier first; any soldier will do.
+            let preferred = if sides.allies() {
+                [kits.allies.as_ref(), kits.axis.as_ref()]
+            } else {
+                [kits.axis.as_ref(), kits.allies.as_ref()]
+            };
+            let template = preferred
+                .into_iter()
+                .flatten()
+                .find_map(|kit| slots.bodies.get(&kit.body))
+                .ok_or("the match has no soldier body to fit the robot to")?
+                .skel
+                .clone();
+            Some((sides, rig_name, rig, kits, template))
+        }
+    };
+    if prop.is_none() && body.is_none() {
+        return Ok(Vec::new());
+    }
+
     let donor = pick_donor(slots.materials)
         .ok_or_else(|| format!("no lit model material ({DONOR_TECHNIQUE_SET}) to borrow"))?;
     let donor_name = slots.materials.materials[donor].name.as_str().to_owned();
+    let tones = stand_in_tones(model, donor, slots.materials)?;
+    let material_of = |rgba: [f32; 4]| {
+        tones
+            .iter()
+            .find(|(tone, _)| *tone == rgba)
+            .map(|(_, index)| *index)
+            .expect("every part colour is a tone")
+    };
+    let mut report = vec![format!(
+        "urdf robot {}: bones={} links={} triangles={} (from {}) vertices={} donor={donor_name}",
+        model.name,
+        model.bones.len(),
+        model.parts.len(),
+        model.triangle_count(),
+        model.source_triangles,
+        model.vertex_count(),
+    )];
 
+    if let Some((origin, yaw, from)) = prop {
+        let skel = model.skel(&model.name, material_of);
+        let radius = skel.radius.unwrap_or(0.0);
+        slots
+            .scene_assets
+            .insert(key.clone(), MapXModelSceneAsset::Iw4(Arc::new(skel)));
+        slots.script_models.push(ScriptModelSceneInstance {
+            id: ScriptModelId::from_source_ordinal(ROBOT_ORDINAL),
+            dobj_state: xmodel_runtime::DObjSemanticState::bind_pose(model.name.clone(), 1, 1),
+            current_model: key,
+            transform: Transform {
+                translation: origin,
+                rotation: Quat::from_rotation_z(yaw.to_radians()),
+                scale: Vec3::ONE,
+            },
+            // The model origin is on the floor; sample light from inside the body.
+            lighting_origin: (origin + Vec3::Z * radius.min(EYE_HEIGHT)).to_array(),
+            metadata: ScriptModelMetadata {
+                targetname: model.name.clone(),
+                ..Default::default()
+            },
+        });
+        report.push(format!(
+            "urdf robot prop: placed {from} at ({:.0} {:.0} {:.0}) yaw {:.0}",
+            origin.x, origin.y, origin.z, yaw,
+        ));
+    }
+
+    if let Some((sides, rig_name, rig, kits, template)) = body {
+        let name = format!("mp_body_urdf_{}", model.name);
+        let skel = body::fit_body(model, rig, &template, &name, material_of)?;
+        let surfaces = skel.surface_vertex_ranges.len();
+        slots
+            .bodies
+            .insert_in(AssetNamespace::Iw4, skel, Some(slots.materials));
+        let robot_kit = |old: Option<&SoldierKit>| SoldierKit {
+            body: name.clone(),
+            head: None,
+            arms: old.and_then(|kit| kit.arms.clone()),
+        };
+        let replaced = SoldierKits {
+            allies: if sides.allies() {
+                Some(robot_kit(kits.allies.as_ref()))
+            } else {
+                kits.allies.clone()
+            },
+            axis: if sides.axis() {
+                Some(robot_kit(kits.axis.as_ref()))
+            } else {
+                kits.axis.clone()
+            },
+        };
+        // Inserting reset the kit choice; this one is the match's now.
+        slots.bodies.set_kits(replaced);
+        report.push(format!(
+            "urdf robot body: {name} ({rig_name} rig on {}, {surfaces} surfaces) replaces the {sides} soldiers",
+            template.name,
+        ));
+    }
+    Ok(report)
+}
+
+/// One stand-in material per part colour: the donor's shaders with a solid
+/// colour map, a flat normal map and fixed specular.
+fn stand_in_tones(
+    model: &RobotModel,
+    donor: usize,
+    materials: &mut MaterialCatalog,
+) -> Result<Vec<([f32; 4], WalkLocalMaterialIndex)>, String> {
     let flat_normal = Arc::new(asset_material::solid_texture([128, 128, 255, 128], false));
     let specular = Arc::new(asset_material::solid_texture([48, 48, 48, 160], true));
-    let mut tone_materials = Vec::new();
+    let mut tones = Vec::new();
     for rgba in model.tones() {
         let bytes = rgba.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
         let hex = format!("{:02x}{:02x}{:02x}", bytes[0], bytes[1], bytes[2]);
@@ -97,11 +224,10 @@ pub fn install(
             specular: Some(("$urdf_specular".to_owned(), specular.clone(), true)),
         };
         let name = format!("urdf/{}/{hex}", model.name);
-        let index = slots
-            .materials
+        let index = materials
             .stand_in_material(donor, &name, textures)
             .ok_or("the donor material vanished")?;
-        for constant in &mut slots.materials.materials[index].constants {
+        for constant in &mut materials.materials[index].constants {
             let name = constant.name.split(|&b| b == 0).next().unwrap_or(&[]);
             if let Some((_, literal)) = STAND_IN_CONSTANTS
                 .iter()
@@ -110,50 +236,9 @@ pub fn install(
                 constant.literal = *literal;
             }
         }
-        tone_materials.push((rgba, WalkLocalMaterialIndex::from_walk(index)));
+        tones.push((rgba, WalkLocalMaterialIndex::from_walk(index)));
     }
-
-    let skel = model.skel(&model.name, |rgba| {
-        tone_materials
-            .iter()
-            .find(|(tone, _)| *tone == rgba)
-            .map(|(_, index)| *index)
-            .expect("every part colour is a tone")
-    });
-    let radius = skel.radius.unwrap_or(0.0);
-    slots
-        .scene_assets
-        .insert(key.clone(), MapXModelSceneAsset::Iw4(Arc::new(skel)));
-    slots.script_models.push(ScriptModelSceneInstance {
-        id: ScriptModelId::from_source_ordinal(ROBOT_ORDINAL),
-        dobj_state: xmodel_runtime::DObjSemanticState::bind_pose(model.name.clone(), 1, 1),
-        current_model: key,
-        transform: Transform {
-            translation: origin,
-            rotation: Quat::from_rotation_z(yaw.to_radians()),
-            scale: Vec3::ONE,
-        },
-        // The model origin is on the floor; sample light from inside the body.
-        lighting_origin: (origin + Vec3::Z * radius.min(EYE_HEIGHT)).to_array(),
-        metadata: ScriptModelMetadata {
-            targetname: model.name.clone(),
-            ..Default::default()
-        },
-    });
-
-    Ok(format!(
-        "urdf robot {}: bones={} surfaces={} triangles={} (from {}) vertices={} donor={donor_name} placed {from} at ({:.0} {:.0} {:.0}) yaw {:.0}",
-        model.name,
-        model.bones.len(),
-        model.parts.len(),
-        model.triangle_count(),
-        model.source_triangles,
-        model.vertex_count(),
-        origin.x,
-        origin.y,
-        origin.z,
-        yaw,
-    ))
+    Ok(tones)
 }
 
 /// A real IW4 material on the lit model technique with all three maps bound,

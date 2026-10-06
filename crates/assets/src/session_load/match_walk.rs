@@ -409,10 +409,11 @@ pub(super) async fn walk_prepared_match(
         materials: &mut global,
         scene_assets: &mut world.map_xmodel_scene_assets,
         script_models: &mut world.script_model_instances,
+        bodies: &mut bodies,
         spawns: &dm_spawns,
         clip: clip.as_ref(),
     }) {
-        report.push(robot.unwrap_or_else(|error| format!("urdf robot refused: {error}")));
+        report.extend(robot.unwrap_or_else(|error| vec![format!("urdf robot refused: {error}")]));
     }
     let provisional_map_ids: Vec<usize> = (0..global.materials.len()).collect();
     if iw5_mat_n > 0 {

@@ -27,4 +27,4 @@ game. Keep them this short: nobody opens a long file twice.
 | [`GSC-RUNTIME.md`](GSC-RUNTIME.md) | GSC → executable IR → Bevy runtime; args, arrays and tables still share one `Runtime` | implementing gameplay or script execution |
 | [`GSC-POSTFX.md`](GSC-POSTFX.md) | script vision, color correction, blur, DoF and bloom | authoring or debugging GSC post effects |
 | [`BOTS.md`](BOTS.md) | host AI: the per-tick pipeline, what a probe that never ran may not claim, the shared query budget, resumable routes, fighting from a position | bot decisions, bot movement, "why is it standing there" |
-| [`ROBOT.md`](ROBOT.md) | the URDF robot import: fetching the G1, `IW4L_ROBOT_URDF`, how links become one rigid XModel and where it hooks into the match walk | putting a robot in a map, changing how it is built |
+| [`ROBOT.md`](ROBOT.md) | the URDF robot import: fetching the G1, `IW4L_ROBOT_*`, the standing prop, fitting links onto the soldier skeleton, where it hooks into the match walk | putting a robot in a map or on a team, changing how it is built |

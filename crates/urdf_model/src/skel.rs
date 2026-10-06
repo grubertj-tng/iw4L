@@ -169,6 +169,18 @@ impl RobotModel {
             .sum()
     }
 
+    /// The bone a link became, by link name.
+    pub fn bone(&self, link: &str) -> Option<&Bone> {
+        self.bones.iter().find(|bone| bone.name == link)
+    }
+
+    /// The geometry a link carries, by link name.
+    pub fn part(&self, link: &str) -> Option<&Part> {
+        self.parts
+            .iter()
+            .find(|part| self.bones[part.bone].name == link)
+    }
+
     /// Distinct part colours, in first-use order.
     pub fn tones(&self) -> Vec<[f32; 4]> {
         let mut tones: Vec<[f32; 4]> = Vec::new();
@@ -201,7 +213,13 @@ impl RobotModel {
         let mut geometry = Geometry::default();
         for part in &self.parts {
             let (rotation, translation) = bind[part.bone];
-            geometry.push_part(part, rotation, translation, material_of(part.rgba));
+            geometry.push_mesh(
+                &part.mesh,
+                part.bone,
+                material_of(part.rgba),
+                |p| rotation * p + translation,
+                |n| rotation * n,
+            );
         }
 
         let mut bone_collision = vec![None; self.bones.len()];
@@ -209,21 +227,7 @@ impl RobotModel {
             bone_collision[part.bone] = collision_box(&part.mesh);
         }
 
-        let radius = geometry
-            .positions
-            .iter()
-            .map(|p| Vec3::from_array(*p).length())
-            .fold(0.0f32, f32::max);
-        let bounds =
-            geometry
-                .positions
-                .iter()
-                .fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), p| {
-                    (
-                        std::array::from_fn(|i| lo[i].min(p[i])),
-                        std::array::from_fn(|i| hi[i].max(p[i])),
-                    )
-                });
+        let (radius, bounds) = geometry.radius_and_bounds();
         let rigid_verts = geometry.vert_skin.len();
 
         ModelSkel {
@@ -310,22 +314,23 @@ fn quat16(q: DQuat) -> [i16; 4] {
         .map(|c| (c * 32767.0).round().clamp(-32767.0, 32767.0) as i16)
 }
 
-/// The surfaces an XModel draws, accumulated part by part.
+/// The surfaces an XModel draws, accumulated mesh by mesh, each mesh rigid
+/// on one bone.
 #[derive(Default)]
-struct Geometry {
-    positions: Vec<[f32; 3]>,
-    normals: Vec<[f32; 3]>,
-    colors: Vec<[f32; 4]>,
-    uvs: Vec<[f32; 2]>,
-    indices: Vec<u32>,
-    packed_vertices: Vec<[u8; asset_iw4::size::GFX_PACKED_VERTEX]>,
-    vert_skin: Vec<VertSkin>,
-    surface_materials: Vec<Option<WalkLocalMaterialIndex>>,
-    surface_vertex_ranges: Vec<(usize, usize)>,
-    surface_index_ranges: Vec<(usize, usize)>,
-    surface_part_bits: Vec<[u32; 6]>,
-    surface_deformed: Vec<Option<bool>>,
-    surface_vert_list_count: Vec<Option<u32>>,
+pub(crate) struct Geometry {
+    pub(crate) positions: Vec<[f32; 3]>,
+    pub(crate) normals: Vec<[f32; 3]>,
+    pub(crate) colors: Vec<[f32; 4]>,
+    pub(crate) uvs: Vec<[f32; 2]>,
+    pub(crate) indices: Vec<u32>,
+    pub(crate) packed_vertices: Vec<[u8; asset_iw4::size::GFX_PACKED_VERTEX]>,
+    pub(crate) vert_skin: Vec<VertSkin>,
+    pub(crate) surface_materials: Vec<Option<WalkLocalMaterialIndex>>,
+    pub(crate) surface_vertex_ranges: Vec<(usize, usize)>,
+    pub(crate) surface_index_ranges: Vec<(usize, usize)>,
+    pub(crate) surface_part_bits: Vec<[u32; 6]>,
+    pub(crate) surface_deformed: Vec<Option<bool>>,
+    pub(crate) surface_vert_list_count: Vec<Option<u32>>,
 }
 
 /// An XSurface addresses its vertices with 16-bit indices.
@@ -335,16 +340,18 @@ const MAX_SURFACE_VERTICES: usize = u16::MAX as usize + 1;
 const TEXCOORD: [f32; 2] = [0.5, 0.5];
 
 impl Geometry {
-    fn push_part(
+    /// Adds `mesh` in model space at bind: `place` maps its positions there
+    /// and `orient` its normals.
+    pub(crate) fn push_mesh(
         &mut self,
-        part: &Part,
-        rotation: Quat,
-        translation: Vec3,
+        mesh: &LinkMesh,
+        bone: usize,
         material: WalkLocalMaterialIndex,
+        place: impl Fn(Vec3) -> Vec3,
+        orient: impl Fn(Vec3) -> Vec3,
     ) {
         let mut part_bits = [0u32; 6];
-        part_bits[part.bone / 32] |= 1 << (part.bone % 32);
-        let mesh = &part.mesh;
+        part_bits[bone / 32] |= 1 << (bone % 32);
         // A link too dense for one XSurface becomes several.
         let mut surface_vertex: Vec<Option<u32>> = vec![None; mesh.positions.len()];
         let mut surface: Option<(usize, usize)> = None;
@@ -372,9 +379,9 @@ impl Geometry {
                     None => {
                         let index = self.positions.len() as u32;
                         self.push_vertex(
-                            rotation * mesh.positions[corner as usize] + translation,
-                            rotation * mesh.normals[corner as usize],
-                            part.bone,
+                            place(mesh.positions[corner as usize]),
+                            orient(mesh.normals[corner as usize]),
+                            bone,
                         );
                         surface_vertex[corner as usize] = Some(index);
                         index
@@ -384,6 +391,25 @@ impl Geometry {
             }
         }
         self.close_surface(surface);
+    }
+
+    /// The model-origin sphere and the box around every vertex.
+    pub(crate) fn radius_and_bounds(&self) -> (f32, ([f32; 3], [f32; 3])) {
+        let radius = self
+            .positions
+            .iter()
+            .map(|p| Vec3::from_array(*p).length())
+            .fold(0.0f32, f32::max);
+        let bounds = self
+            .positions
+            .iter()
+            .fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), p| {
+                (
+                    std::array::from_fn(|i| lo[i].min(p[i])),
+                    std::array::from_fn(|i| hi[i].max(p[i])),
+                )
+            });
+        (radius, bounds)
     }
 
     fn close_surface(&mut self, surface: Option<(usize, usize)>) {

@@ -1,8 +1,9 @@
-# Robot: a URDF model standing in the match
+# Robot: a URDF model in the match
 
 `crates/urdf_model` reads a robot description (URDF links, joints, STL meshes)
-and stands it in front of a spawn as a script model. Off unless configured; a
-match without it loads exactly as before.
+and puts it in a match: standing in front of a spawn as a script model, and/or
+as the soldier body of one or both teams. Off unless configured; a match
+without it loads exactly as before.
 
 ## Get a robot and turn it on
 
@@ -19,31 +20,33 @@ In `.env` (absolute path):
 
 ```bash
 IW4L_ROBOT_URDF=/…/context/externals/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf
-# IW4L_ROBOT_ORIGIN="-334 1580 -76"   optional, map units, feet height
-# IW4L_ROBOT_YAW=0                    optional, degrees, with ORIGIN
+# IW4L_ROBOT_BODY=all                 all | allies | axis: those soldiers are robots
+# IW4L_ROBOT_PROP=off                 no robot standing at the spawn
+# IW4L_ROBOT_ORIGIN="-334 1580 -76"   map units, feet height; IW4L_ROBOT_YAW degrees
 ```
 
-`make map mp_boneyard`; the log line `urdf robot …` says where it stands. Every
-machine in a match needs the same setting: the robot takes an entity slot.
-`cargo run --release -p urdf_model --example inspect -- <urdf>` prints what the
-import makes of a description without starting the game.
+The log lines `urdf robot …` say what was installed and where. Every machine in
+a match needs the same settings. `cargo run --release -p urdf_model --example
+inspect -- <urdf>` prints what the import makes of a description.
 
 ## What happens
 
-* **Geometry** (`mesh.rs`): each link's STL soup is welded, simplified with
-  meshoptimizer to 1.5 mm deviation (G1: 393k → 19.5k triangles), and given
-  normals that break at edges sharper than 40°.
-* **Skeleton** (`skel.rs`): `tag_origin` plus one rigid bone per link, all
-  joints at zero, feet on z = 0, metres → inches, STL winding flipped to IW4's
-  clockwise front faces. Per-link boxes are the bone collision.
-* **Materials** (`install.rs`): one stand-in per URDF colour, cloned from the
-  common_mp `mc/mtl_weapon_claymore` technique with a solid colour map, flat
-  normal map and fixed specular/env constants.
-* **Hook**: `assets::session_load::match_walk`, before material ids are
-  provisioned — the XModel enters `map_xmodel_scene_assets`, the placement
-  `script_model_instances`. Lighting is sampled from the map's light grid.
+* **Geometry** (`mesh.rs`): each link's STL is welded, simplified with
+  meshoptimizer to 1.5 mm (G1: 393k → 19.5k triangles), normals break at 40°.
+* **Prop** (`skel.rs`): `tag_origin` plus one rigid bone per link, joints at
+  zero, feet on z = 0, inches, winding flipped to IW4's clockwise fronts.
+* **Body** (`body.rs`): the kit's soldier skeleton, hit boxes and tags are kept;
+  a rig table (`UNITREE_G1`) puts each link on a soldier bone. Segments are
+  scaled to soldier size and stretched along their length so the robot's
+  joints land on the soldier's; the head turns with `j_head`, no separate head
+  model. Player animations, aiming and hit locations work unchanged.
+* **Materials** (`install.rs`): one stand-in per URDF colour on the common_mp
+  `mc/mtl_weapon_claymore` technique: solid colour, flat normal, fixed specular.
+* **Hook**: `assets::session_load::match_walk` before material ids are
+  provisioned — XModel, placement, body and kit choice join the match there.
 
 ## Not yet
 
-Players walk through it (no movement brush). It does not move: the bones are
-there, nothing animates them. Bullet hits on the link boxes are not verified.
+Players walk through the standing robot and nothing animates it. Bodies have one
+level of detail. First-person arms stay the soldier's. Another robot needs its
+own rig table.
