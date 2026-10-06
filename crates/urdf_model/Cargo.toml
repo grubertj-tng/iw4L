@@ -1,0 +1,21 @@
+[package]
+name = "urdf_model"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "URDF robot import: STL links as a rigid IW4 XModel placed in a match."
+
+[dependencies]
+asset_core.workspace = true
+asset_iw4.workspace = true
+asset_material.workspace = true
+asset_model.workspace = true
+asset_world.workspace = true
+fx_iw4.workspace = true
+xmodel_runtime.workspace = true
+bevy.workspace = true
+meshopt = "0.6"
+roxmltree = "0.21"
+
+[lints]
+workspace = true

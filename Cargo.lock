@@ -2885,6 +2885,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "float-cmp"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b09cf3155332e944990140d967ff5eceb70df778b34f77d8075db46e4704e6d8"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4113,6 +4122,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "meshopt"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01e77ead21976b3a9f01ec1724f766923da74f0726364e2b0f425658935d71a"
+dependencies = [
+ "bitflags 2.13.1",
+ "cc",
+ "float-cmp",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -5633,6 +5654,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6855,6 +6885,22 @@ dependencies = [
  "toml",
  "windows-sys 0.61.2",
  "zstd",
+]
+
+[[package]]
+name = "urdf_model"
+version = "0.1.0"
+dependencies = [
+ "asset_core",
+ "asset_iw4",
+ "asset_material",
+ "asset_model",
+ "asset_world",
+ "bevy",
+ "fx_iw4",
+ "meshopt",
+ "roxmltree",
+ "xmodel_runtime",
 ]
 
 [[package]]
