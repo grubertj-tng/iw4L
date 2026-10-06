@@ -468,6 +468,7 @@ dependencies = [
  "render_material",
  "serde_json",
  "structured_data_iw4",
+ "urdf_model",
  "weapon_iw4",
  "xmodel_runtime",
 ]

@@ -405,6 +405,15 @@ pub(super) async fn walk_prepared_match(
 
     let mut global = materials;
     let iw5_linked = global.absorb_asset_population_host_materials_win(iw5_materials);
+    if let Some(robot) = urdf_model::install_from_env(urdf_model::MatchSlots {
+        materials: &mut global,
+        scene_assets: &mut world.map_xmodel_scene_assets,
+        script_models: &mut world.script_model_instances,
+        spawns: &dm_spawns,
+        clip: clip.as_ref(),
+    }) {
+        report.push(robot.unwrap_or_else(|error| format!("urdf robot refused: {error}")));
+    }
     let provisional_map_ids: Vec<usize> = (0..global.materials.len()).collect();
     if iw5_mat_n > 0 {
         iw5_scene_models.remap_walk_materials(&iw5_linked);

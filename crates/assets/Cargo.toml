@@ -30,6 +30,7 @@ lighting_iw4.workspace = true
 bevy.workspace = true
 frame.workspace = true
 serde_json.workspace = true
+urdf_model.workspace = true
 async-lock.workspace = true
 png.workspace = true
 
