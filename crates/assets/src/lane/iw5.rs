@@ -135,7 +135,7 @@ impl ZoneLane for Iw5Lane {
         progress: &LoadProgress,
         shared_surfaces: asset_model::SharedXModelSurfaces,
         material_seed: asset_material::MaterialCatalog,
-        _common_film_visions: &super::FilmVisionCatalog,
+        common_film_visions: &super::FilmVisionCatalog,
     ) -> LoadedWorld {
         let mut report = vec![format!("game: IW5 ({})", path.display())];
         let stage = progress.begin_scoped(StageId::MapAssets, "header", None);
@@ -212,6 +212,28 @@ impl ZoneLane for Iw5Lane {
             )),
         }
         stage.set_completed(sink.walked as u64);
+        let mut film_visions = common_film_visions.clone();
+        film_visions.extend(std::mem::take(&mut sink.film_visions));
+        let vision_name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("vision/{}.vision", name.to_ascii_lowercase()));
+        let film_vision = vision_name
+            .as_ref()
+            .and_then(|name| match film_visions.get(name) {
+                Some(Ok(vision)) => {
+                    report.push(format!("film vision: ready {name}"));
+                    Some(*vision)
+                }
+                Some(Err(error)) => {
+                    report.push(format!("film vision: refused {name}: {error:?}"));
+                    None
+                }
+                None => {
+                    report.push(format!("film vision: missing {name}"));
+                    None
+                }
+            });
         let exp_fog = sink.exp_fog.take();
         let script_sound = std::mem::take(&mut sink.script_sound).finish();
         let createart_name = sink.createart_name.take();
@@ -270,6 +292,7 @@ impl ZoneLane for Iw5Lane {
         let bodies = std::mem::take(&mut sink.bodies);
         let fpv_meshes = std::mem::take(&mut sink.fpv_meshes);
         let map_xanims = std::mem::take(&mut sink.xanims);
+        let mut map_fx = std::mem::take(&mut sink.fx);
 
         let clip = if let Some(geometry) = stream.clip_map() {
             report.push(format!(
@@ -339,7 +362,7 @@ impl ZoneLane for Iw5Lane {
                         exp_fog,
                         createart_name,
                         policy: WorldDrawPolicy::iw5(),
-                        ..Default::default()
+                        ..PreparedWorld::empty(WorldDrawPolicy::iw5())
                     },
                     collision: clip,
                     spawns: dm_spawns,
@@ -352,7 +375,7 @@ impl ZoneLane for Iw5Lane {
                         reason: "no GfxWorld retained — nothing to draw".into(),
                         addr: Some("assets::lane::iw5::load_world/no_gfx_world"),
                     }],
-                    ..Default::default()
+                    ..LoadedWorld::empty(WorldDrawPolicy::iw5())
                 },
             );
         };
@@ -528,6 +551,9 @@ impl ZoneLane for Iw5Lane {
                         sound: map_sound,
                         materials: map_materials,
                         world: PreparedWorld {
+                            fx: std::mem::take(&mut map_fx),
+                            film_vision,
+                            film_visions,
                             min: draw.stats.min,
                             max: draw.stats.max,
                             world_bounds: draw.stats.bounds,
@@ -546,7 +572,7 @@ impl ZoneLane for Iw5Lane {
                             createart_name,
                             policy: WorldDrawPolicy::iw5(),
                             smodel_lighting_samples,
-                            ..Default::default()
+                            ..PreparedWorld::empty(WorldDrawPolicy::iw5())
                         },
                         collision: clip,
                         spawns: dm_spawns,
@@ -562,7 +588,7 @@ impl ZoneLane for Iw5Lane {
                             ..Default::default()
                         },
                         report,
-                        ..Default::default()
+                        ..LoadedWorld::empty(WorldDrawPolicy::iw5())
                     },
                 )
             }
@@ -575,10 +601,13 @@ impl ZoneLane for Iw5Lane {
                     LoadedWorld {
                         sound: map_sound,
                         world: PreparedWorld {
+                            fx: std::mem::take(&mut map_fx),
+                            film_vision,
+                            film_visions,
                             exp_fog,
                             createart_name,
                             policy: WorldDrawPolicy::iw5(),
-                            ..Default::default()
+                            ..PreparedWorld::empty(WorldDrawPolicy::iw5())
                         },
                         collision: clip,
                         spawns: dm_spawns,
@@ -591,7 +620,7 @@ impl ZoneLane for Iw5Lane {
                             reason: format!("world draw: {e}"),
                             addr: Some("assets::lane::iw5::load_world/world_mesh"),
                         }],
-                        ..Default::default()
+                        ..LoadedWorld::empty(WorldDrawPolicy::iw5())
                     },
                 )
             }
@@ -652,7 +681,6 @@ impl ZoneLane for Iw5Lane {
         sink.weapons.resolve_reticles(&sink.materials);
         let captured = sink.weapons.len();
         let mut weapons = sink.weapons.into_build();
-        weapons.stamp_namespace(asset_core::AssetNamespace::Iw5);
         weapons.apply_stats_tables(sink.stats_tables.values());
         weapons.resolve_sz_xanim_edges(&sink.xanims);
         weapons.resolve_fpv_mesh_edges(&sink.fpv_meshes);
@@ -721,12 +749,15 @@ impl ZoneLane for Iw5Lane {
         CommonCensus {
             pending_images,
             weapons,
+            film_visions: sink.film_visions,
             cac_tables: sink.stats_tables.into_values().collect(),
             material_population: materials,
             fpv: sink.fpv_meshes,
             world_weapons: sink.world_weapons,
             xanims: sink.xanims,
+            player_anim_sources: sink.player_anim_sources,
             light_defs,
+            fx: sink.fx,
             scene_models: sink.scene_models,
             shared_surfaces: sink.shared_surfaces,
             report,

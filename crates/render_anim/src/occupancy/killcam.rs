@@ -10,6 +10,7 @@ use sim::ClientId;
 #[derive(Default)]
 pub struct KillcamCamera {
     entity: Option<i32>,
+    generation: Option<u32>,
     mode: Option<KillCamMode>,
     origin: Vec3,
     angles: [f32; 3],
@@ -129,8 +130,17 @@ pub(super) fn classify_view(
     let number = ps.kill_cam_entity;
     let entity = snapshot.meta.entities.iter().find(|e| e.number == number);
     let projectile = snapshot.projectiles.iter().find(|p| p.entnum == number);
-    let mode = if let Some(p) = projectile {
-        let facts = weapons.and_then(|w| w.0.event_facts_of(p.weapon));
+    let projectile_weapon = projectile.map(|p| p.weapon).or_else(|| {
+        entity
+            .filter(|e| e.e_type == entity_iw4::ET_MISSILE)
+            .and_then(|e| u32::try_from(e.index).ok())
+    });
+    let mode = if let Some(projectile_weapon) = projectile_weapon {
+        let facts = weapons.and_then(|w| {
+            w.snapshot_weapon(presented.weapon_epoch(), projectile_weapon)
+                .ok()
+                .and_then(|weapon| weapon.event_facts())
+        });
         match facts
             .map(|f| f.projectile_camera())
             .unwrap_or(asset_game::ProjectileCameraPolicy::Missile)
@@ -142,6 +152,15 @@ pub(super) fn classify_view(
             asset_game::ProjectileCameraPolicy::Missile => KillCamMode::Mode3Missile,
         }
     } else {
+        if let Some(mode) = snapshot
+            .meta
+            .script_movers
+            .iter()
+            .find(|mover| mover.state.number == number)
+            .and_then(|mover| mover.killcam_camera)
+        {
+            return Some(mode);
+        }
         match entity?.e_type {
             12 => KillCamMode::Mode1Heli,
             11 => KillCamMode::Mode6Turret,
@@ -162,7 +181,7 @@ impl KillcamCamera {
         clip: Option<&ClipCollision>,
     ) -> Option<(WorldCameraPose, f32, Option<f32>)> {
         let ps = presented.player(viewer)?;
-        if !in_killcam || now < self.last_time {
+        if !in_killcam {
             *self = Self::default();
         }
         let previous_time = self.last_time;
@@ -175,6 +194,7 @@ impl KillcamCamera {
         let number = ps.kill_cam_entity;
         if number == ENTITYNUM_NONE {
             self.entity = None;
+            self.generation = None;
             self.mode = None;
             self.stop = None;
             self.previous_origin = None;
@@ -194,6 +214,10 @@ impl KillcamCamera {
             let mode = classify_view(presented, viewer, in_killcam, weapons)?;
             self.rest_ground = false;
             self.entity = Some(number);
+            self.generation = usize::try_from(number)
+                .ok()
+                .and_then(|index| snapshot.meta.entity_kernel.slots.get(index))
+                .map(|slot| slot.generation);
             self.mode = Some(mode);
             self.stop = None;
             self.previous_origin = None;
@@ -205,6 +229,14 @@ impl KillcamCamera {
                 now,
             );
         }
+        let same_generation = self.generation.is_none_or(|generation| {
+            usize::try_from(number)
+                .ok()
+                .and_then(|index| snapshot.meta.entity_kernel.slots.get(index))
+                .is_some_and(|slot| slot.generation == generation)
+        });
+        let entity = entity.filter(|_| same_generation);
+        let projectile = projectile.filter(|_| same_generation);
         if let Some(p) = projectile {
             self.origin = Vec3::from_array(presented.projectile_origin_at(p, now));
             self.angles = evaluate_trajectory(&p.apos, trajectory_time);
@@ -224,7 +256,11 @@ impl KillcamCamera {
         if let Some(p) = projectile {
             self.rest_ground = entity.is_some_and(|e| e.ground_entity_num != ENTITYNUM_NONE)
                 && weapons
-                    .and_then(|w| w.0.event_facts_of(p.weapon))
+                    .and_then(|w| {
+                        w.snapshot_weapon(presented.weapon_epoch(), p.weapon)
+                            .ok()
+                            .and_then(|weapon| weapon.event_facts())
+                    })
                     .is_some_and(|f| f.rests_on_ground());
         }
         let look_at = if ps.kill_cam_look_at_entity == ENTITYNUM_NONE {
@@ -264,7 +300,13 @@ impl KillcamCamera {
         let camera_up = toward.cross(side);
         let (desired, angles, fov) = match mode {
             KillCamMode::Mode0 => return None,
-            KillCamMode::Mode1Heli => return None,
+            KillCamMode::Mode1Heli => {
+                let anchor = anchor + Vec3::Z * 50.0;
+                let target = self.target - Vec3::Z * 100.0;
+                let direction = (target - anchor).normalize_or_zero();
+                let origin = pull_back(clip, anchor, anchor - direction * 1000.0);
+                (origin, look_angles(target - origin), 15.0)
+            }
             KillCamMode::Mode2Airstrike => {
                 let origin = anchor.with_z(anchor.z.max(self.target.z + 24.0));
                 (origin, look_angles(self.target - origin), 50.0)
@@ -415,7 +457,8 @@ impl KillcamCamera {
         self.last_pose = Some(pose);
         let focus_distance = matches!(
             mode,
-            KillCamMode::Mode2Airstrike
+            KillCamMode::Mode1Heli
+                | KillCamMode::Mode2Airstrike
                 | KillCamMode::Mode3Missile
                 | KillCamMode::Mode4MissileAlt
                 | KillCamMode::Mode5Rocket

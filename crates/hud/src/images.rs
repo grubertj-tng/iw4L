@@ -72,7 +72,7 @@ pub(crate) struct BloodMaterialBinding {
 fn blood_material_binding(catalog: &MenuCatalog) -> Result<BloodMaterialBinding, String> {
     let pass = "splatter_alt/unlit/pass 0";
     let plan = catalog
-        .material_2d_plans
+        .material_2d_plans()
         .get("splatter_alt")
         .ok_or_else(|| format!("{pass}: material plan missing"))?;
     if plan.unlit_pass_count != Some(1) || plan.unlit_pass_states.len() != 1 {
@@ -96,7 +96,7 @@ fn blood_material_binding(catalog: &MenuCatalog) -> Result<BloodMaterialBinding,
         ));
     }
     let state =
-        render_material::compile_material_state(HUD_CHROME_NAMESPACE, plan.unlit_pass_states[0]);
+        asset_material::compile_material_state(HUD_CHROME_NAMESPACE, plan.unlit_pass_states[0]);
     if let Some(fields) = state.unsupported_host_fields() {
         return Err(format!("{pass}: unsupported material state: {fields:?}"));
     }
@@ -133,12 +133,14 @@ fn make_image(
 
 #[derive(Resource, Default)]
 pub struct HudImages {
+    controller_icons: HashMap<String, Handle<Image>>,
+    ui_images: asset_material::UiImagePublication,
     games_root: PathBuf,
 
     trees: NamespaceTrees,
     adopted_zone: Option<PathBuf>,
 
-    map_namespace: AssetNamespace,
+    map_namespace: Option<AssetNamespace>,
     by_name: HashMap<IwdKey, Option<Handle<Image>>>,
     rgba_by_name: HashMap<(AssetNamespace, String), CachedRgba>,
     zone_rgba: HashMap<String, (u32, u32, Arc<Vec<u8>>)>,
@@ -150,11 +152,22 @@ pub struct HudImages {
     zone_samplers: HashMap<String, u8>,
     blood_plan: Option<Result<BloodMaterialBinding, String>>,
     zone_installed: bool,
+    zone_identity: Option<asset_game::ImageProductRevision>,
     zone_uploaded: bool,
     iwd_warmed: bool,
 }
 
 impl HudImages {
+    pub fn adopt_ui_images(&mut self, publication: &asset_material::UiImagePublication) {
+        if self.ui_images.id() == publication.id() {
+            return;
+        }
+        self.ui_images = publication.clone();
+        self.by_name.clear();
+        self.rgba_by_name.clear();
+        self.iwd_warmed = false;
+    }
+
     pub fn set_games_root(&mut self, root: &Path) {
         if self.games_root == root {
             return;
@@ -174,22 +187,23 @@ impl HudImages {
             return;
         }
         self.adopted_zone = Some(zone_ff.to_path_buf());
-        let namespace = asset_transport::zone_game_for_path(zone_ff)
-            .map_or(AssetNamespace::Iw4, AssetNamespace::from_zone_game);
+        let Some(namespace) = asset_transport::zone_game_for_path(zone_ff) else {
+            return;
+        };
         let mut trees = self.trees.clone();
         trees.adopt_zone(zone_ff);
-        if trees == self.trees && namespace == self.map_namespace {
+        if trees == self.trees && Some(namespace) == self.map_namespace {
             return;
         }
         self.trees = trees;
-        self.map_namespace = namespace;
+        self.map_namespace = Some(namespace);
         self.by_name.clear();
         self.rgba_by_name.clear();
         self.iwd_warmed = false;
         self.log_trees();
     }
 
-    pub fn map_namespace(&self) -> AssetNamespace {
+    pub fn map_namespace(&self) -> Option<AssetNamespace> {
         self.map_namespace
     }
 
@@ -203,26 +217,48 @@ impl HudImages {
         !self.games_root.as_os_str().is_empty()
     }
 
+    pub fn clear_zone_catalog(&mut self) {
+        self.zone_rgba.clear();
+        self.zone_handles.clear();
+        self.zone_image_name.clear();
+        self.material_images.clear();
+        self.zone_states.clear();
+        self.zone_srgb_reads.clear();
+        self.zone_samplers.clear();
+        self.blood_plan = None;
+        self.zone_installed = false;
+        self.zone_identity = None;
+        self.zone_uploaded = false;
+        self.by_name.clear();
+        self.rgba_by_name.clear();
+        self.iwd_warmed = false;
+    }
+
     pub fn install_zone_catalog(&mut self, catalog: &MenuCatalog) {
-        if self.zone_installed {
+        let identity = catalog
+            .image_revision()
+            .unwrap_or_else(|| asset_game::ImageProductRevision(catalog.image_identity()));
+        if self.zone_identity == Some(identity) {
             return;
         }
+        self.clear_zone_catalog();
         self.zone_installed = true;
+        self.zone_identity = Some(identity);
         self.zone_uploaded = false;
         self.blood_plan = Some(blood_material_binding(catalog));
         self.zone_srgb_reads.extend(
             catalog
-                .material_srgb_reads
+                .material_srgb_reads()
                 .iter()
                 .map(|(name, &srgb)| (cache_key(name), srgb)),
         );
         self.material_images.extend(
             catalog
-                .material_images
+                .material_images()
                 .iter()
                 .map(|(material, image)| (cache_key(material), image.clone())),
         );
-        for (name, plan) in &catalog.material_2d_plans {
+        for (name, plan) in catalog.material_2d_plans() {
             let binding =
                 plan.textures
                     .iter()
@@ -234,15 +270,15 @@ impl HudImages {
                         })
                     });
             if let Some(binding) = binding
-                && catalog.material_images.get(name) == binding.image.as_ref()
+                && catalog.material_images().get(name) == binding.image.as_ref()
             {
                 self.zone_samplers
                     .insert(cache_key(name), binding.sampler_state);
             }
         }
-        for (name, state) in &catalog.material_state_bits {
+        for (name, state) in catalog.material_state_bits() {
             let compiled = state.agreed().and_then(|words| {
-                let compiled = render_material::compile_material_state(HUD_CHROME_NAMESPACE, words);
+                let compiled = asset_material::compile_material_state(HUD_CHROME_NAMESPACE, words);
                 if let Some(fields) = compiled.unsupported_host_fields() {
                     diag::warn!(Ui, "hud material state refused: {name}: {fields:?}");
                     None
@@ -251,11 +287,11 @@ impl HudImages {
                 }
             });
             self.zone_states.insert(name.clone(), compiled);
-            if catalog.zone_images.contains_key(name) && state.agreed().is_none() {
+            if catalog.zone_images().contains_key(name) && state.agreed().is_none() {
                 diag::warn!(Ui, "hud material state gap: {name}: {state:?}");
             }
         }
-        for (key, atlas) in &catalog.zone_images {
+        for (key, atlas) in catalog.zone_images() {
             self.zone_rgba
                 .insert(key.clone(), (atlas.width, atlas.height, atlas.rgba.clone()));
             self.zone_image_name
@@ -271,9 +307,11 @@ impl HudImages {
         ns: AssetNamespace,
         name: &str,
     ) -> Option<render_material::CompiledPassState> {
-        (ns == HUD_CHROME_NAMESPACE)
-            .then(|| self.zone_states.get(&cache_key(name)).copied().flatten())
-            .flatten()
+        if ns == HUD_CHROME_NAMESPACE {
+            self.zone_states.get(&cache_key(name)).copied().flatten()
+        } else {
+            self.ui_images.zone_material_state(ns, name)
+        }
     }
 
     pub(crate) fn blood_material_binding(&self) -> Result<BloodMaterialBinding, &str> {
@@ -357,6 +395,24 @@ impl HudImages {
         sampler: Option<u8>,
         images: &mut Assets<Image>,
     ) -> Option<Handle<Image>> {
+        if let Some(icon) = frame::ControllerIcon::ALL
+            .into_iter()
+            .find(|icon| icon.material() == name)
+        {
+            let handle = self
+                .controller_icons
+                .entry(name.to_owned())
+                .or_insert_with(|| {
+                    images.add(make_image(
+                        crate::controller_icons::SIZE,
+                        crate::controller_icons::SIZE,
+                        crate::controller_icons::rasterize(icon),
+                        HudSampling::Color,
+                        None,
+                    ))
+                });
+            return Some(handle.clone());
+        }
         let key = iwd_key(ns, name, sampling, sampler);
         if ns == HUD_CHROME_NAMESPACE && self.zone_states.get(&key.1) == Some(&None) {
             return None;
@@ -376,6 +432,10 @@ impl HudImages {
 
     pub fn ensure_rgba(&mut self, ns: AssetNamespace, name: &str) {
         let key = (ns, cache_key(name));
+        if ns == HUD_CHROME_NAMESPACE && self.zone_states.get(&key.1) == Some(&None) {
+            self.rgba_by_name.insert(key, None);
+            return;
+        }
         if self.rgba_by_name.contains_key(&key) {
             return;
         }
@@ -435,8 +495,9 @@ impl HudImages {
             );
         }
         if let Some(compass) = compass {
-            if let Some(name) = compass.declaration.image.as_deref() {
-                let ns = self.map_namespace;
+            if let Some(name) = compass.declaration.image.as_deref()
+                && let Some(ns) = self.map_namespace
+            {
                 let _ = self.get(ns, name, images);
                 self.ensure_rgba(ns, name);
             }
@@ -502,34 +563,24 @@ impl HudImages {
         if cache_key(name) == "white" {
             return Some((1, 1, vec![255; 4]));
         }
-        if let Some((width, height, rgba)) = asset_material::zone_ui_image(ns, name) {
-            return Some((width, height, rgba.as_ref().clone()));
+        if self.ui_images.has_zone_image(ns, name) {
+            return self
+                .ui_images
+                .zone_image(ns, name)
+                .map(|(width, height, rgba)| (width, height, rgba.as_ref().clone()));
         }
-        let main = self.trees.main_for(ns)?;
-        let mapped = (ns == HUD_CHROME_NAMESPACE)
-            .then(|| {
-                self.material_images
-                    .get(&cache_key(name))
-                    .map(String::as_str)
-            })
-            .flatten();
-        for image_name in mapped
-            .filter(|image| *image != name)
-            .into_iter()
-            .chain(std::iter::once(name))
-        {
-            match asset_material::decode_ui_image_from_main(main, image_name) {
-                Ok(Some(image)) => return Some(image),
-                Ok(None) => {}
-                Err(error) => {
-                    diag::warn!(
-                        Ui,
-                        "hud: decode `{}:{image_name}` from {}: {error}",
-                        ns.as_str(),
-                        main.display()
-                    );
-                }
-            }
+        let requested = if ns == HUD_CHROME_NAMESPACE {
+            self.material_images
+                .get(&cache_key(name))
+                .map(String::as_str)
+                .unwrap_or(name)
+        } else {
+            name
+        };
+        let key = format!("{}:material/{requested}", ns.as_str());
+        match asset_material::decode_ui_image(&self.ui_images, &self.games_root, &key) {
+            Ok(image) => return image,
+            Err(error) => diag::warn!(Ui, "hud: {key}: {error}"),
         }
         None
     }

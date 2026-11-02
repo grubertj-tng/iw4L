@@ -15,8 +15,95 @@ pub struct ClassRow {
     pub camos: [String; 2],
 }
 
+trait ClassWeaponSource {
+    fn resolve(
+        &self,
+        selection: &asset_game::WeaponSelection,
+        rules: asset_game::LoadoutRules,
+    ) -> Result<u32, asset_game::ConfigurationRefusal>;
+    fn has_family(&self, family: &asset_game::FamilyKey) -> bool;
+    fn lookup(&self, name: &str) -> Result<Option<u32>, ()>;
+    fn describe_configuration(&self, id: u32) -> Option<&asset_game::WeaponSelection>;
+    fn admit(&self, id: u32) -> Result<(), asset_game::ConfigurationRefusal>;
+    fn camouflage_slot(&self, id: u32, name: &str) -> Option<u8>;
+}
+
+impl ClassWeaponSource for WeaponRegistry {
+    fn resolve(
+        &self,
+        selection: &asset_game::WeaponSelection,
+        rules: asset_game::LoadoutRules,
+    ) -> Result<u32, asset_game::ConfigurationRefusal> {
+        self.resolve_configuration(selection, rules)
+            .map(|resolved| {
+                self.bind(resolved.handle())
+                    .expect("configuration owner")
+                    .wire_id()
+            })
+    }
+    fn has_family(&self, family: &asset_game::FamilyKey) -> bool {
+        self.weapon_families().family(family).is_some()
+    }
+    fn lookup(&self, name: &str) -> Result<Option<u32>, ()> {
+        self.resolve_index(name).map_err(|_| ())
+    }
+    fn describe_configuration(&self, id: u32) -> Option<&asset_game::WeaponSelection> {
+        self.describe_configuration(id)
+    }
+    fn admit(&self, id: u32) -> Result<(), asset_game::ConfigurationRefusal> {
+        self.configuration_admission(id)
+    }
+    fn camouflage_slot(&self, id: u32, name: &str) -> Option<u8> {
+        self.camouflage_slot(id, name)
+    }
+}
+
+impl ClassWeaponSource for asset_game::EditorWeaponCatalog {
+    fn resolve(
+        &self,
+        selection: &asset_game::WeaponSelection,
+        rules: asset_game::LoadoutRules,
+    ) -> Result<u32, asset_game::ConfigurationRefusal> {
+        self.resolve_configuration(selection, rules)
+            .map(|resolved| resolved.wire_id())
+    }
+    fn has_family(&self, family: &asset_game::FamilyKey) -> bool {
+        self.weapon_families().family(family).is_some()
+    }
+    fn lookup(&self, name: &str) -> Result<Option<u32>, ()> {
+        self.resolve_index(name).map_err(|_| ())
+    }
+    fn describe_configuration(&self, id: u32) -> Option<&asset_game::WeaponSelection> {
+        self.describe_configuration(id)
+    }
+    fn admit(&self, id: u32) -> Result<(), asset_game::ConfigurationRefusal> {
+        self.admission(id)
+    }
+    fn camouflage_slot(&self, id: u32, name: &str) -> Option<u8> {
+        self.camouflage_slot(id, name)
+    }
+}
+
 pub fn resolve_class_weapon(
     weapons: &WeaponRegistry,
+    name: &str,
+    attachments: &[String],
+    rules: asset_game::LoadoutRules,
+) -> Result<u32, String> {
+    resolve_weapon_choice(weapons, name, attachments, rules)
+}
+
+pub fn resolve_editor_class_weapon(
+    weapons: &asset_game::EditorWeaponCatalog,
+    name: &str,
+    attachments: &[String],
+    rules: asset_game::LoadoutRules,
+) -> Result<u32, String> {
+    resolve_weapon_choice(weapons, name, attachments, rules)
+}
+
+fn resolve_weapon_choice(
+    weapons: &impl ClassWeaponSource,
     name: &str,
     attachments: &[String],
     rules: asset_game::LoadoutRules,
@@ -30,16 +117,15 @@ pub fn resolve_class_weapon(
     }
     let resolve = |selection: asset_game::WeaponSelection| {
         weapons
-            .resolve_configuration(&selection, rules)
-            .map(|resolved| resolved.id)
-            .map_err(|refusal| format!("{name}:{}", refusal.code()))
+            .resolve(&selection, rules)
+            .map_err(|refusal| format!("{name}:{} — {refusal}", refusal.code()))
     };
     if let Some(family) = asset_game::FamilyKey::parse(name)
-        && weapons.weapon_families().family(&family).is_some()
+        && weapons.has_family(&family)
     {
         return resolve(asset_game::WeaponSelection::with(family, attachments));
     }
-    let id = match weapons.resolve_index(name) {
+    let id = match weapons.lookup(name) {
         Ok(Some(id)) => id,
         Ok(None) | Err(_) => return Err(format!("{name}:catalog.unknown")),
     };
@@ -54,20 +140,34 @@ pub fn resolve_class_weapon(
             resolve(selection)
         }
         _ if attachments.is_empty() => weapons
-            .configuration_admission(id)
+            .admit(id)
             .map(|()| id)
-            .map_err(|refusal| format!("{name}:{}", refusal.code())),
+            .map_err(|refusal| format!("{name}:{} — {refusal}", refusal.code())),
         _ => Err(format!("{name}:weapon.unknown_family")),
     }
 }
 
-pub fn authoritative_class_lock_reason(
+pub(crate) fn authoritative_class_lock_reason(
     names: [&str; 4],
     ids: [u32; 4],
-    combat: &[weapon_iw4::WeaponCombatFacts],
-    equipment: &[sim::EquipmentRuntimeFacts],
+    content: &sim::SimWeaponContent,
 ) -> Option<String> {
     let mut reason = None;
+    for (name, id) in names.iter().zip(ids) {
+        if id != 0 && !content.is_runnable(id) {
+            append_lock_reason(
+                &mut reason,
+                format!(
+                    "{name}:execution.refused: {}",
+                    content
+                        .execution_refusal(id)
+                        .unwrap_or("weapon content missing")
+                ),
+            );
+        }
+    }
+    let combat = content.combat();
+    let equipment = content.equipment();
     for (name, id) in names[..2].iter().zip(&ids[..2]) {
         if *id == 0 {
             continue;
@@ -114,10 +214,15 @@ pub fn project_class(
     class_id: u32,
     row: &ClassRow,
     weapons: &WeaponRegistry,
-    combat: &[weapon_iw4::WeaponCombatFacts],
-    equipment: &[sim::EquipmentRuntimeFacts],
+    compiled: &crate::PreparedSimWeapons,
 ) -> AuthoritativeClassProjection {
-    let resolved = resolve_personal_class(row, weapons).and_then(|loadout| {
+    let content = compiled.content();
+    let resolved = if compiled.owned_by(weapons) {
+        resolve_personal_class(row, weapons)
+    } else {
+        Err("weapon.foreign_content".to_owned())
+    }
+    .and_then(|loadout| {
         loadout
             .definition(sim::ClassId(class_id), 1)
             .ok_or_else(|| "class.invalid_definition".to_owned())
@@ -130,9 +235,7 @@ pub fn project_class(
         ),
     };
     let names = row.weapons.each_ref().map(String::as_str);
-    if let Some(reason) =
-        authoritative_class_lock_reason(names, def.weapon_slot_ids(), combat, equipment)
-    {
+    if let Some(reason) = authoritative_class_lock_reason(names, def.weapon_slot_ids(), content) {
         append_lock_reason(&mut lock_reason, reason);
     }
     def.locked = lock_reason.is_some();
@@ -163,10 +266,24 @@ pub fn resolve_personal_class(
     row: &ClassRow,
     registry: &WeaponRegistry,
 ) -> Result<sim::PersonalClass, String> {
+    resolve_class_choices(row, registry)
+}
+
+pub fn resolve_editor_class(
+    row: &ClassRow,
+    catalog: &asset_game::EditorWeaponCatalog,
+) -> Result<sim::PersonalClass, String> {
+    resolve_class_choices(row, catalog)
+}
+
+fn resolve_class_choices(
+    row: &ClassRow,
+    registry: &impl ClassWeaponSource,
+) -> Result<sim::PersonalClass, String> {
     let mut loadout = sim::PersonalClass::default();
     let rules = asset_game::LoadoutRules::for_class(&row.perks[0]);
     for (slot, weapon) in loadout.weapons.iter_mut().enumerate() {
-        *weapon = resolve_class_weapon(
+        *weapon = resolve_weapon_choice(
             registry,
             &row.weapons[slot],
             row.attachments.get(slot).map_or(&[], Vec::as_slice),

@@ -50,6 +50,7 @@ pub(crate) fn schedule() -> Schedule {
                 crate::script::sync_players,
                 crate::script::sync_presence,
                 run_players_system,
+                crate::script::publish_projectile_launches,
                 record_collision_state_system,
                 run_entity_types_system,
                 dispatch_touches_system,
@@ -92,7 +93,7 @@ pub(crate) fn run_schedule(
     let request = ecs
         .remove_resource::<StepRequest>()
         .expect("simulation request missing");
-    if let Some(fault) = ecs.resource::<crate::script::Runtime>().fault.as_ref() {
+    if let Some(fault) = ecs.resource::<crate::script::RoundScript>().fault.as_ref() {
         return Err(fault.clone());
     }
     Ok(request
@@ -392,6 +393,7 @@ fn run_players_system(ecs: &mut World) {
             crate::script::player_commands(world.ecs(), id.0, cmd.buttons, old_buttons);
             let mut cmd = *cmd;
             crate::script_player::constrain_cmd(&mut world, *id, &mut cmd);
+            crate::script::hold_killcam_viewer(world.ecs(), *id, &mut cmd);
             crate::script::select_location(world.ecs(), id.0, &mut cmd, old_buttons);
             if world
                 .client_meta(*id)
@@ -401,6 +403,12 @@ fn run_players_system(ecs: &mut World) {
                 cmd.forwardmove = 0;
                 cmd.rightmove = 0;
                 cmd.buttons &= playerstate_iw4::buttons::CROUCH | playerstate_iw4::buttons::PRONE;
+            }
+            if facts.is_some_and(|f| f.scope_zoom.is_variable())
+                && ps.f_weapon_pos_frac == 1.0
+                && cmd.buttons & playerstate_iw4::buttons::CHANGE_ZOOM != 0
+            {
+                cmd.buttons &= !playerstate_iw4::buttons::MELEE_CHARGE;
             }
             let commanded_move = cmd.forwardmove != 0 || cmd.rightmove != 0;
             world.set_anim_command_buttons(*id, cmd.buttons);
@@ -564,7 +572,7 @@ fn run_players_system(ecs: &mut World) {
                 if world.publishes_snapshot() {
                     world.record_entity_collision_history(tick);
                 }
-                let emissions = phase_emit(&world, core::slice::from_ref(&shot));
+                let emissions = phase_emit(&world, tick, core::slice::from_ref(&shot));
                 phase_trace(&mut world, tick, &emissions);
             }
             crate::equipment::phase_offhand(&mut world, tick, &[(*id, cmd)]);
@@ -716,6 +724,11 @@ fn finalize_system(ecs: &mut World) {
 
     harvest_predictable_events(&mut world, tick);
     world.script_gaps_mut().report();
+    debug_assert!(
+        world.validate_entity_payloads().is_ok(),
+        "{:?}",
+        world.validate_entity_payloads()
+    );
 }
 
 fn publish_snapshot_system(ecs: &mut World) {
@@ -746,7 +759,7 @@ fn publish_snapshot_system(ecs: &mut World) {
     };
     drop(world);
     let script_seats = crate::script::script_seats(ecs);
-    let mut runtime = ecs.resource_mut::<crate::script::Runtime>();
+    let mut runtime = ecs.resource_mut::<crate::script::RoundScript>();
     let script_exit_level = std::mem::take(&mut runtime.exit_level);
     effects.kicks = std::mem::take(&mut runtime.kicks)
         .into_iter()
@@ -896,6 +909,7 @@ fn action_needs_player_row(action: &ClientAction) -> bool {
             | ClientAction::LeaveMatch { .. }
             | ClientAction::SetName { .. }
             | ClientAction::SetProfile { .. }
+            | ClientAction::Chat { .. }
             | ClientAction::UseCopycat { .. }
             | ClientAction::ActionSlot { .. }
             | ClientAction::ChooseDefaultClass { .. }
@@ -971,6 +985,19 @@ fn apply_action(
 
             ActionOutcome::Applied
         }
+        ClientAction::Chat {
+            team_only, text, ..
+        } => {
+            let end = text.iter().position(|b| *b == 0).unwrap_or(text.len());
+            let Ok(text) = core::str::from_utf8(&text[..end]) else {
+                return ActionOutcome::Refused;
+            };
+            if crate::chat::send(world, id, team_only, text) {
+                ActionOutcome::Applied
+            } else {
+                ActionOutcome::Refused
+            }
+        }
         ClientAction::UseCopycat { .. } | ClientAction::SpawnClient { .. } => {
             ActionOutcome::Refused
         }
@@ -1011,6 +1038,24 @@ fn apply_action(
                 );
             }
 
+            ActionOutcome::Applied
+        }
+        ClientAction::ChangeWeaponCamo { weapon, model, .. } => {
+            if !world.bootstrap_ref().allow_debug_actions
+                || !world
+                    .client_meta(id)
+                    .is_some_and(|m| m.lifecycle == ClientLifecycle::Alive)
+                || !world.weapon_camouflage_allowed(weapon, model)
+            {
+                return ActionOutcome::Refused;
+            }
+            let Some(ps) = world.player_mut(id) else {
+                return ActionOutcome::Refused;
+            };
+            if weapon == 0 || ps.weapon != weapon || !ps.weapons.contains(&(weapon as i32)) {
+                return ActionOutcome::Refused;
+            }
+            weapon_iw4::set_weapon_model_for_held(&ps.weapons, &mut ps.weapon_data, weapon, model);
             ActionOutcome::Applied
         }
         ClientAction::ChangeWeaponConfiguration {
@@ -1804,7 +1849,14 @@ fn choose_bot_class(world: &mut FrameWorld, id: ClientId, index: u8) {
     let bot_classes = &world.bootstrap_ref().bot_classes;
     let def = (!bot_classes.is_empty() && !t5)
         .then(|| bot_classes[index as usize % bot_classes.len()].clone())
-        .filter(|def| !def.locked && validate_class_content(world, def).is_ok());
+        .filter(|def| !def.locked && validate_class_content(world, def).is_ok())
+        .filter(|def| {
+            world
+                .ecs_ref()
+                .resource::<crate::PersistentDataStore>()
+                .temporary_client(id)
+                || crate::progression::validate_class(world, id, def).is_ok()
+        });
     match def {
         Some(def) => crate::script::choose_class(world.ecs(), id.0, &def),
         None => crate::script::choose_default_class(world.ecs(), id.0, index),
@@ -1830,7 +1882,10 @@ fn answer_custom_class(
     let Some(def) = crate::script::personal_class(world.ecs(), id.0, crate::ClassId(slot)) else {
         return Some(ActionOutcome::Refused);
     };
-    if validate_class_content(world, &def).is_err() {
+    if validate_class_content(world, &def)
+        .and_then(|()| crate::progression::validate_class(world, id, &def))
+        .is_err()
+    {
         return Some(ActionOutcome::Refused);
     }
     crate::script::choose_class(world.ecs(), id.0, &def);
@@ -1870,7 +1925,9 @@ fn apply_select_class(
         return ActionOutcome::Refused;
     };
 
-    if let Err(reason) = validate_class_content(world, &def) {
+    if let Err(reason) = validate_class_content(world, &def)
+        .and_then(|()| crate::progression::validate_class(world, id, &def))
+    {
         diag::info!(
             Sim,
             "class select: rejected client={} id={} rev={} reason={}",
@@ -2170,7 +2227,7 @@ pub(crate) fn script_slide(
     origin: [f32; 3],
     slide: &mut crate::script::host::mechanics::Slide,
 ) -> [f32; 3] {
-    let runtime = world.resource::<crate::script::Runtime>();
+    let runtime = world.resource::<crate::script::RoundScript>();
     let linked = |mut child: u64| {
         for _ in 0..runtime.entities.len() {
             if child == object {

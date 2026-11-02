@@ -198,8 +198,10 @@ impl AudioRuntime {
         self.shared.master.store(gain.to_bits(), Ordering::Release);
     }
 
-    pub fn set_match_epoch(&self, epoch: u64) {
-        self.shared.match_epoch.store(epoch, Ordering::Release);
+    pub fn set_presentation_epoch(&self, epoch: u64) {
+        self.shared
+            .presentation_epoch
+            .store(epoch, Ordering::Release);
         self.source_publisher
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -224,7 +226,7 @@ impl AudioRuntime {
             .unwrap_or_else(|poison| poison.into_inner())
             .reconcile(
                 sources,
-                self.shared.match_epoch.load(Ordering::Acquire),
+                self.shared.presentation_epoch.load(Ordering::Acquire),
                 self.shared.cancelled.load(Ordering::Acquire),
             );
         self.sources.dropped.fetch_add(rejected, Ordering::Relaxed);
@@ -326,6 +328,7 @@ impl AudioRuntime {
             class,
             epoch,
             pitch_scale,
+            volume_scale,
             fallbacks,
         } = request;
         if fallbacks.len() > 16 {
@@ -362,6 +365,7 @@ impl AudioRuntime {
             scope: class.scope(),
             epoch,
             pitch_scale,
+            volume_scale,
             execution: CueIntent {
                 event,
                 origin_inches,
@@ -542,7 +546,7 @@ fn control(
         {
             desired = scene;
         }
-        let epoch = shared.match_epoch.load(Ordering::Acquire);
+        let epoch = shared.presentation_epoch.load(Ordering::Acquire);
         desired.sources.retain(|source| {
             !shared.cancelled.load(Ordering::Acquire)
                 && (source.key.scope != AudioScope::Match || source.key.epoch == epoch)
@@ -668,7 +672,7 @@ fn control(
         });
 
         let diag_stage = crate::diagnostics::slow_stage("null_and_reclaim", diag_stage);
-        resolver.retain_epoch(shared.match_epoch.load(Ordering::Acquire));
+        resolver.retain_epoch(shared.presentation_epoch.load(Ordering::Acquire));
         for _ in 0..CONTROL_BATCH {
             let Ok(request) = cue_rx.try_recv() else {
                 break;
@@ -677,7 +681,7 @@ fn control(
             // Validate a newly received cue against the latest published clocks.
             events.advance(event_context.get());
             if request.scope == AudioScope::Match
-                && request.epoch != shared.match_epoch.load(Ordering::Acquire)
+                && request.epoch != shared.presentation_epoch.load(Ordering::Acquire)
             {
                 request.reject(CueFailure::StaleScope);
             } else if crate::event::EventJournal::fire_refused(
@@ -707,7 +711,7 @@ fn control(
             let mut work = pending_cues.pop_front().expect("pending cue");
             if shared.cancelled.load(Ordering::Acquire)
                 || (work.request.scope == AudioScope::Match
-                    && work.request.epoch != shared.match_epoch.load(Ordering::Acquire))
+                    && work.request.epoch != shared.presentation_epoch.load(Ordering::Acquire))
             {
                 work.complete(crate::StartOutcome::Failed(
                     crate::StartFailure::CueRefused(if shared.cancelled.load(Ordering::Acquire) {
@@ -790,6 +794,11 @@ fn control(
                 CueStep::Waiting => pending_cues.push_back(work),
                 CueStep::Finished => {}
                 CueStep::Start(start) => {
+                    let start_delay_ms = work
+                        .resolved
+                        .as_ref()
+                        .map_or(0, |cue| u64::from(cue.policy.composition.start_delay_ms));
+                    let start_delay = Duration::from_millis(start_delay_ms);
                     let instance = make_instance(
                         next_id.fetch_add(1, Ordering::Relaxed),
                         work.request.scope,
@@ -820,7 +829,7 @@ fn control(
                         StartRequest {
                             event: work.request.execution.event,
                             start_deadline: (work.source.is_none() && !start.looping)
-                                .then_some(work.request.execution.deadline),
+                                .then_some(work.request.execution.deadline + start_delay),
                             protect_attack: work.source.is_none()
                                 && !start.looping
                                 && work.request.execution.class == crate::SoundClass::Weapon,
@@ -830,10 +839,15 @@ fn control(
                             media: start.media,
                             instance: instance.clone(),
                             looping: start.looping,
-                            frame: source.map_or_else(
-                                || shared.frame.load(Ordering::Acquire),
-                                |source| source.start_frame,
-                            ),
+                            frame: source
+                                .map_or_else(
+                                    || shared.frame.load(Ordering::Acquire),
+                                    |source| source.start_frame,
+                                )
+                                .saturating_add(
+                                    start_delay_ms * u64::from(crate::render_core::SAMPLE_RATE)
+                                        / 1000,
+                                ),
                         },
                         &shared,
                         &mut instances,
@@ -873,7 +887,7 @@ fn control(
         apply_source_render_budget(&instances);
         instances.sort_by_key(|logical| logical.source.is_some());
         let now = shared.frame.load(Ordering::Acquire);
-        let epoch = shared.match_epoch.load(Ordering::Acquire);
+        let epoch = shared.presentation_epoch.load(Ordering::Acquire);
 
         instances.retain_mut(|logical| {
             let instance = &logical.request.instance;
@@ -984,6 +998,7 @@ fn control(
                     scope: source.key.scope,
                     epoch: source.key.epoch,
                     pitch_scale: 1.0,
+                    volume_scale: 1.0,
                     execution: CueIntent {
                         event: None,
                         origin_inches: source.origin_inches,
@@ -1270,7 +1285,7 @@ fn admit(
     {
         Some(AdmissionFailure::Cancelled)
     } else if request.instance.scope == AudioScope::Match
-        && request.instance.epoch != shared.match_epoch.load(Ordering::Acquire)
+        && request.instance.epoch != shared.presentation_epoch.load(Ordering::Acquire)
     {
         Some(AdmissionFailure::StaleScope)
     } else if instances.len() == LOGICAL_INSTANCES {

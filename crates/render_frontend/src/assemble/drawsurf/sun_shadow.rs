@@ -1,3 +1,5 @@
+use bevy::prelude::DetectChangesMut;
+
 pub use super::sun_shadow_clip::{
     SunShadowClipInput, SunShadowFrustumRays, sun_shadow_clip_planes, sun_shadow_frustum_rays,
 };
@@ -131,8 +133,6 @@ pub const SUN_SHADOW_HALF: f32 = 0.5;
 pub const SUN_SHADOW_NEG_QUARTER: f32 = -0.25;
 
 pub const SUN_SHADOW_SAMPLE_EXTENT_PIXELS: f32 = 1024.0;
-
-pub const SM_SUN_SAMPLE_SIZE_NEAR_DEFAULT: f32 = 0.25;
 
 pub const SM_SUN_PARTITION_RATIO: f32 = 4.0;
 
@@ -437,6 +437,8 @@ pub fn forced_fallback_frame(
     world_mid: [f32; 3],
 
     world_half: [f32; 3],
+
+    sample_near: f32,
 ) -> SunShadowForcedFrame {
     let profile = SUN_SHADOW_FORCED_PROFILE;
     let axes = sun_axes_from_dir(sun_direction);
@@ -447,7 +449,6 @@ pub fn forced_fallback_frame(
     ]);
     let view_origin = camera.origin;
     let org = view_org_in_sun_proj(view_origin, axes);
-    let sample_near = SM_SUN_SAMPLE_SIZE_NEAR_DEFAULT;
     let sample_far = sample_near * SM_SUN_PARTITION_RATIO;
     let sample_size = [sample_near, sample_far];
     let corner_rays = sun_shadow_corner_rays(camera);
@@ -553,4 +554,63 @@ pub fn forced_fallback_frame(
         shadow_org_pixel_center: fit.pixel_center,
         projection_offset_clip,
     }
+}
+
+pub fn sun_shadow_frame_for_view(
+    light_direction: [f32; 3],
+    prepared: &crate::prepare::scene::view_parms::PreparedSceneView,
+    world_bounds: [f32; 6],
+    sample_near: f32,
+) -> SunShadowForcedFrame {
+    let world = prepared.view_from_world.inverse();
+    let axis = |local: bevy::math::Vec3| world.transform_vector3(local).normalize_or_zero();
+    let (tan_half_fov_x, tan_half_fov_y) = tan_half_fov_from_clip(prepared.clip_from_view);
+    forced_fallback_frame(
+        sun_shadow_forward_from_light_dir(light_direction),
+        SunShadowCamera {
+            origin: prepared.eye.to_array(),
+            forward: axis(bevy::math::Vec3::NEG_Z).to_array(),
+            right: axis(bevy::math::Vec3::X).to_array(),
+            up: axis(bevy::math::Vec3::Y).to_array(),
+            tan_half_fov_x,
+            tan_half_fov_y,
+            z_near: prepared.near,
+        },
+        [world_bounds[0], world_bounds[1], world_bounds[2]],
+        [world_bounds[3], world_bounds[4], world_bounds[5]],
+        sample_near,
+    )
+}
+
+pub(crate) fn publish_sun_shadow_frame(
+    dir_light: Option<bevy::prelude::Res<crate::prepare::scene::world::MapDirPrimaryLight>>,
+    prepared: bevy::prelude::Res<crate::prepare::scene::view_parms::PreparedSceneView>,
+    scene: Option<bevy::prelude::Res<crate::prepare::scene::world::WorldScene>>,
+    shadows: bevy::prelude::Res<render_scene::SmEnableDvar>,
+    sun_shadows: bevy::prelude::Res<render_scene::SmSunEnableDvar>,
+    mut published: bevy::prelude::ResMut<render_scene::PreparedSunShadowFrame>,
+) {
+    let enabled = prepared.ready
+        && shadows.enabled.unwrap_or(lighting_iw4::SM_ENABLE_DEFAULT)
+        && sun_shadows
+            .enabled
+            .unwrap_or(lighting_iw4::SM_SUN_ENABLE_DEFAULT);
+    let next = if enabled {
+        dir_light
+            .as_deref()
+            .zip(scene.as_deref())
+            .and_then(|(light, scene)| {
+                scene.world_bounds.map(|bounds| {
+                    sun_shadow_frame_for_view(
+                        light.direction,
+                        &prepared,
+                        bounds,
+                        scene.sun_sample_size_near,
+                    )
+                })
+            })
+    } else {
+        None
+    };
+    published.set_if_neq(render_scene::PreparedSunShadowFrame(next));
 }

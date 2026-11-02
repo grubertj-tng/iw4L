@@ -194,7 +194,7 @@ fn grenade_deadlines(
     }
     let cleanup_at_ms = cap_at;
     match kind {
-        GrenadeLaunchKind::Launcher if facts.fuse_time_ms <= 0 => {
+        GrenadeLaunchKind::Launcher if facts.fuse_time_ms <= 0 || !facts.timed_detonation => {
             if facts.projectile_activate_dist != 0 {
                 (None, cleanup_at_ms)
             } else {
@@ -218,14 +218,10 @@ fn grenade_deadlines(
             };
             (Some(now_ms.saturating_add(fuse)), cleanup_at_ms)
         }
-        GrenadeLaunchKind::Launcher => {
-            let fuse = if facts.fuse_time_ms <= 0 {
-                GRENADE_DEFAULT_FUSE_MS
-            } else {
-                facts.fuse_time_ms.min(GRENADE_FUSE_CAP_MS)
-            };
-            (Some(now_ms.saturating_add(fuse)), cleanup_at_ms)
-        }
+        GrenadeLaunchKind::Launcher => (
+            Some(now_ms.saturating_add(facts.fuse_time_ms.min(GRENADE_FUSE_CAP_MS))),
+            cleanup_at_ms,
+        ),
     }
 }
 
@@ -573,7 +569,7 @@ pub(crate) fn think_projectile(world: &mut FrameWorld, tick: Tick, entnum: i32) 
             .detonate_at_ms
             .is_none_or(|deadline| deadline > projectile.cleanup_at_ms || !projectile.live)
     {
-        let _ = world.remove_projectile_by_number(entnum);
+        let _ = world.despawn_projectile(entnum);
         return;
     }
     let facts = required_projectile_facts(world, projectile.weapon);
@@ -647,6 +643,8 @@ pub(crate) fn think_projectile(world: &mut FrameWorld, tick: Tick, entnum: i32) 
         }
         return;
     }
+    let remote = crate::remote_missile::is_remote(world, projectile.id);
+    let mask = crate::remote_missile::projectile_mask(remote);
     let mut trace_start = start;
     let mut hops = 0u32;
     let mut hop_capped = false;
@@ -665,7 +663,7 @@ pub(crate) fn think_projectile(world: &mut FrameWorld, tick: Tick, entnum: i32) 
             &BulletTraceQuery {
                 start: trace_start,
                 end,
-                mask: MASK_BULLET_WORLD,
+                mask,
                 ignore: Some(projectile.owner),
                 ignore_hit: None,
                 ignore_model: None,
@@ -736,6 +734,22 @@ pub(crate) fn think_projectile(world: &mut FrameWorld, tick: Tick, entnum: i32) 
             continue;
         }
         break outcome;
+    };
+    let outcome = if remote {
+        let sky = crate::world::clip_trace(
+            brushes,
+            bsp,
+            mesh,
+            start,
+            end,
+            [0.0; 3],
+            [0.0; 3],
+            crate::bullet_collision::CONTENTS_SKY,
+            &|_| true,
+        );
+        crate::remote_missile::sky_wall_outcome(outcome, start, &sky)
+    } else {
+        outcome
     };
     if world.publishes_snapshot()
         && projectile.live
@@ -848,7 +862,7 @@ pub(crate) fn think_projectile(world: &mut FrameWorld, tick: Tick, entnum: i32) 
     };
     match tick_outcome {
         TickOutcome::Cleanup => {
-            let _ = world.remove_projectile_by_number(entnum);
+            let _ = world.despawn_projectile(entnum);
             return;
         }
         TickOutcome::Fuse => {
@@ -1254,7 +1268,11 @@ pub(crate) fn think_projectile(world: &mut FrameWorld, tick: Tick, entnum: i32) 
             *row = projectile;
         }
     } else {
-        let _ = world.remove_projectile_by_number(entnum);
+        let terminal = detonated
+            .iter()
+            .find(|info| info.splash)
+            .map(|info| (tick, info.projectile));
+        let _ = world.finish_projectile(entnum, terminal);
     }
     for info in &detonated {
         impacts.push(ProjectileImpact {
@@ -1272,11 +1290,6 @@ pub(crate) fn think_projectile(world: &mut FrameWorld, tick: Tick, entnum: i32) 
         });
     }
     world.record_projectile_impacts(tick, &impacts);
-    for info in &detonated {
-        if info.splash {
-            world.note_dying_missile(tick, info.projectile);
-        }
-    }
     let resolves_damage = world.publishes_snapshot();
     if resolves_damage {
         for (projectile, target) in direct_hits {

@@ -35,7 +35,10 @@ pub(crate) fn load_user_settings(
     };
     persistence.path = Some(path.clone());
     match fs::read_to_string(&path) {
-        Ok(source) => parse_settings(&source, &mut settings, &mut binds),
+        Ok(source) => {
+            parse_settings(&source, &mut settings, &mut binds);
+            persistence.last_payload = Some(source);
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             // Do not replace settings we could not read with session defaults.
@@ -47,7 +50,9 @@ pub(crate) fn load_user_settings(
         }
     }
     settings.sanitize();
-    persistence.last_payload = Some(serialize_settings(&settings, &binds));
+    if persistence.last_payload.is_none() {
+        persistence.last_payload = Some(serialize_settings(&settings, &binds));
+    }
 }
 
 pub(crate) fn consume_menu_binding(
@@ -152,20 +157,17 @@ pub(crate) fn consume_menu_binding(
 
 pub(crate) fn sync_binding_view(
     binds: Res<KeyBinds>,
-    devices: Res<frame::InputDevices>,
     mut view: ResMut<ui::BindingView>,
     mut dvars: ResMut<frame::UiMenuDvars>,
-    mut style: Local<Option<frame::PromptStyle>>,
 ) {
-    if !binds.is_changed() && *style == Some(devices.style) {
+    if !binds.is_changed() {
         return;
     }
-    *style = Some(devices.style);
     let mut chords = std::collections::BTreeMap::<u32, (Vec<String>, Vec<String>)>::new();
     for (button, id) in binds.iter() {
         let (keys, buttons) = chords.entry(id).or_default();
         match button {
-            BindButton::Pad(pad) => buttons.push(pad.prompt(devices.style).to_owned()),
+            BindButton::Pad(pad) => buttons.push(pad.icon_prompt().to_owned()),
             _ => keys.push(display_button(button)),
         }
     }
@@ -204,15 +206,15 @@ pub(crate) fn apply_master_volume(
 pub(crate) fn sync_player_name(
     settings: Res<frame::GameSettings>,
     generation: Res<frame::WorldGeneration>,
-    has_world: Res<frame::HasWorld>,
+    has_world: Res<State<frame::MatchScope>>,
     role: Res<frame::RuntimeRole>,
     local: Option<Res<net::LocalPresentClient>>,
     link: Option<Res<net::UdpClientLink>>,
     mut inbox: Option<ResMut<net::ClientActionInbox>>,
     mut seq: ResMut<net::ActionRequestIds>,
-    mut sent: Local<Option<(frame::WorldGeneration, sim::ClientId, [u8; 16])>>,
+    mut sent: Local<Option<(frame::WorldStamp, sim::ClientId, [u8; 16])>>,
 ) {
-    if !has_world.0 || *role == frame::RuntimeRole::Replay {
+    if !(*has_world.get() == frame::MatchScope::Live) || *role == frame::RuntimeRole::Replay {
         *sent = None;
         return;
     }
@@ -228,7 +230,7 @@ pub(crate) fn sync_player_name(
         return;
     }
     let name = entity_iw4::pack_client_state_name(&settings.player_name);
-    let next = (*generation, local.0, name);
+    let next = (generation.stamp(), local.0, name);
     if sent.as_ref() == Some(&next) {
         return;
     }
@@ -311,7 +313,7 @@ fn parse_into<T: std::str::FromStr>(value: &str, slot: &mut T) {
 fn serialize_settings(settings: &frame::GameSettings, binds: &KeyBinds) -> String {
     let safe_name = settings.player_name.replace(['\n', '\r', '='], " ");
     let mut lines = vec![
-        "// IW4L user settings v2".to_owned(),
+        "// IW4L user settings v3".to_owned(),
         format!(
             "resolution={}x{}",
             settings.resolution.width, settings.resolution.height
@@ -455,6 +457,22 @@ fn parse_settings(source: &str, settings: &mut frame::GameSettings, binds: &mut 
         let warnings = binds.apply_config_script(&bind_script);
         for warning in warnings {
             warn!("settings bind: {warning}");
+        }
+    }
+    if !source
+        .lines()
+        .any(|line| line.trim() == "// IW4L user settings v3")
+    {
+        for (key, command) in [
+            (KeyCode::KeyT, "chatmodepublic"),
+            (KeyCode::KeyY, "chatmodeteam"),
+        ] {
+            if let Some(id) = input_iw4::command_id_lookup(command)
+                && binds.get(BindButton::Key(key)).is_none()
+                && !binds.iter().any(|(_, bound)| bound == id)
+            {
+                binds.set(BindButton::Key(key), id);
+            }
         }
     }
     if !binds.has_pad_binds() {

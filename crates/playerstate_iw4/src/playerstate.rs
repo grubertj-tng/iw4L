@@ -95,6 +95,7 @@ pub struct PlayerState {
     pub weapon_primary: u32,
     pub weap_flags: u32,
     pub f_weapon_pos_frac: f32,
+    pub scope_zoom_level: u32,
     pub hold_breath_timer: i32,
     pub hold_breath_scale: f32,
     pub aim_spread_scale: f32,
@@ -313,6 +314,7 @@ impl PlayerState {
         weapon_primary: 0,
         weap_flags: 0,
         f_weapon_pos_frac: 0.0,
+        scope_zoom_level: 0,
         hold_breath_timer: 0,
         hold_breath_scale: 1.0,
         aim_spread_scale: 0.0,
@@ -368,6 +370,11 @@ pub const PERK_QUICKDRAW_SPEED_SCALE: f32 = 1.5;
 pub const PERK_COLDBLOODED: u32 = 1 << 27;
 
 pub const PERK_HEARTBREAKER: u32 = 1 << 28;
+pub const PERK_SELECTIVEHEARING: u32 = 1 << 29;
+pub const PERK1_FASTSPRINTRECOVERY: u32 = 1 << 2;
+pub const PERK1_EXTENDEDMELEE: u32 = 1 << 3;
+pub const EXTENDED_MELEE_TARGET_RANGE: f32 = 192.0;
+pub const SPRINT_RECOVERY_MULTIPLIER: f32 = 0.6;
 
 pub const PERK1_SPYGAME: u32 = 1;
 

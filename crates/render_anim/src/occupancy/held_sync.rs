@@ -1,8 +1,9 @@
 use bevy::prelude::*;
+use frame::ScopeApp;
 use frame::{LaunchReport, LifeEnded, LifeFrontPublished, LifeStarted, ViewSubject};
 use net::{ClientSet, LocalPresentClient, PresentedSnapshot};
 
-use crate::anim::fpv_prepared::PreparedFpv;
+use crate::anim::fpv_prepared::{FpvOwnerInputs, PreparedFpv};
 use crate::gaps::{RenderGap, RenderGapCause, RenderPresentationGaps};
 use crate::occupancy::fpv_present::{
     FpvHeldLife, FpvHeldSettled, FpvPlacementRoot, FpvState, FpvStatusGap, PendingFpvSpawn,
@@ -16,6 +17,7 @@ pub fn sync_fpv_to_held_weapon(
     local: Res<LocalPresentClient>,
     view: Res<ViewSubject>,
     prepared: Res<PreparedFpv>,
+    owners: FpvOwnerInputs,
     mut pending_fpv: ResMut<PendingFpvSpawn>,
     mut session_vm: ResMut<SessionViewmodel>,
     mut settled: ResMut<FpvHeldSettled>,
@@ -160,6 +162,14 @@ pub fn sync_fpv_to_held_weapon(
         }
         return;
     };
+    let Some((weapon_handle, parent_handle)) =
+        owners.handles(presented.weapon_epoch(), held, ps.weapon_primary)
+    else {
+        return;
+    };
+    if owners.bind(table).is_none() {
+        return;
+    }
     let state = match table.gun_index(held) {
         Some(gun_index) => {
             for entity in &existing_fpv {
@@ -167,6 +177,8 @@ pub fn sync_fpv_to_held_weapon(
             }
             session_vm.0 = None;
             pending_fpv.0 = Some(PendingFpvSpawnRequest {
+                weapon_handle,
+                parent_handle,
                 gun_index,
                 catalog_id: table.catalog_id(),
                 weapon_id: held,
@@ -214,8 +226,20 @@ pub fn sync_fpv_status_to_probe(
 }
 
 pub(crate) fn register_held_sync_systems(app: &mut App) {
-    app.add_message::<LifeStarted>()
-        .add_message::<LifeEnded>()
-        .add_systems(Update, sync_fpv_to_held_weapon.in_set(LifeFrontPublished))
-        .add_systems(Update, sync_fpv_status_to_probe.in_set(ClientSet::Diag));
+    app.scoped_message::<LifeStarted>(frame::MatchScope::Live)
+        .scoped_message::<LifeEnded>(frame::MatchScope::Live)
+        .add_systems(
+            Update,
+            (sync_fpv_to_held_weapon
+                .in_set(frame::InMatch)
+                .in_set(LifeFrontPublished))
+            .in_set(frame::InMatch),
+        )
+        .add_systems(
+            Update,
+            (sync_fpv_status_to_probe
+                .in_set(frame::InMatch)
+                .in_set(ClientSet::Diag))
+            .in_set(frame::InMatch),
+        );
 }

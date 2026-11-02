@@ -7,13 +7,13 @@ use assets::{
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use frame::{
-    CacWeaponOffer, ClassSelectHandoff, HasWorld, HostClassLoadouts, LaunchIdentity, LaunchReport,
-    MatchInstalled, WorldGeneration, WorldProducts,
+    CacWeaponOffer, ClassSelectHandoff, HostClassLoadouts, InstalledMatch, LaunchIdentity,
+    LaunchReport, WorldProducts, WorldStamp,
 };
 use net::{AuthorityInputGate, AuthorityLoadHold, AuthorityWorld, ClientSet};
 
 use crate::SessionContentManifest;
-use crate::combat_table;
+use crate::weapon_content;
 use render_frontend::adapters::anim::dyn_ent::{DynEntPhysClip, DynEntPhysWorld};
 use render_frontend::prepare::scene::camera::SimCamera;
 use render_frontend::prepare::scene::world::{WorldScene, world_scene_from_draw};
@@ -37,6 +37,11 @@ fn log_world_report(report: &[String]) {
 #[derive(SystemParam)]
 pub struct PreparedMatchSource<'w, 's> {
     ready: ResMut<'w, PreparedMatchReady>,
+    audio_status: Option<Res<'w, audio::LoadingAudioStatus>>,
+    audio_owner: Option<Res<'w, audio::LoadingAudioOwner>>,
+    audio_candidate: Option<Res<'w, audio::PreparedMatchAudio>>,
+    audio_silent: Option<Res<'w, audio::AudioSilent>>,
+    current: Res<'w, assets::CurrentMatchLoad>,
     swap: Res<'w, crate::SessionSwapRequest>,
     bridge: Option<Res<'w, net::MasterBridge>>,
     intent: Option<Res<'w, net::MasterLaunchIntent>>,
@@ -64,7 +69,6 @@ impl MatchInstallConsole<'_> {
 #[derive(SystemParam)]
 pub struct MatchInstallAuthority<'w> {
     role: Res<'w, frame::RuntimeRole>,
-    prediction: Option<Res<'w, net::ClientPredictionState>>,
     input_gate: Res<'w, AuthorityInputGate>,
     cheats: Option<Res<'w, sim::HostCheats>>,
     profile: Option<Res<'w, sim::LocalPlayerProfile>>,
@@ -77,11 +81,18 @@ pub struct MatchInstallAuthority<'w> {
 pub struct MatchInstallPresentation<'w> {
     probe: Option<ResMut<'w, LaunchReport>>,
     camera: Res<'w, SimCamera>,
+    player_data: Res<'w, sim::LocalPlayerData>,
 }
 
-#[derive(SystemParam)]
-pub struct MatchInstallOccupancy<'w> {
-    has_world: ResMut<'w, HasWorld>,
+fn discard_ready(commands: &mut Commands, key: frame::LocalLoadKey) {
+    commands.queue(move |world: &mut World| {
+        if world
+            .get_resource::<PreparedMatchReady>()
+            .is_some_and(|ready| ready.load_key == key)
+        {
+            world.remove_resource::<PreparedMatchReady>();
+        }
+    });
 }
 
 pub fn apply_prepared_match(
@@ -90,13 +101,17 @@ pub fn apply_prepared_match(
     mut console: MatchInstallConsole,
     authority: MatchInstallAuthority,
     presentation: MatchInstallPresentation,
-    occupancy: MatchInstallOccupancy,
     mode_selection: Option<Res<sim::HostGameModeSelection>>,
     rules: Option<Res<frame::HostMatchRules>>,
     mut failed: MessageWriter<frame::MapLoadFailed>,
 ) {
     let PreparedMatchSource {
         mut ready,
+        audio_status,
+        audio_owner,
+        audio_candidate,
+        audio_silent,
+        current,
         swap,
         bridge,
         intent,
@@ -110,7 +125,6 @@ pub fn apply_prepared_match(
     } = source;
     let MatchInstallAuthority {
         role,
-        prediction,
         input_gate,
         cheats,
         profile,
@@ -122,8 +136,8 @@ pub fn apply_prepared_match(
     let MatchInstallPresentation {
         mut probe,
         camera: sim_cam,
+        player_data,
     } = presentation;
-    let MatchInstallOccupancy { mut has_world } = occupancy;
     let stale_key = !ready.load_key.match_key.is_none()
         && bridge.as_ref().is_none_or(|bridge| {
             let state = bridge.state();
@@ -131,7 +145,8 @@ pub fn apply_prepared_match(
                 || state.identity().match_key() != ready.load_key.match_key
                 || ready.load_key.incarnation != bridge.incarnation()
         });
-    if !swap.accepts_install(ready.request_id)
+    if current.0 != Some(ready.load_key)
+        || !swap.accepts_install(ready.request_id)
         || stale_key
         || ready.load_key.local_load_request_id != ready.request_id
     {
@@ -144,7 +159,7 @@ pub fn apply_prepared_match(
         if let Some(stage) = install_stage.take() {
             stage.cancel();
         }
-        commands.remove_resource::<PreparedMatchReady>();
+        discard_ready(&mut commands, ready.load_key);
         return;
     }
     if ready.load_key.match_key.is_none() && intent.as_ref().is_some_and(|intent| intent.is_join())
@@ -157,13 +172,51 @@ pub fn apply_prepared_match(
         if let Some(stage) = install_stage.take() {
             stage.cancel();
         }
-        commands.remove_resource::<PreparedMatchReady>();
-        commands.remove_resource::<MatchLoadAbort>();
+        discard_ready(&mut commands, ready.load_key);
+        let request_id = ready.request_id;
+        commands.queue(move |world: &mut World| {
+            if world
+                .get_resource::<MatchLoadAbort>()
+                .is_some_and(|abort| abort.0 == request_id)
+            {
+                world.remove_resource::<MatchLoadAbort>();
+            }
+        });
         diag::info!(
             World,
             "match install: aborted request #{dropped} (`{zone}`) — not occupying the menu"
         );
         return;
+    }
+    if role.runs_client()
+        && audio_owner
+            .as_ref()
+            .is_none_or(|owner| owner.0 != Some(ready.load_key))
+    {
+        return;
+    }
+    match audio_status.as_deref() {
+        Some(audio::LoadingAudioStatus::Ready) => {
+            if role.runs_client()
+                && audio_silent.is_none()
+                && audio_candidate
+                    .as_ref()
+                    .is_none_or(|candidate| candidate.load_key != ready.load_key)
+            {
+                return;
+            }
+        }
+        Some(audio::LoadingAudioStatus::Failed(error)) => {
+            failed.write(frame::MapLoadFailed {
+                request_id: ready.request_id,
+                load_key: ready.load_key,
+                zone: ready.zone.clone(),
+                error: error.clone(),
+            });
+            discard_ready(&mut commands, ready.load_key);
+            return;
+        }
+        _ => return,
     }
     // The stage opens a frame before the work so the row is already up when
     // the main thread stops answering — the yield is the point, not an
@@ -187,8 +240,10 @@ pub fn apply_prepared_match(
     let request_id = ready.request_id;
     let load_key = ready.load_key;
     let zone = std::mem::take(&mut ready.zone);
-    let mut prepared = std::mem::take(&mut ready.prepared);
-    commands.remove_resource::<PreparedMatchReady>();
+    let Some(mut prepared) = ready.prepared.take() else {
+        return;
+    };
+    discard_ready(&mut commands, ready.load_key);
 
     let world_report = std::mem::take(&mut prepared.report);
     log_world_report(&world_report);
@@ -200,11 +255,13 @@ pub fn apply_prepared_match(
 
     let plan = match preflight_match_install(
         prepared,
+        load_key,
         &zone,
         mode_selection.as_deref(),
         rules.as_deref(),
         catalog.as_deref(),
         identity.as_deref(),
+        *role,
     ) {
         Ok(plan) => plan,
         Err(refusal) => {
@@ -215,7 +272,6 @@ pub fn apply_prepared_match(
                 }
                 probe.world_report = world_report;
             }
-            *has_world = HasWorld(false);
             if let Some(stage) = install_stage {
                 stage.fail();
             }
@@ -234,7 +290,10 @@ pub fn apply_prepared_match(
     };
     let prepared_install = (|| -> Result<bevy::ecs::world::CommandQueue, InstallRefusal> {
         let mut install = bevy::ecs::world::CommandQueue::default();
+        install.push(audio::stage_prepared_match_audio);
         let MatchInstallPlan {
+            ui_images,
+            capabilities,
             scripts,
             script_level,
             script_entries,
@@ -249,6 +308,7 @@ pub fn apply_prepared_match(
             killstreaks,
             fpv_meshes,
             bodies,
+            soldiers,
             world_weapons,
             projectile_meshes,
             xmodel_walk,
@@ -271,8 +331,69 @@ pub fn apply_prepared_match(
         } = plan;
         let spawn_count = prepared_map.spawns.len();
 
+        let mut local_player_data = player_data.clone();
+        let definitions = script_level
+            .schemas
+            .get("mp/playerdata.def")
+            .ok_or_else(|| {
+                InstallRefusal::new("Local progression: player data schema is missing")
+            })?;
+        let ranks = weapons
+            .registry()
+            .rank_progression()
+            .map_err(|error| InstallRefusal::new(format!("Local progression: {error}")))?;
+        local_player_data
+            .install(
+                definitions,
+                ranks,
+                account
+                    .as_ref()
+                    .and_then(|account| account.snapshot.as_ref()),
+            )
+            .map_err(|error| InstallRefusal::new(format!("Local progression: {error:?}")))?;
+        local_player_data.install_unlock_data(
+            account_defaults.clone(),
+            script_level
+                .tables
+                .get("mp/allchallengestable.csv")
+                .cloned(),
+        );
+        for name in ["mp/ranktable.csv", "mp/rankicontable.csv"] {
+            if let Some(table) = script_level.tables.get(name) {
+                local_player_data.install_rank_table(name, table.clone());
+            }
+        }
+        diag::info!(
+            Sim,
+            "local progression prepared before admission: rank={}",
+            local_player_data
+                .progression
+                .as_ref()
+                .expect("installed progression")
+                .rank
+        );
+        let rank_tables = [
+            weapons.registry().shared_rank_table(),
+            weapons.registry().shared_rank_icons(),
+        ]
+        .map(|table| table.expect("validated rank presentation").clone());
+        install.push(move |world: &mut World| {
+            world
+                .resource_mut::<crate::scope_control::InstallAnnouncement>()
+                .0
+                .push(move |world: &mut World| {
+                    if let Some(mut catalog) = world.get_resource_mut::<asset_game::MenuCatalog>() {
+                        for table in rank_tables {
+                            catalog.insert_string_table(table);
+                        }
+                    }
+                    world.insert_resource(local_player_data);
+                });
+        });
+
         let facts = std::mem::take(&mut prepared_map.facts);
         let airstrike_height = facts.airstrike_height;
+        stage_resource(&mut install, crate::scope_control::MatchUiImages(ui_images));
         stage_resource(
             &mut install,
             assets::SessionCompass {
@@ -298,13 +419,27 @@ pub fn apply_prepared_match(
 
         let mut scene = loaded_scene;
         scene.readiness = frame::WorldReadiness::new(
-            WorldGeneration::from_install(request_id),
+            WorldStamp::from_install(request_id),
             frame::ReadinessState::Pending,
         );
         let mut sim_cam = *sim_cam;
         let mut input_gate = *input_gate;
-        let mut content = sim::SimContentBuilder::default();
+        let sim_weapons = weapon_content::compile(
+            weapons.registry(),
+            &world_weapons.0,
+            lochit_table,
+            objective_weapons,
+            pen_table,
+            pen_table_loaded,
+        )
+        .map_err(|error| InstallRefusal::new(format!("Invalid simulation weapons: {error:?}")))?;
+        let mut content = sim::SimContentBuilder::for_match(Arc::clone(sim_weapons.content()));
+        content
+            .set_map(Arc::clone(&prepared_map.content))
+            .map_err(|error| InstallRefusal::new(format!("Invalid map content: {error}")))?;
         content.set_script_sound_aliases(script_sound_aliases);
+        content.set_script_fx(capabilities.script_fx.clone());
+        stage_resource(&mut install, capabilities);
         let mut sim = sim::SimWorld::new();
         if role.runs_authority()
             && let Some(previous) = previous.as_ref()
@@ -319,32 +454,26 @@ pub fn apply_prepared_match(
                 .unwrap_or(sim::LocalPlayerProfile::default());
             sim.set_local_player_profile(profile);
         }
-        content.set_weapon_def_scales(weapons.0.scales_table());
-        let combat = combat_table::from_registry(&weapons.0, lochit_table);
-        content.set_weapon_combat_table(combat.clone());
-        content.set_weapon_runnable_table(weapons.0.runnable_table());
-        content.set_weapon_transition_groups(weapons.0.configuration_transition_groups());
-        content.set_bullet_pen_facts(combat_table::pen_from_registry(&weapons.0));
-        content.set_penetration_table(pen_table);
-        content.set_pen_table_loaded(pen_table_loaded);
         content.set_player_kit_collisions(
-            player_kit_collision(&bodies.0, false),
-            player_kit_collision(&bodies.0, true),
+            player_kit_collision(soldiers.side(false).ok().map(Arc::as_ref))?,
+            player_kit_collision(soldiers.side(true).ok().map(Arc::as_ref))?,
         );
         if let Some(Ok(tree)) = player_anim_sources.compiled() {
             for axis in [false, true] {
-                if let Ok(definition) = tree.to_runtime_definition(|_, name| {
-                    let kit = bodies.0.kits().kit(axis)?;
-                    let body = bodies.0.get(&kit.body)?;
-                    xanims
-                        .0
-                        .body_clip(body.namespace, name, &body.skel.bone_names)
-                }) {
+                if let Ok(soldier) = soldiers.side(axis)
+                    && let Ok(animation) = soldier.animation()
+                    && let Ok(definition) = animation.runtime()
+                {
                     if axis {
-                        content.set_player_axis_anim_tree(Some(definition));
+                        content.set_player_axis_anim_tree(Some(Arc::clone(definition)));
                     } else {
-                        let names = tree.nodes().iter().map(|node| node.name.clone()).collect();
-                        content.set_player_anim_tree(Some(definition), names);
+                        let names = animation
+                            .tree()
+                            .nodes()
+                            .iter()
+                            .map(|node| node.name.clone())
+                            .collect();
+                        content.set_player_anim_tree(Some(Arc::clone(definition)), names);
                     }
                 }
             }
@@ -357,9 +486,7 @@ pub fn apply_prepared_match(
             }
         }
 
-        let anim_namespace = prepared_map
-            .namespace
-            .unwrap_or(asset_core::AssetNamespace::Iw4);
+        let anim_namespace = prepared_map.namespace.expect("installed map family");
         content.set_script_model_anims(xanims.0.names().filter_map(|name| {
             let parts = &xanims.0.get(anim_namespace, name)?.parts;
             let frequency = if parts.numframes > 0 && parts.framerate > 0.0 {
@@ -382,72 +509,27 @@ pub fn apply_prepared_match(
                 .clip(asset_core::AssetNamespace::Iw4, name)
                 .map(|clip| (*clip).clone())
         }));
-        content.set_weapon_script_names(weapons.0.script_names_table());
-        content.set_weapon_script_aliases(objective_weapons);
-        content.set_vehicle_turrets(weapons.0.vehicle_turrets());
+        content.set_vehicle_turrets(weapons.registry().vehicle_turrets());
         content.set_vehicle_accel(
             weapons
-                .0
+                .registry()
                 .vehicle_accel()
                 .map(|(name, accel)| (name.to_owned(), accel)),
         );
         content.set_vehicle_compass(
             weapons
-                .0
+                .registry()
                 .vehicle_compass()
                 .map(|(name, icons, size)| (name.to_owned(), (icons.clone(), size))),
         );
-        let script_names = weapons.0.script_names_table();
-        content.set_weapon_setups(
-            (0..script_names.len() as u32)
-                .map(|id| {
-                    let selection = weapons.0.describe_configuration(id)?;
-                    let family = selection.family.as_ref()?;
-                    Some(sim::WeaponSetup {
-                        realm: match family.namespace {
-                            asset_core::AssetNamespace::T5 => sim::script::Realm::T5,
-                            asset_core::AssetNamespace::Iw5 => sim::script::Realm::Iw5,
-                            asset_core::AssetNamespace::T6 => sim::script::Realm::T6,
-                            _ => sim::script::Realm::Iw4,
-                        },
-                        base: family.base.clone(),
-                        attachments: selection.attachments.clone(),
-                        stand_in: (family.namespace == asset_core::AssetNamespace::T6)
-                            .then(|| asset_game::t6_stand_in_for(&script_names[id as usize]))
-                            .flatten()
-                            .map(str::to_owned),
-                    })
-                })
-                .collect(),
-        );
-        content.set_shield_models(
-            (0..=weapons.0.len())
-                .map(|index| {
-                    let weapon = index as u32;
-                    (weapons.0.world_facts_of(weapon)?.is_shield()).then_some(())?;
-                    weapons
-                        .0
-                        .world_model_entry(weapon, &world_weapons.0)?
-                        .skel
-                        .retained_capability()
-                        .map(Arc::new)
-                })
-                .collect(),
-        );
-        content.set_weapon_world_models(weapons.0.world_models_table());
-        content.set_weapon_projectile_models(weapons.0.projectile_models_table());
-        content.set_weapon_melee_only(combat_table::melee_only_from_registry(&weapons.0));
-        content.set_weapon_script_sounds(combat_table::script_sounds_from_registry(&weapons.0));
         install_team_voice_prefixes(&mut content, catalog.as_deref(), identity.as_deref(), &zone);
         install_shocks(&mut content, catalog.as_deref(), &map_shocks);
-        let equipment = combat_table::equipment_from_registry(&weapons.0);
-        content.set_equipment_runtime_table(equipment.clone());
         let mut primary = Vec::new();
         let mut secondary = Vec::new();
         let mut lethal = Vec::new();
         let mut tactical = Vec::new();
         let mut excluded = Vec::new();
-        let families = weapons.0.weapon_families();
+        let families = weapons.registry().weapon_families();
         for family in families.offered() {
             let offer = CacWeaponOffer {
                 key: family.key.asset_key(),
@@ -484,6 +566,7 @@ pub fn apply_prepared_match(
         stage_resource(&mut install, xanims);
         stage_resource(&mut install, death);
         stage_resource(&mut install, player_anim_sources);
+        stage_resource(&mut install, soldiers);
         input_gate.local_cmds_enabled = false;
 
         stage_resource(&mut install, DynEntPhysWorld::default());
@@ -503,9 +586,8 @@ pub fn apply_prepared_match(
             }),
             airstrike_height,
             &prepared_map.spawns,
-            &weapons.0,
-            &combat,
-            &equipment,
+            weapons.registry(),
+            &sim_weapons,
             &mut sim_cam,
             &mut input_gate,
             host_classes.as_deref(),
@@ -543,22 +625,6 @@ pub fn apply_prepared_match(
                 .map_err(|e| script_refusal(&zone, gametype, "entry", &e))?;
         }
         let load_hold = AuthorityLoadHold(true);
-        if let Some(glass) = scene.fx_glass.as_ref() {
-            let panes = (0..glass.piece_places.len())
-                .filter_map(|i| {
-                    let (origin, axis_s, axis_t) = glass.pane_basis(i)?;
-                    Some((
-                        i as u32,
-                        sim::GlassPaneBasis {
-                            origin,
-                            axis_s,
-                            axis_t,
-                        },
-                    ))
-                })
-                .collect();
-            sim.world_objects_mut().install_glass_panes(panes);
-        }
         sim.world_objects_mut()
             .set_map_round_epoch(load_key.match_key.match_epoch);
         spawn_script_model_movers(&mut sim, &model_spawns);
@@ -588,9 +654,8 @@ pub fn apply_prepared_match(
 
         let manifest = SessionContentManifest::build(
             &prepared_map,
-            &weapons.0,
-            &combat,
-            &equipment,
+            weapons.registry(),
+            &sim_weapons,
             sim.content_digest(),
         )
         .map_err(|error| InstallRefusal::new(format!("Invalid content manifest: {error:?}")))?;
@@ -631,39 +696,58 @@ pub fn apply_prepared_match(
             "match preparation: {:.1}ms on the main thread (scene handoff, sim boot, catalogs)",
             install_started.elapsed().as_secs_f32() * 1000.0
         );
-        if role.runs_authority() || *role == frame::RuntimeRole::Replay {
-            if let Some(prediction) = prediction.as_ref() {
-                let mut state = net::ClientPrediction::new(prediction.0.local());
-                state.arm_from_content(&sim);
-                stage_resource(&mut install, net::ClientPredictionState(state));
-            }
-            stage_resource(&mut install, AuthorityWorld(sim));
-        } else if let Some(prediction) = prediction.as_ref() {
-            install.push(|world: &mut World| {
-                world.remove_resource::<AuthorityWorld>();
-            });
-            let mut state = net::ClientPrediction::new(prediction.0.local());
-            // Prediction adopts replicated state at admission; the prepared world's
-            // GSC runtime belongs to authority and cannot be restored by snapshots.
+        if role.runs_client() {
+            let client = local.as_ref().map_or(sim::ClientId(0), |local| local.0);
+            let mut state = net::ClientPrediction::new(client);
             state.arm_from_content(&sim);
             stage_resource(&mut install, net::ClientPredictionState(state));
-        } else {
-            return Err(InstallRefusal::new(
-                "No simulation owner for this execution mode",
-            ));
+        }
+        if role.runs_authority() || *role == frame::RuntimeRole::Replay {
+            stage_resource(&mut install, AuthorityWorld(sim));
         }
         sim_cam.freeze_fly = true;
         stage_resource(&mut install, WorldProducts::from_walk(scene.products_id));
         stage_resource(&mut install, scene);
-        stage_resource(&mut install, sim_cam);
-        stage_resource(&mut install, input_gate);
-        stage_resource(&mut install, load_hold);
-        stage_resource(&mut install, class_handoff);
+        install.push(move |world: &mut World| {
+            world
+                .resource_mut::<crate::scope_control::InstallAnnouncement>()
+                .0
+                .push(move |world: &mut World| {
+                    world.insert_resource(sim_cam);
+                });
+        });
+        install.push(move |world: &mut World| {
+            world
+                .resource_mut::<crate::scope_control::InstallAnnouncement>()
+                .0
+                .push(move |world: &mut World| {
+                    world.insert_resource(input_gate);
+                });
+        });
+        install.push(move |world: &mut World| {
+            world
+                .resource_mut::<crate::scope_control::InstallAnnouncement>()
+                .0
+                .push(move |world: &mut World| {
+                    world.insert_resource(load_hold);
+                });
+        });
+        install.push(move |world: &mut World| {
+            world
+                .resource_mut::<crate::scope_control::InstallAnnouncement>()
+                .0
+                .push(move |world: &mut World| {
+                    world.insert_resource(class_handoff);
+                });
+        });
         stage_resource(&mut install, crate::LiveWorldIdentity { load_key });
-        stage_resource(&mut install, HasWorld(true));
-        stage_resource(&mut install, WorldGeneration::from_install(request_id));
+        stage_resource(
+            &mut install,
+            frame::WorldGeneration::from_install(request_id),
+        );
         let installed_zone = zone.clone();
         install.push(move |world: &mut World| {
+            world.resource_mut::<crate::scope_control::InstallAnnouncement>().0.push(move |world: &mut World| {
             if let Some(mut probe) = world.get_resource_mut::<LaunchReport>() {
                 probe.sim_gap = sim_gap;
                 probe.world_report = world_report;
@@ -671,18 +755,19 @@ pub fn apply_prepared_match(
             diag::script_boundary("installed", &script_facts);
             diag::info!(Sim, "match: {} ({}) — world installed ({} dm spawn points); class select waits for admission", kind.display_name(), kind.token(), spawn_count);
             perf::match_installed(&installed_zone, 1);
-            world.write_message(MatchInstalled {
+            frame::scope::insert(world, InstalledMatch {
                 request_id,
                 load_key,
                 zone: installed_zone,
                 spawn_count,
+            }, frame::MatchScope::Live);
             });
         });
 
         Ok(install)
     })();
     match prepared_install {
-        Ok(mut install) => {
+        Ok(install) => {
             commands.queue(move |world: &mut World| {
                 let accepts = world
                     .resource::<crate::SessionSwapRequest>()
@@ -696,7 +781,9 @@ pub fn apply_prepared_match(
                                 && bridge.incarnation() == load_key.incarnation
                         });
                 if accepts && same_match {
-                    install.apply(world);
+                    world
+                        .resource_mut::<crate::ScopeControl>()
+                        .install(load_key, install);
                 }
             });
             if let Some(stage) = install_stage {
@@ -728,6 +815,8 @@ pub fn apply_prepared_match(
 /// commit half of `apply_prepared_match` has nothing to install until preflight
 /// hands one over.
 struct MatchInstallPlan {
+    capabilities: assets::prepared::PreparedCapabilities,
+    ui_images: asset_material::UiImagePublication,
     scripts: sim::script::Program,
     script_level: sim::script::LevelData,
     script_entries: Vec<String>,
@@ -742,6 +831,7 @@ struct MatchInstallPlan {
     killstreaks: assets::prepared::PreparedKillstreaks,
     fpv_meshes: PreparedFpvMeshes,
     bodies: assets::PreparedBodies,
+    soldiers: asset_game::SoldierPresentations,
     world_weapons: assets::PreparedWorldWeapons,
     projectile_meshes: assets::PreparedProjectileMeshes,
     xmodel_walk: assets::PreparedXModelWalkCensus,
@@ -845,12 +935,25 @@ fn script_refusal(
 
 fn preflight_match_install(
     mut prepared: assets::PreparedMatch,
+    load_key: frame::LocalLoadKey,
     zone: &str,
     mode_selection: Option<&sim::HostGameModeSelection>,
     rules: Option<&frame::HostMatchRules>,
     catalog: Option<&asset_game::MenuCatalog>,
     identity: Option<&LaunchIdentity>,
+    role: frame::RuntimeRole,
 ) -> Result<MatchInstallPlan, InstallRefusal> {
+    if prepared
+        .clip
+        .as_ref()
+        .is_none_or(|clip| clip.coverage != asset_world::CollisionCoverage::Complete)
+    {
+        return Err(InstallRefusal::new(
+            "Required collision geometry has incomplete query coverage",
+        ));
+    }
+    let capabilities = assets::prepared::PreparedCapabilities::prepare(&prepared);
+    capabilities.validate(role).map_err(InstallRefusal::new)?;
     let killstreaks = assets::prepared::PreparedKillstreaks(
         prepared
             .scripts
@@ -881,16 +984,22 @@ fn preflight_match_install(
                 names
             }),
     );
-    let weapons = PreparedWeapons(prepared.weapons);
+    let weapons = PreparedWeapons::for_match(prepared.weapons, load_key);
     let fpv_meshes = PreparedFpvMeshes(prepared.fpv_meshes);
     let bodies = assets::PreparedBodies(prepared.bodies);
-    let world_weapons = assets::PreparedWorldWeapons(prepared.world_weapons);
+    let soldiers = prepared.soldiers;
+    let world_weapons = assets::PreparedWorldWeapons(Arc::new(prepared.world_weapons));
     let projectile_meshes = assets::PreparedProjectileMeshes(prepared.projectile_meshes);
     let xmodel_walk = std::mem::take(&mut prepared.xmodel_walk);
     let xanims = PreparedXAnims(prepared.xanims);
     let death = PreparedDestructibleDeath(std::mem::take(&mut prepared.destructible_death));
     log_destructible_death_assets(&death);
     let player_anim_sources = prepared.player_anim_sources;
+    if !soldiers.owned_by(&bodies.0, &fpv_meshes.0, &xanims.0, &player_anim_sources) {
+        return Err(InstallRefusal::new(
+            "soldier presentation owners differ from match catalogs",
+        ));
+    }
     let mut prepared_map = prepared.prepared_map;
     if prepared_map.namespace == Some(asset_core::AssetNamespace::Iw4)
         && let Some(catalog) = catalog
@@ -907,9 +1016,24 @@ fn preflight_match_install(
             zone,
         );
     }
+    let kind = match match_kind(mode_selection) {
+        Ok(kind) => kind,
+        Err(gap) => {
+            diag::info!(Sim, "match install refused: {gap}");
+            return Err(InstallRefusal::with_gap(gap, gap));
+        }
+    };
     let mut objective_weapons = Vec::new();
-    if let Some(namespace @ (asset_core::AssetNamespace::T5 | asset_core::AssetNamespace::Iw5)) =
-        prepared_map.namespace
+    let mut absent_effects = std::collections::BTreeSet::new();
+    if let Some(
+        namespace @ (asset_core::AssetNamespace::T5
+        | asset_core::AssetNamespace::Iw5
+        | asset_core::AssetNamespace::T6),
+    ) = prepared_map.namespace
+        && !matches!(
+            kind,
+            gamemode_iw4::GameModeKind::FreeForAll | gamemode_iw4::GameModeKind::TeamDeathmatch
+        )
     {
         let catalog = catalog.ok_or_else(|| {
             InstallRefusal::new("IW4 menu catalog missing for objective bindings".to_owned())
@@ -923,17 +1047,14 @@ fn preflight_match_install(
         let iw4 =
             asset_game::ObjectiveVisuals::from_faction_table(table, Some(&allies), Some(&axis));
         let realm = &prepared_map.facts.objective_visuals;
-        if !iw4.is_complete() || !realm.is_complete() {
-            return Err(InstallRefusal::new(
-                "incomplete objective bindings for the map's game".to_owned(),
-            ));
-        }
+        let bindings = objective_bindings(&iw4, realm, kind, namespace)?;
+        absent_effects.extend(bindings.absent_effects);
         let scene = &mut prepared.world.map_xmodel_scene_assets;
         let mut served = Vec::new();
         let mut missing = Vec::new();
-        for (from, to) in iw4.model_pairs(realm) {
-            let native = matches!(
-                (prepared_map.namespace, scene.get_name(to)),
+        let native_model = |asset: Option<&asset_world::MapXModelSceneAsset>| {
+            matches!(
+                (prepared_map.namespace, asset),
                 (
                     Some(asset_core::AssetNamespace::Iw5),
                     Some(asset_world::MapXModelSceneAsset::Iw5(_))
@@ -944,28 +1065,29 @@ fn preflight_match_install(
                     Some(asset_core::AssetNamespace::T6),
                     Some(asset_world::MapXModelSceneAsset::T6(_))
                 )
-            );
+            )
+        };
+        for (from, to) in bindings.models {
+            let native = native_model(scene.get_name(to));
             if !native || !scene.alias(from, to) {
                 missing.push(to);
             } else {
                 served.push(format!("{from}->{to}"));
             }
         }
-        for (from, to) in iw4.fx_pairs(realm) {
+        for (from, to) in bindings.optional_models {
+            if native_model(scene.get_name(to)) && scene.alias(from, to) {
+                served.push(format!("{from}->{to}"));
+            }
+        }
+        for (from, to) in bindings.effects {
             match prepared.fx.alias_for_map(from, to) {
                 true => served.push(format!("{from}->{to}")),
                 false => missing.push(to),
             }
         }
-        for (from, to) in iw4.weapon_pairs(realm) {
-            let weapon = (1..weapons.0.len() as u32).find(|&id| {
-                weapons.0.identity_namespace_of(id) == prepared_map.namespace
-                    && weapons.0.script_name_of(id) == to
-                    && [weapons.0.gun_xmodel_of(id), weapons.0.hand_xmodel_of(id)]
-                        .into_iter()
-                        .flatten()
-                        .all(|model| fpv_meshes.0.get(namespace, model).is_some())
-            });
+        for (from, to) in bindings.weapons {
+            let weapon = objective_weapon_binding(weapons.registry(), namespace, to);
             match weapon {
                 Some(id) => {
                     objective_weapons.push((from.to_owned(), id));
@@ -986,13 +1108,6 @@ fn preflight_match_install(
         }
     }
     let strings = std::mem::take(&mut prepared.strings);
-    let kind = match match_kind(mode_selection) {
-        Ok(kind) => kind,
-        Err(gap) => {
-            diag::info!(Sim, "match install refused: {gap}");
-            return Err(InstallRefusal::with_gap(gap, gap));
-        }
-    };
     struct Sources(assets::ScriptSources);
     impl sim::script::SourceResolver for Sources {
         fn read(&self, module: &str) -> Result<String, String> {
@@ -1050,7 +1165,8 @@ fn preflight_match_install(
             Default::default()
         }
     };
-    let script_level = sim::script::LevelData {
+    let mut script_level = sim::script::LevelData {
+        absent_effects,
         player_data_defaults: account_defaults.clone(),
         schemas: sources.0.schemas().clone(),
         entities: sim::script::parse_entity_string(sources.0.entities().unwrap_or("")),
@@ -1069,6 +1185,29 @@ fn preflight_match_install(
             })
             .collect(),
     };
+    let shared_ranks = weapons.registry().shared_rank_table().map_err(|error| {
+        InstallRefusal::new(format!("Invalid shared rank progression: {error}"))
+    })?;
+    script_level.tables.insert(
+        "mp/ranktable.csv".into(),
+        sim::script::StringTable {
+            columns: shared_ranks.columns,
+            rows: shared_ranks.rows,
+            cells: shared_ranks.cells.clone(),
+        },
+    );
+    let shared_icons = weapons
+        .registry()
+        .shared_rank_icons()
+        .map_err(|error| InstallRefusal::new(format!("Invalid shared rank icons: {error}")))?;
+    script_level.tables.insert(
+        "mp/rankicontable.csv".into(),
+        sim::script::StringTable {
+            columns: shared_icons.columns,
+            rows: shared_icons.rows,
+            cells: shared_icons.cells.clone(),
+        },
+    );
     let startup = sim::script::Iw4Startup::new(&sources, gametype, zone);
     let roots: Vec<&str> = startup.roots.iter().map(String::as_str).collect();
     let scripts = sim::script::Program::load(&sources, &roots, &sim::script::Catalog::iw4())
@@ -1132,7 +1271,10 @@ fn preflight_match_install(
             .collect(),
     );
     let fx_models = PreparedFxModels(std::mem::take(&mut prepared.world.fx_models));
-    let impact_fx = PreparedImpactFx(std::mem::take(&mut prepared.world.impact_fx));
+    let impact_fx = PreparedImpactFx {
+        map: std::mem::take(&mut prepared.world.impact_fx),
+        families: std::mem::take(&mut prepared.world.family_impact_fx),
+    };
     let tracers = PreparedTracers(std::mem::take(&mut prepared.tracers));
     let scene = match world_scene_from_draw(
         prepared.world,
@@ -1156,6 +1298,8 @@ fn preflight_match_install(
         ));
     }
     Ok(MatchInstallPlan {
+        capabilities,
+        ui_images: prepared.ui_images,
         script_sound_aliases: prepared.script_sound_aliases,
         scripts,
         script_level,
@@ -1170,6 +1314,7 @@ fn preflight_match_install(
         killstreaks,
         fpv_meshes,
         bodies,
+        soldiers,
         world_weapons,
         projectile_meshes,
         xmodel_walk,
@@ -1196,36 +1341,123 @@ pub fn install_script_model_id(content: asset_world::ScriptModelId) -> sim::Scri
     sim::ScriptModelId::from_authored_source_ordinal(content.source_ordinal())
 }
 
-fn player_kit_collision(
-    bodies: &asset_model::BodyMeshCatalog,
-    axis: bool,
-) -> sim::PlayerKitCollision {
-    let kits = bodies.kits();
-    let kit = kits.kit(axis);
-    let body_key = kit.map(|kit| kit.body.clone()).unwrap_or_default();
-    let head_key = kit.and_then(|kit| kit.head.clone()).unwrap_or_default();
-    let body = (!body_key.is_empty())
-        .then(|| {
-            bodies
-                .get(&body_key)
-                .and_then(|entry| entry.skel.retained_capability())
-                .map(Arc::new)
-        })
-        .flatten();
-    let head = (!head_key.is_empty())
-        .then(|| {
-            bodies
-                .get(&head_key)
-                .and_then(|entry| entry.skel.retained_capability())
-                .map(Arc::new)
-        })
-        .flatten();
-    sim::PlayerKitCollision {
-        body_key,
-        body,
-        head_key,
-        head,
+struct ObjectiveBindings<'a> {
+    models: Vec<(&'a str, &'a str)>,
+    optional_models: Vec<(&'a str, &'a str)>,
+    effects: Vec<(&'a str, &'a str)>,
+    weapons: Vec<(&'a str, &'a str)>,
+    absent_effects: Vec<String>,
+}
+
+fn objective_bindings<'a>(
+    host: &'a asset_game::ObjectiveVisuals,
+    native: &'a asset_game::ObjectiveVisuals,
+    kind: gamemode_iw4::GameModeKind,
+    family: asset_core::FamilyId,
+) -> Result<ObjectiveBindings<'a>, InstallRefusal> {
+    use gamemode_iw4::GameModeKind;
+    let pair = |from: &'a Option<String>, to: &'a Option<String>| {
+        from.as_deref()
+            .filter(|name| !name.is_empty())
+            .zip(to.as_deref().filter(|name| !name.is_empty()))
+            .ok_or_else(|| {
+                InstallRefusal::new("required objective binding missing for the map's game")
+            })
+    };
+    let mut bindings = ObjectiveBindings {
+        models: Vec::new(),
+        optional_models: host
+            .crate_model
+            .iter()
+            .chain(&host.crate_overlay)
+            .zip(native.crate_model.iter().chain(&native.crate_overlay))
+            .filter_map(|(from, to)| Some((from.as_deref()?, to.as_deref()?)))
+            .collect(),
+        effects: Vec::new(),
+        weapons: Vec::new(),
+        absent_effects: Vec::new(),
+    };
+    match kind {
+        GameModeKind::SearchAndDestroy | GameModeKind::Sabotage | GameModeKind::Demolition => {
+            bindings.models.push(pair(&host.bomb, &native.bomb)?);
+            bindings
+                .effects
+                .push(pair(&host.bomb_explosion_fx, &native.bomb_explosion_fx)?);
+            bindings
+                .weapons
+                .push(pair(&host.plant_weapon, &native.plant_weapon)?);
+            bindings
+                .weapons
+                .push(pair(&host.defuse_weapon, &native.defuse_weapon)?);
+        }
+        GameModeKind::Domination | GameModeKind::CaptureTheFlag => {
+            if kind == GameModeKind::Domination {
+                bindings
+                    .models
+                    .push(pair(&host.neutral_flag, &native.neutral_flag)?);
+            }
+            for index in 0..2 {
+                bindings
+                    .models
+                    .push(pair(&host.flag[index], &native.flag[index])?);
+                if kind == GameModeKind::CaptureTheFlag {
+                    bindings
+                        .models
+                        .push(pair(&host.flag_carry[index], &native.flag_carry[index])?);
+                }
+                if family == asset_core::FamilyId::T6 && native.flag_base_fx[index].is_none() {
+                    let from = host.flag_base_fx[index]
+                        .as_ref()
+                        .ok_or_else(|| InstallRefusal::new("host flag effect binding missing"))?;
+                    bindings.absent_effects.push(from.clone());
+                } else {
+                    bindings.effects.push(pair(
+                        &host.flag_base_fx[index],
+                        &native.flag_base_fx[index],
+                    )?);
+                }
+            }
+        }
+        _ => {}
     }
+    Ok(bindings)
+}
+
+fn objective_weapon_binding(
+    registry: &WeaponRegistry,
+    family: asset_core::FamilyId,
+    script_name: &str,
+) -> Option<u32> {
+    registry
+        .published_weapons()
+        .find(|weapon| {
+            let id = weapon.wire_id();
+            registry.identity_namespace_of(id) == Some(family)
+                && registry.script_name_of(id) == script_name
+                && [false, true]
+                    .into_iter()
+                    .all(|axis| registry.fpv_assemblies_of(id, axis).is_some())
+        })
+        .map(|weapon| weapon.wire_id())
+}
+
+fn player_kit_collision(
+    soldier: Option<&asset_game::SoldierPresentation>,
+) -> Result<sim::PlayerKitCollision, InstallRefusal> {
+    let Some(soldier) = soldier else {
+        return Ok(sim::PlayerKitCollision::default());
+    };
+    let head = soldier.head().map_err(|reason| {
+        InstallRefusal::new(format!("soldier head collision refused: {reason}"))
+    })?;
+    Ok(sim::PlayerKitCollision {
+        body_key: soldier.kit().body.clone(),
+        body: soldier.body().skel.retained_capability().map(Arc::new),
+        head_key: soldier.kit().head.clone().unwrap_or_default(),
+        head: head
+            .and_then(|head| head.entry().skel.retained_capability())
+            .map(Arc::new),
+    })
 }
 
 fn match_kind(
@@ -1479,14 +1711,18 @@ fn install_clip_and_player(
     airstrike_height: Option<f32>,
     spawns_in: &[SpawnPoint],
     weapons: &WeaponRegistry,
-    combat: &[weapon_iw4::WeaponCombatFacts],
-    equipment: &[sim::EquipmentRuntimeFacts],
+    sim_weapons: &weapon_content::PreparedSimWeapons,
     sim_cam: &mut SimCamera,
     input_gate: &mut AuthorityInputGate,
     host_classes: Option<&HostClassLoadouts>,
     kind: gamemode_iw4::GameModeKind,
     allow_debug_actions: bool,
 ) -> Result<(&'static str, Vec<Option<String>>), InstallRefusal> {
+    if !sim_weapons.owned_by(weapons) || !content.uses_weapons(sim_weapons.content()) {
+        return Err(InstallRefusal::new(
+            "Simulation weapon registry owner mismatch",
+        ));
+    }
     let clip = clip.ok_or_else(|| InstallRefusal::new("Required collision geometry is missing"))?;
     let static_models = &clip.static_models;
     let count = clip.brushes.len();
@@ -1570,6 +1806,7 @@ fn install_clip_and_player(
             .collect(),
     };
     content.set_clip_map(brushes, bsp, mesh, cmodels);
+    content.set_collision_complete(clip.coverage == asset_world::CollisionCoverage::Complete);
     sim.install_content(content.finish());
     sim.install_model_library(authority_models.models);
     let owner_count = authority_models.capabilities.len();
@@ -1623,7 +1860,7 @@ fn install_clip_and_player(
     let projected: Vec<AuthoritativeClassProjection> = rows
         .iter()
         .enumerate()
-        .map(|(index, row)| project_class(index as u32, row, weapons, combat, equipment))
+        .map(|(index, row)| project_class(index as u32, row, weapons, sim_weapons))
         .collect();
     let lock_reasons: Vec<Option<String>> = projected
         .iter()
@@ -1635,7 +1872,7 @@ fn install_clip_and_player(
         .enumerate()
         .map(|(index, preset)| {
             let row = ClassRow::from(&preset.into());
-            project_class(index as u32, &row, weapons, combat, equipment).def
+            project_class(index as u32, &row, weapons, sim_weapons).def
         })
         .filter(|class| !class.locked)
         .collect();
@@ -1792,6 +2029,7 @@ pub fn register_match_apply_systems(app: &mut App) {
         .add_systems(
             Update,
             apply_prepared_match
+                .after(frame::SessionSwapApplied)
                 .run_if(resource_exists::<PreparedMatchReady>)
                 .in_set(ClientSet::Load),
         );
@@ -1799,6 +2037,6 @@ pub fn register_match_apply_systems(app: &mut App) {
 
 fn stage_resource<T: Resource>(queue: &mut bevy::ecs::world::CommandQueue, resource: T) {
     queue.push(move |world: &mut World| {
-        world.insert_resource(resource);
+        frame::scope::stage(world, resource);
     });
 }

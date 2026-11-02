@@ -2,7 +2,6 @@ mod admission;
 pub mod readiness;
 pub use net::LocalAccount;
 pub use readiness::SessionReadinessPolicy;
-pub mod combat_table;
 pub mod content_manifest;
 pub mod life_front;
 pub mod lifecycle;
@@ -12,6 +11,8 @@ pub mod match_apply;
 pub mod plugin;
 pub mod startup;
 pub mod view_subject;
+mod weapon_content;
+pub use weapon_content::{ClassWeaponAdmission, PreparedSimWeapons};
 
 pub use content_manifest::{
     AuthorityWeaponProfile, ManifestFact, ManifestGap, RuntimeRuleset, SessionContentManifest,
@@ -21,11 +22,11 @@ pub use content_manifest::{
 pub use life_front::{LifeFrontCensus, LifeNotifyCensus};
 pub use lifecycle::{
     LiveWorldIdentity, SessionSwapCompletion, SessionSwapRequest, SessionSwapResult,
-    SessionSwapTarget, TeardownGaps, TeardownRequest,
+    SessionSwapTarget, TeardownRequest,
 };
 pub use loadout::{
-    AuthoritativeClassProjection, ClassRow, authoritative_class_lock_reason, perk_catalog_id,
-    project_class, resolve_class_weapon,
+    AuthoritativeClassProjection, ClassRow, perk_catalog_id, project_class, resolve_class_weapon,
+    resolve_editor_class_weapon,
 };
 pub use local_arm::{
     arm_local_from_presented, join_local_on_class_select, sync_prediction_metrics_to_probe,
@@ -33,3 +34,6 @@ pub use local_arm::{
 pub use match_apply::{apply_prepared_match, install_script_model_id};
 pub use plugin::SessionPlugin;
 pub use startup::{PendingConsoleLines, StartupCommands};
+
+mod scope_control;
+pub use scope_control::ScopeControl;

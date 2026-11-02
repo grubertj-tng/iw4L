@@ -38,6 +38,7 @@ pub mod variant {
 }
 
 pub mod def {
+    pub const CAMOUFLAGE: u32 = 2420;
     pub const GUN_XMODEL: u32 = 4;
     pub const HAND_XMODEL: u32 = 8;
     pub const PLAYER_ANIM_TYPE: u32 = 24;
@@ -49,6 +50,8 @@ pub mod def {
     pub const FIRE_TYPE: u32 = 48;
     pub const OFFHAND_CLASS: u32 = 96;
     pub const OFFHAND_SLOT: u32 = 100;
+    pub const VIEW_FLASH_EFFECT: u32 = 108;
+    pub const WORLD_FLASH_EFFECT: u32 = 112;
     pub const PULLBACK_SOUND: u32 = 168;
     pub const PULLBACK_SOUND_PLAYER: u32 = 172;
     pub const FIRE_SOUND: u32 = 176;
@@ -61,6 +64,8 @@ pub mod def {
     pub const MELEE_SWIPE_SOUND_PLAYER: u32 = 252;
     pub const MELEE_HIT_SOUND: u32 = 256;
     pub const MELEE_MISS_SOUND: u32 = 260;
+    pub const ALT_SWITCH_SOUND: u32 = 376;
+    pub const ALT_SWITCH_SOUND_PLAYER: u32 = 380;
     pub const RAISE_SOUND: u32 = 384;
     pub const RAISE_SOUND_PLAYER: u32 = 388;
     pub const FIRST_RAISE_SOUND: u32 = 392;
@@ -68,6 +73,11 @@ pub mod def {
     pub const PUTAWAY_SOUND: u32 = 408;
     pub const PUTAWAY_SOUND_PLAYER: u32 = 412;
     pub const PROJ_EXPLOSION_SOUND: u32 = 1820;
+    pub const RETICLE_CENTER: u32 = 528;
+    pub const RETICLE_SIDE: u32 = 532;
+    pub const RETICLE_CENTER_SIZE: u32 = 536;
+    pub const RETICLE_SIDE_SIZE: u32 = 540;
+    pub const RETICLE_MIN_OFS: u32 = 544;
     pub const WORLD_MODEL: u32 = 916;
     pub const ROCKET_MODEL: u32 = 924;
     pub const HUD_ICON: u32 = 940;
@@ -247,6 +257,7 @@ pub mod weap_anim {
 }
 
 pub mod unique {
+    pub const CAMOUFLAGE: u32 = 164;
     pub const NAME: u32 = 0;
     pub const TYPE: u32 = 4;
     pub const COMBINED_MASK: u32 = 16;
@@ -285,6 +296,8 @@ pub mod attachment {
     pub const SHARED_AMMO: u32 = 50;
     pub const DAMAGE_RANGE_SCALE: u32 = 52;
     pub const ADS_ZOOM_FOV: u32 = 56;
+    pub const ADS_ZOOM_FOV2: u32 = 60;
+    pub const ADS_ZOOM_FOV3: u32 = 64;
     pub const ADS_ZOOM_IN_FRAC: u32 = 68;
     pub const ADS_ZOOM_OUT_FRAC: u32 = 72;
     pub const ADS_TRANS_IN_TIME_SCALE: u32 = 76;
@@ -439,6 +452,14 @@ impl<'z> AttachmentUniqueView<'z> {
                 self.vec3(rotations),
             ))
         })
+    }
+
+    pub fn camouflage(&self) -> Option<crate::weapon_camo::WeaponCamoView<'z>> {
+        let asset = self
+            .load
+            .assets
+            .get(self.asset.field(unique::CAMOUFLAGE)?)?;
+        crate::weapon_camo::WeaponCamoView::new(self.load, asset).ok()
     }
 
     pub fn asset_field_name(&self, off: u32) -> Option<&'z str> {
@@ -648,6 +669,13 @@ impl<'z> WeaponView<'z> {
 
     pub fn name(&self) -> Option<&'z str> {
         self.variant_str(variant::INTERNAL_NAME)
+    }
+
+    pub fn camouflage(&self) -> Option<crate::weapon_camo::WeaponCamoView<'z>> {
+        let asset = self
+            .load
+            .asset_in(self.asset, self.def?.at(def::CAMOUFLAGE))?;
+        crate::weapon_camo::WeaponCamoView::new(self.load, asset).ok()
     }
 
     pub fn def_loaded_asset_name(&self, off: u32) -> Option<&'z str> {

@@ -64,7 +64,7 @@ impl ZoneLane for T5Lane {
         progress: &LoadProgress,
         _shared_surfaces: asset_model::SharedXModelSurfaces,
         material_seed: asset_material::MaterialCatalog,
-        _common_film_visions: &super::FilmVisionCatalog,
+        common_film_visions: &super::FilmVisionCatalog,
     ) -> LoadedWorld {
         let mut report = vec![format!("game: T5 ({})", path.display())];
         let stage = progress.begin_scoped(StageId::MapAssets, "header", None);
@@ -238,8 +238,10 @@ impl ZoneLane for T5Lane {
         let map_xmodels = std::mem::take(&mut sink.map_xmodels);
         let bodies = std::mem::take(&mut sink.bodies);
         let fpv_meshes = std::mem::take(&mut sink.fpv_meshes);
+        let mut trees = asset_transport::NamespaceTrees::default();
+        trees.adopt_zone(path);
         match decode_material_color_maps(
-            path,
+            &trees,
             &mut materials,
             &stage,
             crate::session_load::load_pool(),
@@ -275,7 +277,7 @@ impl ZoneLane for T5Lane {
                     policy: WorldDrawPolicy::t5(),
                     exp_fog,
                     createart_name,
-                    ..Default::default()
+                    ..PreparedWorld::empty(WorldDrawPolicy::t5())
                 },
                 collision: clip,
                 spawns: dm_spawns,
@@ -287,7 +289,7 @@ impl ZoneLane for T5Lane {
                     ..Default::default()
                 },
                 report,
-                ..Default::default()
+                ..LoadedWorld::empty(WorldDrawPolicy::t5())
             };
             loaded.push_gap(
                 PreparedCapability::PreparedWorld,
@@ -433,6 +435,7 @@ impl ZoneLane for T5Lane {
                     sound: map_sound,
                     materials: map_materials,
                     world: PreparedWorld {
+                        source_namespace: Some(asset_core::AssetNamespace::T5),
                         draw: Some(draw),
                         dynamic_light: None,
                         static_model_meshes,
@@ -449,13 +452,16 @@ impl ZoneLane for T5Lane {
                         fx_models: Default::default(),
 
                         fx_glass: None,
+                        map_content: Default::default(),
                         impact_fx: sink.impact_fx.take_table(),
+                        family_impact_fx: Vec::new(),
                         reflection_probe_images,
                         intermission_view,
                         exp_fog,
-                        t6_film_grade: None,
+                        t6_vision: None,
+                        t6_visions: Default::default(),
                         film_vision: None,
-                        film_visions: Default::default(),
+                        film_visions: common_film_visions.clone(),
                         createart_name,
                         min,
                         max,
@@ -475,7 +481,7 @@ impl ZoneLane for T5Lane {
                         ..Default::default()
                     },
                     report,
-                    ..Default::default()
+                    ..LoadedWorld::empty(WorldDrawPolicy::t5())
                 }
             }
             Err(e) => {
@@ -488,7 +494,7 @@ impl ZoneLane for T5Lane {
                         policy: WorldDrawPolicy::t5(),
                         exp_fog,
                         createart_name,
-                        ..Default::default()
+                        ..PreparedWorld::empty(WorldDrawPolicy::t5())
                     },
                     collision: clip,
                     spawns: dm_spawns,
@@ -500,7 +506,7 @@ impl ZoneLane for T5Lane {
                         ..Default::default()
                     },
                     report,
-                    ..Default::default()
+                    ..LoadedWorld::empty(WorldDrawPolicy::t5())
                 };
                 loaded.push_gap(
                     PreparedCapability::PreparedWorld,
@@ -583,7 +589,6 @@ impl ZoneLane for T5Lane {
         let leftover_fx_gaps = sink.fx.capture_gaps;
         let projectile_keys = sink.weapons.projectile_model_hints();
         let mut weapons = sink.weapons.into_build();
-        weapons.stamp_namespace(asset_core::AssetNamespace::T5);
         let namespace = asset_core::AssetNamespace::T5;
         for id in 1..=weapons.len() as u32 {
             for name in [
@@ -675,6 +680,7 @@ impl ZoneLane for T5Lane {
             projectile_meshes: sink.projectile_meshes,
             world_weapons: sink.world_weapons,
             xanims: sink.xanims,
+            player_anim_sources: sink.player_anim_sources,
             fx: sink.fx,
             impact_fx: sink.impact_fx.take_table(),
             fx_models: sink.fx_models,
@@ -783,7 +789,7 @@ fn absorb_localized_map_sound(path: &Path, catalog: &mut asset_audio::SoundCatal
         let walked = fastfile_t5::load_zone(&mut stream, &mut sink).map(|_| ());
         let sound = sink.sound.take().ok_or("sound capture dropped")?;
         let part = sound.finish(walked.map_err(|e| e.to_string()))?;
-        let aliases = part.sounds.len();
+        let aliases = part.sounds().len();
         Ok((part, aliases))
     };
     match walk() {

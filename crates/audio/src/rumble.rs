@@ -23,8 +23,7 @@ impl Rumble {
         let text = |name: &str| -> Result<&str, String> {
             let key = format!("rumble/{name}");
             let bytes = bank
-                .rawfiles
-                .get(&(namespace, key.clone()))
+                .rawfile_bytes_in(namespace, &key)
                 .ok_or_else(|| format!("missing {key}"))?;
             std::str::from_utf8(bytes).map_err(|_| format!("invalid text in {key}"))
         };
@@ -168,13 +167,8 @@ struct ActiveRumble {
 
 #[derive(Default)]
 struct RumblePlayback {
-    owner: Option<(
-        frame::WorldGeneration,
-        sim::ClientId,
-        sim::LifeSequence,
-        u64,
-    )>,
-    last_time: i32,
+    owner: Option<(frame::WorldStamp, sim::ClientId, sim::LifeSequence, u64)>,
+    timeline: u64,
     active: Vec<ActiveRumble>,
     output: Option<(Entity, GamepadRumbleIntensity)>,
     selected: Option<Entity>,
@@ -299,6 +293,7 @@ pub(crate) fn register(app: &mut App) {
         .add_systems(
             Update,
             update
+                .in_set(frame::InMatch)
                 .in_set(net::ClientSet::Effects)
                 .after(crate::entity_events::play_viewmodel_notetrack_messages),
         );
@@ -313,6 +308,7 @@ fn update(
     local: Res<LocalPresentClient>,
     generation: Res<frame::WorldGeneration>,
     time: Res<Time>,
+    cursor: Option<Res<net::EntityEventCursor>>,
     devices: Res<frame::InputDevices>,
     mut tests: MessageReader<frame::TestControllerRumble>,
     gamepads: Query<Entity, With<Gamepad>>,
@@ -321,6 +317,15 @@ fn update(
     settings: Res<frame::GameSettings>,
     active: Option<Res<frame::ActivePad>>,
 ) {
+    let timeline = crate::backend::presentation_epoch(cursor.as_deref());
+    if state.timeline != timeline {
+        state.active.clear();
+        if let Some((gamepad, _)) = state.output.take() {
+            output.write(GamepadRumbleRequest::Stop { gamepad });
+        }
+        state.timeline = timeline;
+        state.next_refresh_ms = 0;
+    }
     let now = (time.elapsed_secs_f64() * 1000.0) as i32;
     let selected = active
         .and_then(|active| active.0)
@@ -346,20 +351,19 @@ fn update(
     let owner = bank.as_ref().and_then(|bank| {
         let meta = presented.snapshot()?.meta.for_client(local.0)?;
         (meta.lifecycle == sim::ClientLifecycle::Alive).then_some((
-            *generation,
+            generation.stamp(),
             local.0,
             meta.life_sequence,
             bank.0.revision(),
         ))
     });
-    if owner != state.owner || now < state.last_time {
+    if owner != state.owner {
         state.active.clear();
         if let Some((gamepad, _)) = state.output.take() {
             output.write(GamepadRumbleRequest::Stop { gamepad });
         }
         state.owner = owner;
     }
-    state.last_time = now;
     state
         .active
         .retain(|row| now.saturating_sub(row.start) < row.rumble.duration_ms);

@@ -10,6 +10,9 @@ use fx_iw4::{
     elem_def_view,
 };
 
+mod iw5;
+use iw5::FxRead;
+
 use crate::asset_graph::AssetEdgeFromPtrs;
 use crate::graph_support::AuthoredRef;
 use asset_core::{AssetEdge, AssetEdgeCensus, AssetEdgeReason, ZoneOwner};
@@ -271,6 +274,8 @@ pub struct OwnedFxElemDef {
     pub trail_def: Option<OwnedFxTrailDef>,
 
     pub spark_fountain_def: Option<OwnedFxSparkFountainDef>,
+
+    pub phys_pieces: Vec<Option<fx_iw4::FxPhysPiece>>,
 }
 
 impl OwnedFxElemDef {
@@ -316,7 +321,7 @@ impl OwnedFxElemDef {
             .and_then(|index| {
                 sounds
                     .name_at(index)
-                    .map(|alias| (sounds.namespace_of_alias(index), alias))
+                    .and_then(|alias| Some((sounds.namespace_of_alias(index)?, alias)))
             }) {
             Some((namespace, alias)) => FxBankSound::Play { namespace, alias },
             None => FxBankSound::Gap,
@@ -333,6 +338,11 @@ impl OwnedFxElemDef {
             OwnedFxVisual::None => Some(AssetEdge::Absent),
             _ => None,
         }
+    }
+
+    pub fn phys_piece(&self, random_seed: u64) -> Option<fx_iw4::FxPhysPiece> {
+        let idx = fx_iw4::elem_visual_index(self.view.visual_count, random_seed);
+        self.phys_pieces.get(idx).copied().flatten()
     }
 
     pub fn decal_mark_pair(&self, random_seed: u64) -> Option<&OwnedFxVisual> {
@@ -366,13 +376,14 @@ pub struct OwnedFxEffectDef {
 /// answers, and a consumer holding this cannot resolve one more pointer.
 #[derive(Clone, Debug, Default)]
 pub struct FxDefinitions {
+    mark_capabilities: std::sync::OnceLock<Vec<bool>>,
     by_key: HashMap<(crate::AssetNamespace, String), usize>,
 
     defs: Vec<OwnedFxEffectDef>,
 
     zones: Vec<ZoneOwner>,
     capture_zone: ZoneOwner,
-    map_namespace: crate::AssetNamespace,
+    map_namespace: Option<crate::AssetNamespace>,
     pub capture_gaps: usize,
 }
 
@@ -384,7 +395,7 @@ pub struct FxCatalog {
 
     links: HashMap<fastfile_iw4::Ptr, FxLink>,
     last_captured: Option<String>,
-    capture_ns: crate::AssetNamespace,
+    capture_ns: Option<crate::AssetNamespace>,
 }
 
 impl std::ops::Deref for FxCatalog {
@@ -412,7 +423,6 @@ impl FxCatalog {
         if !authored_slot && hint.is_none() {
             return AssetEdge::Absent;
         }
-        let ns = crate::body_namespace(ns);
         match hint.and_then(|name| self.index_in(ns, name)) {
             Some(index) => AssetEdge::bind_order(index, self.zone_of(index)),
             None => AssetEdge::Unresolved(AssetEdgeReason::CatalogMiss),
@@ -422,6 +432,9 @@ impl FxCatalog {
     /// Ends the build: the effect definitions travel on, the zone pointer map
     /// that produced them does not.
     pub fn publish(self) -> FxDefinitions {
+        if let Some(effect) = self.published.defs.first() {
+            self.published.can_emit_marks(effect);
+        }
         self.published
     }
 
@@ -440,7 +453,7 @@ impl FxCatalog {
     }
 
     pub fn set_capture_ns(&mut self, ns: crate::AssetNamespace) {
-        self.capture_ns = ns;
+        self.capture_ns = Some(ns);
     }
 
     pub fn absorb(&mut self, other: FxCatalog) {
@@ -554,7 +567,9 @@ impl FxCatalog {
         }
 
         self.last_captured = Some(name.to_owned());
-        let namespace = self.capture_ns;
+        let namespace = self
+            .capture_ns
+            .expect("asset capture requires an explicit family");
         self.insert_owned(OwnedFxEffectDef {
             namespace,
             name: name.to_owned(),
@@ -570,6 +585,7 @@ impl FxCatalog {
         s: &fastfile_t5::ZoneStream<'_>,
         geometry: fastfile_t5::FxEffectDefGeometry,
         materials: &MaterialCatalog,
+        material_name: &impl Fn(fastfile_t5::Ptr) -> Option<String>,
     ) {
         use fastfile_t5::size as sz_t5;
         let Some(name_ptr) = geometry.name else {
@@ -608,7 +624,7 @@ impl FxCatalog {
         if let Some(arr) = geometry.elem_defs {
             for i in 0..geometry.elem_def_count {
                 let elem_ptr = arr.at(i * sz_t5::FX_ELEM_DEF);
-                match leftover_capture_elem_t5(s, elem_ptr, materials) {
+                match leftover_capture_elem_t5(s, elem_ptr, materials, material_name) {
                     Some(elem) => elems.push(elem),
                     None => {
                         self.capture_gaps += 1;
@@ -622,7 +638,9 @@ impl FxCatalog {
         }
 
         self.last_captured = Some(name.to_owned());
-        let namespace = self.capture_ns;
+        let namespace = self
+            .capture_ns
+            .expect("asset capture requires an explicit family");
         self.insert_owned(OwnedFxEffectDef {
             namespace,
             name: name.to_owned(),
@@ -644,7 +662,9 @@ impl FxCatalog {
     }
 
     pub fn bind_named_slot(&mut self, slot: fastfile_iw4::Ptr, name: &str) {
-        let ns = self.capture_ns;
+        let ns = self
+            .capture_ns
+            .expect("asset capture requires an explicit family");
         if self.index_in(ns, name).is_none() {
             self.insert_owned(OwnedFxEffectDef {
                 namespace: ns,
@@ -712,6 +732,7 @@ impl FxDefinitions {
     }
 
     pub fn insert_owned(&mut self, def: OwnedFxEffectDef) {
+        self.mark_capabilities.take();
         let key = (def.namespace, ascii_lower(&def.name));
         if let Some(index) = self.by_key.get(&key).copied() {
             self.zones[index] = self.capture_zone;
@@ -724,6 +745,62 @@ impl FxDefinitions {
         }
     }
 
+    pub fn can_emit_marks(&self, effect: &OwnedFxEffectDef) -> bool {
+        let flags = self.mark_capabilities.get_or_init(|| {
+            let edges = |elem: &OwnedFxElemDef| {
+                [
+                    elem.effect_on_impact,
+                    elem.effect_on_death,
+                    elem.effect_emitted,
+                ]
+                .into_iter()
+                .chain(elem.visuals.iter().filter_map(|visual| match visual {
+                    OwnedFxVisual::Runner { edge, .. } => Some(*edge),
+                    _ => None,
+                }))
+                .collect::<Vec<_>>()
+            };
+            let children: Vec<Vec<FxChildEdge>> = self
+                .defs
+                .iter()
+                .map(|effect| effect.elems.iter().flat_map(edges).collect())
+                .collect();
+            let mut flags: Vec<bool> = self
+                .defs
+                .iter()
+                .zip(&children)
+                .map(|(effect, children)| {
+                    effect.elems.iter().any(|elem| {
+                        fx_iw4::FxElemType::from_u8(elem.view.elem_type)
+                            == Some(fx_iw4::FxElemType::Decal)
+                    }) || children.iter().any(|edge| edge.is_unresolved())
+                })
+                .collect();
+            loop {
+                let mut changed = false;
+                for (index, children) in children.iter().enumerate() {
+                    if !flags[index]
+                        && children
+                            .iter()
+                            .filter_map(|edge| edge.bound_index())
+                            .any(|child| flags.get(child).copied().unwrap_or(true))
+                    {
+                        flags[index] = true;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            flags
+        });
+        self.index_of(effect)
+            .and_then(|index| flags.get(index))
+            .copied()
+            .unwrap_or(true)
+    }
+
     pub fn def_at(&self, index: usize) -> Option<&OwnedFxEffectDef> {
         self.defs.get(index)
     }
@@ -733,22 +810,32 @@ impl FxDefinitions {
     }
 
     pub fn set_map_namespace(&mut self, ns: crate::AssetNamespace) {
-        self.map_namespace = ns;
+        self.map_namespace = Some(ns);
     }
 
     pub fn map_namespace(&self) -> crate::AssetNamespace {
         self.map_namespace
+            .expect("effects require an explicit map family")
     }
 
     pub fn resolve_createfx_id(&self, fxid: &str) -> Option<&OwnedFxEffectDef> {
-        self.resolve_def_for_map(fxid)
-            .or_else(|| self.get_in(body_namespace(self.map_namespace), fxid))
+        self.resolve_def_for_map(fxid).or_else(|| {
+            self.get_in(
+                self.map_namespace
+                    .expect("effects require an explicit map family"),
+                fxid,
+            )
+        })
     }
 
-    pub fn map_fx_name<'a>(&self, name: &'a str) -> FxName<'a> {
+    pub fn map_fx_name<'a>(&'a self, name: &'a str) -> FxName<'a> {
         match self.resolve_def_for_map(name) {
-            Some(def) => FxName::new(def.namespace, name),
-            None => FxName::new(self.map_namespace, name),
+            Some(def) => FxName::new(def.namespace, &def.name),
+            None => FxName::new(
+                self.map_namespace
+                    .expect("effects require an explicit map family"),
+                name,
+            ),
         }
     }
 
@@ -768,7 +855,9 @@ impl FxDefinitions {
     }
 
     pub fn alias_for_map(&mut self, from: &str, to: &str) -> bool {
-        let map_ns = body_namespace(self.map_namespace);
+        let map_ns = self
+            .map_namespace
+            .expect("effects require an explicit map family");
         let Some(def) = self.resolve_def_in(map_ns, to) else {
             return false;
         };
@@ -780,12 +869,13 @@ impl FxDefinitions {
     }
 
     pub fn resolve_def_for_map(&self, name: &str) -> Option<&OwnedFxEffectDef> {
-        let map_ns = body_namespace(self.map_namespace);
-        self.resolve_def_in(map_ns, name).or_else(|| {
-            (map_ns != crate::AssetNamespace::Iw4)
-                .then(|| self.resolve_def_in(crate::AssetNamespace::Iw4, name))
-                .flatten()
-        })
+        if let Some((family, name)) = name.split_once(':') {
+            return self.resolve_def_in(crate::AssetNamespace::parse(family)?, name);
+        }
+        let map_ns = self
+            .map_namespace
+            .expect("effects require an explicit map family");
+        self.resolve_def_in(map_ns, name)
     }
 
     pub fn resolve_materials(&mut self, materials: &crate::MaterialDefinitions) {
@@ -829,6 +919,7 @@ impl FxDefinitions {
     }
 
     pub fn resolve_nested_edges(&mut self) {
+        self.mark_capabilities.take();
         let playable: HashMap<(crate::AssetNamespace, String), (usize, ZoneOwner)> = self
             .by_key
             .iter()
@@ -872,6 +963,15 @@ impl FxDefinitions {
                         *edge = model_hint_edge(ns, hint.as_deref(), models);
                     }
                 }
+                elem.phys_pieces =
+                    if fx_iw4::elem_skips_position_update(elem.view.elem_type, elem.view.flags) {
+                        elem.visuals
+                            .iter()
+                            .map(|vis| model_phys_piece(vis, models))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
             }
         }
     }
@@ -1301,16 +1401,13 @@ impl AssetLinkSink for FxCatalog {
 }
 
 fn capture_elem(
-    s: &ZoneStream<'_>,
+    s: &impl FxRead,
     p: Ptr,
     materials: &MaterialCatalog,
     xmodel_names: &HashMap<Ptr, Ptr>,
 ) -> Option<OwnedFxElemDef> {
-    let raw = s
-        .slice_at(p, 0, s.layout(FX_ELEM_DEF_STRIDE, 288))
-        .ok()?
-        .to_vec();
-    let view = if s.wire_format() == fastfile_iw4::Iw4WireFormat::X64 {
+    let raw = s.slice_at(p, 0, s.elem_stride()).ok()?.to_vec();
+    let view = if s.is_x64() {
         fx_iw4::elem_def_view_x64(&raw)?
     } else {
         elem_def_view(&raw)?
@@ -1368,10 +1465,11 @@ fn capture_elem(
         has_extended,
         trail_def,
         spark_fountain_def,
+        phys_pieces: Vec::new(),
     })
 }
 
-fn capture_trail_def(s: &ZoneStream<'_>, elem: Ptr) -> Option<OwnedFxTrailDef> {
+fn capture_trail_def(s: &impl FxRead, elem: Ptr) -> Option<OwnedFxTrailDef> {
     let ZonePtr::Offset(trail) = s.ptr_at(elem, s.layout(0xf4, 272)).ok()? else {
         return None;
     };
@@ -1424,7 +1522,7 @@ fn capture_trail_def(s: &ZoneStream<'_>, elem: Ptr) -> Option<OwnedFxTrailDef> {
     })
 }
 
-fn capture_spark_fountain_def(s: &ZoneStream<'_>, elem: Ptr) -> Option<OwnedFxSparkFountainDef> {
+fn capture_spark_fountain_def(s: &impl FxRead, elem: Ptr) -> Option<OwnedFxSparkFountainDef> {
     let ZonePtr::Offset(def) = s.ptr_at(elem, s.layout(0xf4, 272)).ok()? else {
         return None;
     };
@@ -1459,7 +1557,7 @@ fn capture_spark_fountain_def(s: &ZoneStream<'_>, elem: Ptr) -> Option<OwnedFxSp
 }
 
 fn capture_visuals(
-    s: &ZoneStream<'_>,
+    s: &impl FxRead,
     p: Ptr,
     view: &FxElemDefView,
     materials: &MaterialCatalog,
@@ -1593,7 +1691,8 @@ fn sound_visual(name: String) -> OwnedFxVisual {
 }
 
 fn model_visual(name: Option<String>) -> OwnedFxVisual {
-    match name.filter(|n| !n.is_empty()) {
+    let hint = name.map(|name| crate::AssetRef::bare_name(&name).to_owned());
+    match hint.filter(|n| !n.is_empty()) {
         Some(hint) => OwnedFxVisual::Model {
             edge: AssetEdge::Unresolved(AssetEdgeReason::CatalogMiss),
             hint: Some(hint),
@@ -1616,8 +1715,19 @@ fn model_hint_edge(
     }
 }
 
+fn model_phys_piece(
+    vis: &OwnedFxVisual,
+    models: &crate::FxModelCatalog,
+) -> Option<fx_iw4::FxPhysPiece> {
+    let OwnedFxVisual::Model { edge, .. } = vis else {
+        return None;
+    };
+    let (mid, half) = models.get_at(edge.bound_index()?)?.skel.bounds?;
+    fx_iw4::FxPhysPiece::from_bounds(mid, half)
+}
+
 fn resolve_material_visual(
-    s: &ZoneStream<'_>,
+    s: &impl FxRead,
     materials: &MaterialCatalog,
     slot: Ptr,
 ) -> OwnedFxVisual {
@@ -1715,7 +1825,7 @@ pub fn color_decoded_in_catalog(materials: &MaterialDefinitions, material: usize
 }
 
 fn read_xmodel_name(
-    s: &ZoneStream<'_>,
+    s: &impl FxRead,
     slot: Ptr,
     xmodel_names: &HashMap<Ptr, Ptr>,
 ) -> Option<String> {
@@ -1774,13 +1884,6 @@ fn lookup_playable_fx(
         .copied()
 }
 
-pub fn body_namespace(ns: crate::AssetNamespace) -> crate::AssetNamespace {
-    match ns {
-        crate::AssetNamespace::Iw5 => crate::AssetNamespace::Iw4,
-        other => other,
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FxName<'a> {
     pub namespace: crate::AssetNamespace,
@@ -1789,10 +1892,7 @@ pub struct FxName<'a> {
 
 impl<'a> FxName<'a> {
     pub fn new(namespace: crate::AssetNamespace, name: &'a str) -> Self {
-        Self {
-            namespace: body_namespace(namespace),
-            name,
-        }
+        Self { namespace, name }
     }
 
     pub fn engine(name: &'a str) -> Self {
@@ -1810,7 +1910,7 @@ impl std::fmt::Display for FxName<'_> {
     }
 }
 
-fn read_name_field(s: &ZoneStream<'_>, p: Ptr, field: usize) -> String {
+fn read_name_field(s: &impl FxRead, p: Ptr, field: usize) -> String {
     match s.ptr_at(p, field) {
         Ok(ZonePtr::Offset(name)) => s.cstr(s.resolve_alias(name)).ok().unwrap_or("").to_owned(),
         _ => String::new(),
@@ -1818,7 +1918,7 @@ fn read_name_field(s: &ZoneStream<'_>, p: Ptr, field: usize) -> String {
 }
 
 fn copy_ptr_array(
-    s: &ZoneStream<'_>,
+    s: &impl FxRead,
     parent: Ptr,
     field: usize,
     count: usize,
@@ -1924,6 +2024,7 @@ fn leftover_capture_elem_t5(
     s: &fastfile_t5::ZoneStream<'_>,
     p: fastfile_t5::Ptr,
     materials: &MaterialCatalog,
+    material_name: &impl Fn(fastfile_t5::Ptr) -> Option<String>,
 ) -> Option<OwnedFxElemDef> {
     use fastfile_t5::size as sz_t5;
     let raw = s.slice_at(p, 0, sz_t5::FX_ELEM_DEF).ok()?.to_vec();
@@ -1949,7 +2050,7 @@ fn leftover_capture_elem_t5(
         vis_count,
         sz_t5::FX_ELEM_VIS_STATE_SAMPLE,
     );
-    let visuals = leftover_capture_visuals_t5(s, p, &view, materials);
+    let visuals = leftover_capture_visuals_t5(s, p, &view, materials, material_name);
     let (effect_on_impact, effect_on_impact_hint) = capture_named_child(leftover_read_name_t5(
         s,
         p,
@@ -1986,6 +2087,7 @@ fn leftover_capture_elem_t5(
         has_extended,
         trail_def: None,
         spark_fountain_def: None,
+        phys_pieces: Vec::new(),
     })
 }
 
@@ -2160,6 +2262,7 @@ fn leftover_capture_visuals_t5(
     p: fastfile_t5::Ptr,
     view: &FxElemDefView,
     materials: &MaterialCatalog,
+    material_name: &impl Fn(fastfile_t5::Ptr) -> Option<String>,
 ) -> Vec<OwnedFxVisual> {
     use fastfile_t5::size as sz_t5;
     let t = view.elem_type;
@@ -2181,8 +2284,8 @@ fn leftover_capture_visuals_t5(
             .map(|i| {
                 let m = arr.at(i * sz_t5::FX_ELEM_MARK_VISUALS);
                 mark_pair(
-                    leftover_resolve_material_t5(s, materials, m.at(0)),
-                    leftover_resolve_material_t5(s, materials, m.at(4)),
+                    leftover_resolve_material_t5(s, materials, material_name, m.at(0)),
+                    leftover_resolve_material_t5(s, materials, material_name, m.at(4)),
                 )
             })
             .collect();
@@ -2210,11 +2313,21 @@ fn leftover_capture_visuals_t5(
             let arr = s.resolve_alias(arr);
             return (0..visual_count)
                 .map(|i| {
-                    leftover_resolve_material_t5(s, materials, arr.at(i * sz_t5::FX_ELEM_VISUALS))
+                    leftover_resolve_material_t5(
+                        s,
+                        materials,
+                        material_name,
+                        arr.at(i * sz_t5::FX_ELEM_VISUALS),
+                    )
                 })
                 .collect();
         }
-        return vec![leftover_resolve_material_t5(s, materials, vis)];
+        return vec![leftover_resolve_material_t5(
+            s,
+            materials,
+            material_name,
+            vis,
+        )];
     }
     if t == elem_type::MODEL {
         if visual_count > 1 {
@@ -2279,6 +2392,7 @@ fn leftover_capture_visuals_t5(
 fn leftover_resolve_material_t5(
     s: &fastfile_t5::ZoneStream<'_>,
     materials: &MaterialCatalog,
+    material_name: &impl Fn(fastfile_t5::Ptr) -> Option<String>,
     slot: fastfile_t5::Ptr,
 ) -> OwnedFxVisual {
     let slot_iw4 = t5_ptr_to_iw4(slot);
@@ -2289,9 +2403,11 @@ fn leftover_resolve_material_t5(
     let index = materials
         .material_index(slot_iw4)
         .or_else(|| alias.and_then(|target| materials.material_index(target)));
-    let name = index
-        .and_then(|i| materials.materials.get(i.get()).map(|m| m.name.to_string()))
-        .filter(|n| !n.is_empty());
+    let name = material_name(slot).or_else(|| {
+        index
+            .and_then(|i| materials.materials.get(i.get()).map(|m| m.name.to_string()))
+            .filter(|n| !n.is_empty())
+    });
     OwnedFxVisual::Material {
         material: FxElemMaterial::unresolved_for(Some(slot_iw4), alias),
         hint: name,
@@ -2406,6 +2522,19 @@ fn capture_elem_t6(
                     authored,
                 })
                 .collect()
+        } else if t == elem_type::DECAL {
+            elem.visuals
+                .chunks_exact(2)
+                .map(|pair| {
+                    let material = |name: &String| OwnedFxVisual::Material {
+                        material: authored.unresolved(),
+                        hint: Some(name.clone()).filter(|name| !name.is_empty()),
+                        material_namespace: namespace,
+                        authored,
+                    };
+                    mark_pair(material(&pair[0]), material(&pair[1]))
+                })
+                .collect()
         } else if t == elem_type::MODEL {
             elem.visuals
                 .iter()
@@ -2460,5 +2589,6 @@ fn capture_elem_t6(
         has_extended: false,
         trail_def: None,
         spark_fountain_def: None,
+        phys_pieces: Vec::new(),
     })
 }

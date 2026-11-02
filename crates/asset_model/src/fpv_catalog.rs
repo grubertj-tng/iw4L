@@ -114,12 +114,6 @@ impl FpvHands {
                 };
             }
         }
-        let def = Self::game_default(map_ns);
-        if let Some((ns, name)) = def.key() {
-            if catalog.contains(ns, name) {
-                return def;
-            }
-        }
         Self::Unresolved
     }
 }
@@ -217,7 +211,7 @@ pub struct FpvMeshBuild {
     catalog: FpvMeshCatalog,
     capture_zone: crate::ZoneOwner,
     strings: ScriptStrings,
-    capture_ns: AssetNamespace,
+    capture_ns: Option<AssetNamespace>,
 }
 
 impl Default for FpvMeshBuild {
@@ -226,7 +220,7 @@ impl Default for FpvMeshBuild {
             catalog: FpvMeshCatalog::default(),
             capture_zone: crate::ZoneOwner::default(),
             strings: ScriptStrings::default(),
-            capture_ns: AssetNamespace::Iw4,
+            capture_ns: None,
         }
     }
 }
@@ -252,7 +246,7 @@ impl FpvMeshBuild {
     }
 
     pub fn set_capture_ns(&mut self, ns: AssetNamespace) {
-        self.capture_ns = ns;
+        self.capture_ns = Some(ns);
     }
 
     pub fn set_capture_zone(&mut self, zone: crate::ZoneOwner) {
@@ -337,12 +331,22 @@ impl FpvMeshBuild {
         materials: &MaterialCatalog,
     ) {
         if model_kind(&skel.name) == Some(ModelKind::Fpv) {
-            self.insert_in(ns.unwrap_or(self.capture_ns), skel.clone(), Some(materials));
+            self.insert_in(
+                ns.or(self.capture_ns)
+                    .expect("asset capture requires an explicit family"),
+                skel.clone(),
+                Some(materials),
+            );
         }
     }
 
     pub fn insert_captured(&mut self, skel: FpvSkel, materials: Option<&MaterialCatalog>) {
-        self.insert_in(self.capture_ns, skel, materials);
+        self.insert_in(
+            self.capture_ns
+                .expect("asset capture requires an explicit family"),
+            skel,
+            materials,
+        );
     }
 
     pub fn insert_in(
@@ -518,20 +522,6 @@ impl FpvMeshCatalog {
         seen.values().filter(|bits| bits.count_ones() >= 2).count()
     }
 
-    pub fn peer(&self, ns: AssetNamespace, name: &str) -> Option<&FpvMeshEntry> {
-        const PREFER: [AssetNamespace; 3] =
-            [AssetNamespace::T5, AssetNamespace::Iw5, AssetNamespace::Iw4];
-        for other in PREFER {
-            if other == ns {
-                continue;
-            }
-            if let Some(entry) = self.get(other, name) {
-                return Some(entry);
-            }
-        }
-        None
-    }
-
     pub fn tag_view_count(&self) -> usize {
         self.entries
             .iter()
@@ -571,16 +561,104 @@ pub struct FpvMount {
     pub tag: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AmmunitionVisualMode {
+    Absent,
+    Embedded { bone: u16 },
+    Mounted,
+}
+
 #[derive(Clone, Debug)]
 pub struct FpvMountPlan {
     pub gun: FpvMeshIndex,
     pub secondary_gun: Option<FpvMeshIndex>,
     pub attachments: Vec<FpvMount>,
     pub rocket: Option<FpvMount>,
+    pub ammunition: AmmunitionVisualMode,
     pub ads_swaps: Vec<(usize, FpvMeshIndex)>,
 }
 
 impl FpvMountPlan {
+    pub fn prepare_embedded_ammunition(
+        &mut self,
+        catalog: &FpvMeshCatalog,
+    ) -> Result<(), FpvMountError> {
+        let entry = catalog
+            .get_at(self.gun.order())
+            .ok_or_else(|| FpvMountError {
+                model: format!("#{}", self.gun.order()),
+                detail: "gun missing from FPV catalog",
+            })?;
+        let valid = entry.skel.pose.as_ref().is_some_and(|pose| {
+            let count = entry.skel.bone_names.len();
+            pose.num_bones == count
+                && entry.skel.bones.len() == count
+                && pose.num_root_bones > 0
+                && pose.num_root_bones <= count
+                && pose.parent_list.len() == count - pose.num_root_bones
+                && (pose.num_root_bones..count).all(|bone| entry.skel.parent_of(bone).is_some())
+                && entry.skel.vert_skin.iter().all(|skin| {
+                    (0..4)
+                        .filter(|index| {
+                            if *index == 0 {
+                                !skin.primary_is_zero()
+                            } else {
+                                skin.has_extra_weight(*index)
+                            }
+                        })
+                        .all(|index| usize::from(skin.bones[index]) < count)
+                })
+        });
+        if !valid {
+            return Err(FpvMountError {
+                model: entry.skel.name.clone(),
+                detail: "invalid embedded ammunition hierarchy or binding",
+            });
+        }
+        let bone = entry
+            .skel
+            .bone_names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case("tag_clip"))
+            .filter(|bone| *bone <= u8::MAX as usize)
+            .filter(|bone| {
+                entry.skel.vert_skin.iter().any(|skin| {
+                    skin.bones
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| {
+                            if *index == 0 {
+                                !skin.primary_is_zero()
+                            } else {
+                                skin.has_extra_weight(*index)
+                            }
+                        })
+                        .any(|(_, bound)| {
+                            let mut current = Some(usize::from(*bound));
+                            while let Some(index) = current {
+                                if index == *bone {
+                                    return true;
+                                }
+                                current = entry.skel.parent_of(index);
+                            }
+                            false
+                        })
+                })
+            })
+            .ok_or_else(|| FpvMountError {
+                model: entry.skel.name.clone(),
+                detail: "embedded ammunition has no bound geometry",
+            })?;
+        if entry.skel.pose.is_none() || self.rocket.is_some() {
+            return Err(FpvMountError {
+                model: entry.skel.name.clone(),
+                detail: "invalid embedded ammunition structure",
+            });
+        }
+        self.ammunition = AmmunitionVisualMode::Embedded { bone: bone as u16 };
+        Ok(())
+    }
+
     pub fn attachment_models(&self, ads: bool) -> impl Iterator<Item = FpvMeshIndex> + '_ {
         self.attachments.iter().enumerate().map(move |(at, mount)| {
             ads.then(|| self.ads_swaps.iter().find(|(swap, _)| *swap == at))
@@ -738,7 +816,43 @@ pub fn plan_fpv_mounts(
         gun,
         secondary_gun: None,
         attachments: selected,
+        ammunition: if rocket.is_some() {
+            AmmunitionVisualMode::Mounted
+        } else {
+            AmmunitionVisualMode::Absent
+        },
         rocket,
         ads_swaps: Vec::new(),
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FamilyFpvMesh<F: asset_core::Family> {
+    index: crate::FpvMeshIndex,
+    owner: u64,
+    family: core::marker::PhantomData<F>,
+}
+
+impl<F: asset_core::Family> FamilyFpvMesh<F> {
+    pub fn index(self) -> crate::FpvMeshIndex {
+        self.index
+    }
+    pub fn owner(self) -> u64 {
+        self.owner
+    }
+}
+
+impl FpvMeshCatalog {
+    pub fn family_mesh<F: asset_core::Family>(
+        &self,
+        index: crate::FpvMeshIndex,
+    ) -> Option<FamilyFpvMesh<F>> {
+        (self.identity() != 0 && self.get_at(index.order())?.namespace == F::ID).then_some(
+            FamilyFpvMesh {
+                index,
+                owner: self.identity(),
+                family: core::marker::PhantomData,
+            },
+        )
+    }
 }

@@ -15,6 +15,7 @@ pub const PLAYERANIM_TYPES_PATH: &str = "mp/playeranimtypes.txt";
 
 #[derive(Clone, Debug, Default, Resource)]
 pub struct PlayerAnimSources {
+    family: Option<asset_core::FamilyId>,
     multiplayer_atr: Option<Vec<u8>>,
     playeranim_script: Option<Vec<u8>>,
     playeranim_types: Option<Vec<u8>>,
@@ -30,7 +31,31 @@ pub struct PlayerAnimSources {
 }
 
 impl PlayerAnimSources {
-    pub fn capture(&mut self, name: &str, data: &[u8], zlib_compressed: bool) {
+    pub fn family(&self) -> Option<asset_core::FamilyId> {
+        self.family
+    }
+    pub fn capture(
+        &mut self,
+        family: asset_core::FamilyId,
+        name: &str,
+        data: &[u8],
+        zlib_compressed: bool,
+    ) {
+        if ![
+            MULTIPLAYER_ANIMTREE_PATH,
+            PLAYERANIM_SCRIPT_PATH,
+            PLAYERANIM_TYPES_PATH,
+        ]
+        .contains(&name)
+        {
+            return;
+        }
+        if self.family.is_some_and(|owner| owner != family) {
+            self.decode_errors
+                .push("character animation source family mismatch");
+            return;
+        }
+        self.family = Some(family);
         let (target, path) = match name {
             MULTIPLAYER_ANIMTREE_PATH => (&mut self.multiplayer_atr, MULTIPLAYER_ANIMTREE_PATH),
             PLAYERANIM_SCRIPT_PATH => (&mut self.playeranim_script, PLAYERANIM_SCRIPT_PATH),
@@ -45,6 +70,18 @@ impl PlayerAnimSources {
                     return;
                 }
             }
+        } else if family == asset_core::FamilyId::T6 && path == MULTIPLAYER_ANIMTREE_PATH {
+            let decoded = data.get(..4).and_then(|size| {
+                let size = u32::from_le_bytes(size.try_into().ok()?) as usize;
+                asset_transport::inflate_deflate(&data[4..], size)
+                    .ok()
+                    .filter(|bytes| bytes.len() == size)
+            });
+            let Some(bytes) = decoded else {
+                self.decode_errors.push(path);
+                return;
+            };
+            bytes
         } else {
             data.to_vec()
         };
@@ -81,10 +118,42 @@ impl PlayerAnimSources {
             self.multiplayer_atr.as_deref(),
             self.playeranim_script.as_deref(),
         ));
-        if let Some(Ok(tree)) = self.compiled.as_ref() {
-            if let Some(script) = self.playeranim_script.as_deref() {
+        if let Some(Ok(tree)) = self.compiled.as_ref()
+            && let Some(script) = self.playeranim_script.as_deref()
+        {
+            self.parsed_script = Some(crate::playeranim_parse::parse_player_anim_script(
+                script,
+                tree,
+                matches!(
+                    self.family,
+                    Some(asset_core::FamilyId::T5 | asset_core::FamilyId::T6)
+                ),
+                (self.family == Some(asset_core::FamilyId::T6))
+                    .then_some(self.playeranim_types.as_deref())
+                    .flatten(),
+            ));
+        }
+        if matches!(
+            self.family,
+            Some(asset_core::FamilyId::T5 | asset_core::FamilyId::T6)
+        ) && let (Some(Ok(tree)), Some(Ok(script)), Some(atr)) = (
+            self.compiled.as_ref(),
+            self.parsed_script.as_ref(),
+            self.multiplayer_atr.as_deref(),
+        ) {
+            self.compiled = Some(crate::atr_compile::compile_selected_multiplayer(
+                atr, tree, script,
+            ));
+            if let Some(Ok(tree)) = self.compiled.as_ref()
+                && let Some(script) = self.playeranim_script.as_deref()
+            {
                 self.parsed_script = Some(crate::playeranim_parse::parse_player_anim_script(
-                    script, tree,
+                    script,
+                    tree,
+                    true,
+                    (self.family == Some(asset_core::FamilyId::T6))
+                        .then_some(self.playeranim_types.as_deref())
+                        .flatten(),
                 ));
             }
         }
@@ -143,6 +212,9 @@ impl PlayerAnimSources {
         let Some(Ok(tree)) = self.compiled.as_ref() else {
             return;
         };
+        let Some(family) = self.family else {
+            return;
+        };
         let leaves: Vec<(usize, String)> = tree
             .nodes()
             .iter()
@@ -156,7 +228,7 @@ impl PlayerAnimSources {
         let mut missing_leaves = 0usize;
         let mut first_missing = None;
         for (index, name) in leaves {
-            if catalog.get(crate::AssetNamespace::Iw4, &name).is_some() {
+            if catalog.get(family, &name).is_some() {
                 bound[index] = true;
                 bound_leaves += 1;
             } else {

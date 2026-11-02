@@ -109,6 +109,7 @@ pub fn register(app: &mut App) {
         .add_systems(
             Update,
             update_dof
+                .in_set(frame::InMatch)
                 .after(crate::prepare::scene::view_parms::stamp_prepared_scene_view)
                 .in_set(net::ClientSet::Present),
         );
@@ -136,15 +137,19 @@ fn update_dof(
     mut frame: ResMut<DofFrame>,
     mut scene: Local<DepthOfField>,
     clip: Res<crate::adapters::anim::dyn_ent::DynEntPhysClip>,
-    world: Res<frame::WorldGeneration>,
+    context: (Res<frame::InstalledMatch>, Res<net::EntityEventCursor>),
     view_settings: (Res<frame::ViewSubject>, Res<frame::GameSettings>),
     camera: Option<Res<render_anim::occupancy::view_kick::SessionViewKick>>,
-    mut generation: Local<Option<u64>>,
+    mut generation: Local<Option<frame::PresentationContext>>,
 ) {
     let (subject, settings) = view_settings;
     *frame = DofFrame::default();
-    if *generation != world.0 {
-        *generation = world.0;
+    let current = Some(frame::PresentationContext::new(
+        context.0.load_key,
+        context.1.timeline(),
+    ));
+    if *generation != current {
+        *generation = current;
         *scene = DepthOfField::default();
     }
     let Some(ps) = presented.player(local.0).filter(|_| view.ready) else {
@@ -207,7 +212,14 @@ fn update_dof(
     ) {
         if let Some(range) = weapons
             .as_ref()
-            .and_then(|w| w.0.hud_facts_of(weapon_iw4::get_viewmodel_weapon_index(ps)))
+            .and_then(|w| {
+                w.snapshot_weapon(
+                    presented.weapon_epoch(),
+                    weapon_iw4::get_viewmodel_weapon_index(ps),
+                )
+                .ok()
+                .and_then(|weapon| weapon.hud_facts())
+            })
             .and_then(|w| w.ads_dof)
         {
             scene.view_model_start = range[0] * ads;

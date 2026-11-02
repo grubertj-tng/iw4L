@@ -35,6 +35,7 @@ pub enum AliasCommand {
 #[derive(Message, Clone, Debug)]
 pub struct Footstep {
     pub event: Option<crate::AudioEvent>,
+    pub volume_scale: f32,
     pub alias: &'static str,
     pub fallback: &'static str,
     pub origin_inches: Option<[f32; 3]>,
@@ -48,6 +49,14 @@ pub struct WeaponSound {
     pub alias: String,
     pub origin_inches: Option<[f32; 3]>,
     pub snd_ent: Option<u32>,
+}
+
+#[derive(Message, Clone, Debug)]
+pub struct FlameFire {
+    pub number: u32,
+    pub weapon: u32,
+    pub player_view: bool,
+    pub origin_inches: [f32; 3],
 }
 
 #[derive(Message, Clone, Debug)]
@@ -67,7 +76,7 @@ pub struct ViewmodelNotetrack {
 
 #[derive(Message, Clone, Debug)]
 pub struct ViewmodelNotetracks {
-    pub generation: frame::WorldGeneration,
+    pub generation: frame::WorldStamp,
     pub client: sim::ClientId,
     pub life: sim::LifeSequence,
     pub weapon: u32,
@@ -78,6 +87,7 @@ pub struct ViewmodelNotetracks {
 #[derive(Message, Clone, Debug)]
 pub struct LandSound {
     pub event: Option<crate::AudioEvent>,
+    pub volume_scale: f32,
     pub alias: &'static str,
     pub fallback: &'static str,
     pub origin_inches: Option<[f32; 3]>,

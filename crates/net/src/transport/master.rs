@@ -1,20 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use master_protocol::{
     ALPN, AdmissionFailure, AdvertId, ContentFlags, ControlFrame, ControlHello, ControlRequest,
     ControlResponse, EndpointRole, MAX_BOOTSTRAP_STREAM_BYTES, MAX_CONCURRENT_BOOTSTRAP,
     MAX_RELAY_UNI_STREAMS, MemberId, RelayDatagram, RequestBody, ResponseBody, RoomView,
-    SESSION_IDLE, SESSION_KEEP_ALIVE, SessionCloseReason, decode_relay, decode_relay_stream,
-    decode_stream_payload, encode_relay, encode_relay_stream, encode_stream_frame,
-    stream_frame_len,
+    SESSION_IDLE, SessionCloseReason, decode_relay, decode_relay_stream, decode_stream_payload,
+    encode_relay, encode_relay_stream, encode_stream_frame, stream_frame_len,
 };
 use quinn::crypto::rustls::QuicClientConfig;
 use tokio_util::sync::CancellationToken;
@@ -31,51 +29,30 @@ use crate::transport::fragment::{Fragmenter, Reassembler};
 use crate::transport::protocol::{ContentFingerprint, HandshakeHello, MatchDescriptor};
 use crate::transport::udp_session::{RelayMailbox, UdpAuthorityHub, UdpClientLink};
 
+pub(crate) mod limits;
+mod population;
+pub use population::CommunityPlayerCounts;
+
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
-pub const CONTENT_IW4: u8 = 1 << 0;
-pub const CONTENT_IW5: u8 = 1 << 1;
-pub const CONTENT_T5: u8 = 1 << 2;
-pub const CONTENT_T6: u8 = 1 << 3;
+pub const CONTENT_IW4: u8 = ContentFlags::IW4.0;
 
 pub const fn content_inventory(iw4: bool, iw5: bool, t5: bool, t6: bool) -> ContentFlags {
     ContentFlags(
-        (if iw4 { CONTENT_IW4 } else { 0 })
-            | (if iw5 { CONTENT_IW5 } else { 0 })
-            | (if t5 { CONTENT_T5 } else { 0 })
-            | (if t6 { CONTENT_T6 } else { 0 }),
+        (if iw4 { ContentFlags::IW4.0 } else { 0 })
+            | (if iw5 { ContentFlags::IW5.0 } else { 0 })
+            | (if t5 { ContentFlags::T5.0 } else { 0 })
+            | (if t6 { ContentFlags::T6.0 } else { 0 }),
     )
 }
 
-pub fn content_required_by_map(map: &str) -> Result<ContentFlags> {
-    let namespace = map
-        .split_once(':')
-        .map_or("iw4", |(namespace, _)| namespace);
-    Ok(ContentFlags(match namespace {
-        "iw4" => CONTENT_IW4,
-        "iw5" => CONTENT_IW5,
-        "t5" => CONTENT_T5,
-        "t6" => CONTENT_T6,
-        other => return Err(format!("unknown content namespace `{other}` in map `{map}`").into()),
-    }))
-}
-
 pub fn content_names(flags: ContentFlags) -> String {
-    let mut names = Vec::new();
-    if flags.0 & CONTENT_IW4 != 0 {
-        names.push("iw4");
-    }
-    if flags.0 & CONTENT_IW5 != 0 {
-        names.push("iw5");
-    }
-    if flags.0 & CONTENT_T5 != 0 {
-        names.push("t5");
-    }
-    if flags.0 & CONTENT_T6 != 0 {
-        names.push("t6");
-    }
-    if flags.0 & !(CONTENT_IW4 | CONTENT_IW5 | CONTENT_T5 | CONTENT_T6) != 0 {
+    let mut names: Vec<_> = ContentFlags::FAMILIES
+        .into_iter()
+        .filter_map(|(name, flag)| flags.contains(flag).then_some(name))
+        .collect();
+    if !ContentFlags::KNOWN.contains(flags) {
         names.push("unknown");
     }
     names.join(",")
@@ -83,11 +60,105 @@ pub fn content_names(flags: ContentFlags) -> String {
 
 const RELAY_PACKET_BYTES: usize = crate::transport::protocol::MAX_PACKET_BYTES as usize;
 const HOST_DATA_CAP: usize = 64;
-const HOST_CONTROL_CAP: usize = 32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MasterOperationOutcome {
+    Succeeded,
+    Refused(String),
+    RemoteOutcomeUnknown(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MasterOperationResult {
+    pub request_id: u64,
+    pub outcome: MasterOperationOutcome,
+}
+
+struct QueuedControl {
+    frame: ControlFrame,
+    deadline: tokio::time::Instant,
+    _bytes: tokio::sync::OwnedSemaphorePermit,
+}
+
+struct ControlSender {
+    tx: tokio::sync::mpsc::Sender<QueuedControl>,
+    pending: Mutex<HashMap<u64, tokio::time::Instant>>,
+    outcomes: Arc<Mutex<VecDeque<MasterOperationResult>>>,
+    bytes: Arc<tokio::sync::Semaphore>,
+}
+
+impl ControlSender {
+    fn complete_response(&self, response: &ControlResponse) -> Option<tokio::time::Instant> {
+        let deadline = self
+            .pending
+            .lock()
+            .expect("control requests poisoned")
+            .remove(&response.request_id)?;
+        let outcome = if deadline <= tokio::time::Instant::now() {
+            MasterOperationOutcome::RemoteOutcomeUnknown("response deadline".into())
+        } else if let ResponseBody::Error(error) = &response.body {
+            MasterOperationOutcome::Refused(error.to_string())
+        } else {
+            MasterOperationOutcome::Succeeded
+        };
+        self.outcomes
+            .lock()
+            .expect("control outcomes poisoned")
+            .push_back(MasterOperationResult {
+                request_id: response.request_id,
+                outcome,
+            });
+        Some(deadline)
+    }
+
+    fn close_pending(&self) {
+        let mut pending = self.pending.lock().expect("control requests poisoned");
+        let mut outcomes = self.outcomes.lock().expect("control outcomes poisoned");
+        outcomes.extend(
+            pending
+                .drain()
+                .map(|(request_id, _)| MasterOperationResult {
+                    request_id,
+                    outcome: MasterOperationOutcome::RemoteOutcomeUnknown(
+                        "connection closed before correlated response".into(),
+                    ),
+                }),
+        );
+    }
+
+    fn expire(&self, role: &'static str) -> std::result::Result<(), TransportFault> {
+        let now = tokio::time::Instant::now();
+        let mut pending = self.pending.lock().expect("control requests poisoned");
+        if let Some(id) = pending
+            .iter()
+            .find_map(|(id, deadline)| (*deadline <= now).then_some(*id))
+        {
+            pending.remove(&id);
+            self.outcomes
+                .lock()
+                .expect("control outcomes poisoned")
+                .push_back(MasterOperationResult {
+                    request_id: id,
+                    outcome: MasterOperationOutcome::RemoteOutcomeUnknown(
+                        "response deadline".into(),
+                    ),
+                });
+            return Err(TransportFault::new(
+                "control_response",
+                role,
+                format!("request {id} deadline; remote outcome unknown"),
+            ));
+        }
+        Ok(())
+    }
+}
 
 const BOOTSTRAP_PRIORITY: i32 = -32;
-const IO_DEADLINE: Duration = Duration::from_secs(8);
-const LEAVE_DRAIN: Duration = Duration::from_millis(500);
+const DNS_DEADLINE: Duration = Duration::from_secs(8);
+const CONNECT_RETRY_FIRST: Duration = Duration::from_secs(1);
+const CONNECT_RETRY_MAX: Duration = Duration::from_secs(6);
+const CONNECT_RACE: usize = 4;
+const CLIENT_KEEP_ALIVE: Duration = Duration::from_millis(250);
 const DATAGRAM_SEND_BUFFER: usize = 1024 * 1024;
 const QUEUE_POLL: Duration = Duration::from_millis(5);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -99,10 +170,12 @@ fn blocking_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn endpoint_build() -> String {
@@ -122,9 +195,52 @@ fn relay_reassembler() -> Reassembler {
     Reassembler::new(master_protocol::MAX_OPAQUE_PAYLOAD, RELAY_PACKET_BYTES)
 }
 
-fn take_commands(commands: &Mutex<Vec<MasterBridgeCommand>>) -> Vec<MasterBridgeCommand> {
+struct QueuedCommand {
+    command: MasterBridgeCommand,
+    deadline: tokio::time::Instant,
+}
+
+fn take_commands(
+    commands: &Mutex<Vec<QueuedCommand>>,
+    role: &'static str,
+) -> std::result::Result<Vec<MasterBridgeCommand>, TransportFault> {
     let mut queue = commands.lock().expect("master command queue poisoned");
-    std::mem::take(&mut *queue)
+    let commands = std::mem::take(&mut *queue);
+    if commands
+        .iter()
+        .any(|command| command.deadline <= tokio::time::Instant::now())
+    {
+        return Err(TransportFault::new(
+            "local_command",
+            role,
+            "command queue deadline",
+        ));
+    }
+    Ok(commands
+        .into_iter()
+        .map(|command| command.command)
+        .collect())
+}
+
+async fn command_deadline(
+    commands: &Mutex<Vec<QueuedCommand>>,
+    role: &'static str,
+) -> TransportFault {
+    loop {
+        if commands
+            .lock()
+            .expect("master command queue poisoned")
+            .iter()
+            .any(|command| command.deadline <= tokio::time::Instant::now())
+        {
+            return TransportFault::new(
+                "local_command",
+                role,
+                "command expired before connection; not sent",
+            );
+        }
+        tokio::time::sleep(QUEUE_POLL).await;
+    }
 }
 
 fn classify_try_send<T>(
@@ -343,6 +459,7 @@ impl MasterLaunchIntent {
         let host = std::env::var("IW4L_MASTER_HOST_NAME").ok();
         let join = std::env::var("IW4L_MASTER_JOIN").ok();
         match (host, join) {
+            (None, None) => Ok(Self::disabled()),
             (Some(name), None) if !name.trim().is_empty() => {
                 Ok(Self(MasterLaunchMode::Host(HostConfig {
                     password: std::env::var("IW4L_MASTER_PASSWORD").unwrap_or_default(),
@@ -503,7 +620,9 @@ enum MasterBridgeCommand {
     MatchEnded {
         match_key: frame::MatchKey,
     },
-    AuthorityProgress,
+    AuthorityProgress {
+        now_ms: u64,
+    },
     AdmitEnter {
         member_id: MemberId,
         epoch: u32,
@@ -512,6 +631,19 @@ enum MasterBridgeCommand {
         client_id: u32,
     },
     Shutdown,
+}
+
+impl MasterBridgeCommand {
+    fn queued_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::SetPassword { password } => password.capacity(),
+                Self::UpdateLobby { map, mode } | Self::StartMatch { map, mode } => {
+                    map.capacity() + mode.capacity()
+                }
+                _ => 0,
+            }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -545,6 +677,7 @@ pub enum MasterBridgeState {
         max_players: u8,
         skip_votes: u8,
         in_match: bool,
+        families: frame::AssetFamilies,
     },
     Joining {
         identity: SessionIdentity,
@@ -559,6 +692,7 @@ pub enum MasterBridgeState {
         max_players: u8,
         skip_votes: u8,
         in_match: bool,
+        families: frame::AssetFamilies,
     },
     Closed {
         identity: SessionIdentity,
@@ -600,6 +734,13 @@ impl MasterBridgeState {
         }
     }
 
+    pub fn families(&self) -> Option<frame::AssetFamilies> {
+        match self {
+            Self::Hosting { families, .. } | Self::Joined { families, .. } => Some(*families),
+            _ => None,
+        }
+    }
+
     pub fn members(&self) -> &[MemberId] {
         match self {
             Self::Hosting { members, .. } | Self::Joined { members, .. } => members,
@@ -632,7 +773,8 @@ impl MasterBridgeState {
 #[derive(Resource)]
 pub struct MasterBridge {
     state: Arc<Mutex<MasterBridgeState>>,
-    commands: Arc<Mutex<Vec<MasterBridgeCommand>>>,
+    commands: Arc<Mutex<Vec<QueuedCommand>>>,
+    outcomes: Arc<Mutex<VecDeque<MasterOperationResult>>>,
     installed_load: Arc<Mutex<Option<frame::LocalLoadKey>>>,
     mailbox: RelayMailbox,
     bootstrap: Arc<BootstrapLane>,
@@ -661,15 +803,52 @@ impl MasterBridge {
         self.close.cancel();
     }
 
+    pub fn take_operation_results(&self) -> Vec<MasterOperationResult> {
+        self.outcomes
+            .lock()
+            .expect("control outcomes poisoned")
+            .drain(..)
+            .collect()
+    }
+
     pub fn mailbox(&self) -> RelayMailbox {
         self.mailbox.clone()
     }
 
     fn send(&self, command: MasterBridgeCommand) {
-        self.commands
-            .lock()
-            .expect("master command queue poisoned")
-            .push(command);
+        let mut commands = self.commands.lock().expect("master command queue poisoned");
+        if matches!(command, MasterBridgeCommand::AuthorityProgress { .. })
+            && let Some(queued) = commands.iter_mut().find(|queued| {
+                matches!(
+                    queued.command,
+                    MasterBridgeCommand::AuthorityProgress { .. }
+                )
+            })
+        {
+            queued.command = command;
+            return;
+        }
+        if commands.len() >= limits::values().queue_items
+            || commands
+                .iter()
+                .map(|queued| queued.command.queued_bytes())
+                .sum::<usize>()
+                .saturating_add(command.queued_bytes())
+                > limits::values().queue_bytes
+        {
+            drop(commands);
+            publish_failed(
+                &self.state,
+                self.state().identity(),
+                TransportFault::new("local_command", "local", "command budget exhausted"),
+            );
+            self.close.cancel();
+            return;
+        }
+        commands.push(QueuedCommand {
+            command,
+            deadline: tokio::time::Instant::now() + limits::values().queue_age,
+        });
     }
 
     pub fn set_installed_load(&self, load: Option<frame::LocalLoadKey>) {
@@ -701,7 +880,7 @@ impl MasterBridge {
     }
 
     pub fn report_authority_progress(&self) {
-        self.send(MasterBridgeCommand::AuthorityProgress);
+        self.send(MasterBridgeCommand::AuthorityProgress { now_ms: now_ms() });
     }
 
     pub fn report_match_ended(&self, match_key: frame::MatchKey) {
@@ -745,7 +924,10 @@ impl MasterBridge {
 impl Drop for MasterBridge {
     fn drop(&mut self) {
         if let Ok(mut queue) = self.commands.lock() {
-            queue.push(MasterBridgeCommand::Shutdown);
+            queue.push(QueuedCommand {
+                command: MasterBridgeCommand::Shutdown,
+                deadline: tokio::time::Instant::now() + limits::values().shutdown,
+            });
         }
         self.close.cancel();
         let _ = self.worker.take();
@@ -760,6 +942,7 @@ pub struct MasterMatchOffer {
     pub map: String,
     pub mode: String,
     pub match_key: frame::MatchKey,
+    pub families: frame::AssetFamilies,
 }
 
 impl MasterMatchStart {
@@ -894,6 +1077,7 @@ fn arm_master_browser(
 }
 
 fn apply_master_menu_action(
+    dvars: Res<frame::UiMenuDvars>,
     mut pending: ResMut<PendingMasterMenuAction>,
     mut intent: ResMut<MasterLaunchIntent>,
     mut role: ResMut<frame::RuntimeRole>,
@@ -920,6 +1104,12 @@ fn apply_master_menu_action(
         }
         MasterMenuAction::UpdateLobby { map, mode } => {
             if let Some(bridge) = bridge {
+                if let Some(families) = bridge.state().families()
+                    && let Err(error) = families.require_map(&map)
+                {
+                    diag::warn!(Net, "{error}");
+                    return;
+                }
                 bridge.send(MasterBridgeCommand::UpdateLobby { map, mode });
             } else {
                 diag::warn!(Net, "master lobby update requested without a live bridge");
@@ -928,6 +1118,12 @@ fn apply_master_menu_action(
         }
         MasterMenuAction::StartMatch { map, mode } => {
             if let Some(bridge) = bridge {
+                if let Some(families) = bridge.state().families()
+                    && let Err(error) = families.require_map(&map)
+                {
+                    diag::warn!(Net, "{error}");
+                    return;
+                }
                 bridge.send(MasterBridgeCommand::StartMatch { map, mode });
             } else {
                 diag::warn!(Net, "master lobby start requested without a live bridge");
@@ -985,7 +1181,11 @@ fn apply_master_menu_action(
             mode,
             password,
         } => {
-            let requires = match content_required_by_map(&map) {
+            let requires = match frame::AssetFamilies::from_inventory(browser.have.0, &dvars)
+                .and_then(|families| {
+                    families.require_map(&map)?;
+                    Ok(ContentFlags(families.0))
+                }) {
                 Ok(value) => value,
                 Err(error) => {
                     diag::warn!(Net, "master host content: {error}");
@@ -1045,128 +1245,144 @@ fn browser_worker(
     };
     runtime.block_on(async move {
         loop {
-            if cancel.is_cancelled() {
+            let Err(error) = browse(&target, &state, &refresh, &cancel).await else {
                 return;
-            }
-            state.lock().expect("master browser state poisoned").loading = true;
-            let result: Result<(u64, Vec<master_protocol::Advert>, u64)> =
-                io_timeout(&cancel, async {
-                    let (_endpoint, connection) = connect(&target, &cancel).await?;
-                    let (mut send, mut recv) = io_timeout(&cancel, connection.open_bi()).await?;
-                    send.set_priority(0)?;
-                    write_frame(
-                        &mut send,
-                        &ControlFrame::Hello(ControlHello {
-                            protocol_version: master_protocol::PROTOCOL_VERSION,
-                            game_protocol: crate::PROTOCOL_VERSION,
-                            role: EndpointRole::Cli,
-                            build: endpoint_build(),
-                            player_name: String::new(),
-                        }),
-                    )
-                    .await?;
-                    write_frame(
-                        &mut send,
-                        &ControlFrame::Request(ControlRequest {
-                            request_id: 1,
-                            body: RequestBody::ListRooms,
-                        }),
-                    )
-                    .await?;
-                    loop {
-                        match read_frame(&mut recv).await? {
-                            ControlFrame::Response(ControlResponse {
-                                request_id: 1,
-                                body:
-                                    ResponseBody::RoomList {
-                                        generation,
-                                        adverts,
-                                    },
-                            }) => {
-                                return Result::Ok((
-                                    generation,
-                                    adverts,
-                                    connection.rtt().as_millis().max(1) as u64,
-                                ));
-                            }
-                            ControlFrame::Response(ControlResponse {
-                                body: ResponseBody::Error(error),
-                                ..
-                            }) => return Err(error.into()),
-                            ControlFrame::RoomView(_)
-                            | ControlFrame::Closed { .. }
-                            | ControlFrame::PeerEvent(_)
-                            | ControlFrame::Hello(_)
-                            | ControlFrame::Relay(_) => {}
-                            other => {
-                                return Err(format!("unexpected browser frame {other:?}").into());
-                            }
-                        }
-                    }
-                })
-                .await;
+            };
             let mut current = state.lock().expect("master browser state poisoned");
             current.loading = false;
-            match result {
-                Ok((generation, adverts, ping_ms)) => {
-                    current.ping_ms = Some(ping_ms);
-                    current.generation = generation;
-                    let have = current.have;
-                    current.adverts = adverts
-                        .into_iter()
-                        .map(|advert| MasterAdvert {
-                            id: advert.id,
-                            name: advert.name,
-                            map: advert.map,
-                            mode: advert.mode,
-                            players: advert.players,
-                            max_players: advert.max_players,
-                            locked: advert.locked,
-                            in_match: advert.in_match,
-                            requires: advert.requires,
-                            available: advert.available,
-                            password_protected: advert.password_protected,
-                            missing: advert.requires.missing_from(have),
-                        })
-                        .collect();
-                    current.error = None;
-                }
-                Err(error) => {
-                    current.ping_ms = None;
-                    let message = error.to_string();
-                    if !cancel.is_cancelled() && current.error.as_deref() != Some(message.as_str())
-                    {
-                        diag::warn!(
-                            Net,
-                            "master browser request failed target={} server_name={}: {}",
-                            target.address,
-                            target.server_name,
-                            message
-                        );
-                    }
-                    current.error = Some(message);
-                }
+            current.ping_ms = None;
+            let message = error.to_string();
+            if !cancel.is_cancelled() && current.error.as_deref() != Some(message.as_str()) {
+                diag::warn!(
+                    Net,
+                    "master browser request failed target={} server_name={}: {}",
+                    target.address,
+                    target.server_name,
+                    message
+                );
             }
+            current.error = Some(message);
             drop(current);
-
-            let seen_refresh = refresh.load(Ordering::Relaxed);
-            for _ in 0..50 {
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                }
-                if refresh.load(Ordering::Relaxed) != seen_refresh {
-                    break;
-                }
+            if !wait_for_refresh(&refresh, &cancel).await {
+                return;
             }
         }
     });
 }
 
+async fn browse(
+    target: &MasterTarget,
+    state: &Mutex<MasterBrowserSnapshot>,
+    refresh: &AtomicU64,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    state.lock().expect("master browser state poisoned").loading = true;
+    let (_endpoint, connection) = connect(target, cancel).await?;
+    let (mut send, mut recv) = cancellable(cancel, connection.open_bi()).await?;
+    send.set_priority(0)?;
+    write_frame(
+        &mut send,
+        &ControlFrame::Hello(ControlHello {
+            protocol_version: master_protocol::PROTOCOL_VERSION,
+            game_protocol: crate::PROTOCOL_VERSION,
+            role: EndpointRole::Cli,
+            build: endpoint_build(),
+            player_name: String::new(),
+        }),
+    )
+    .await?;
+    let mut request_id = 0_u64;
+    loop {
+        request_id += 1;
+        state.lock().expect("master browser state poisoned").loading = true;
+        write_frame(
+            &mut send,
+            &ControlFrame::Request(ControlRequest {
+                request_id,
+                body: RequestBody::ListRooms,
+            }),
+        )
+        .await?;
+        let response_deadline = tokio::time::Instant::now() + limits::values().response;
+        let (generation, adverts) = loop {
+            let frame = tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep_until(response_deadline) => return Err("room list response deadline".into()),
+                frame = read_frame(&mut recv) => frame?,
+            };
+            match frame {
+                ControlFrame::Response(ControlResponse {
+                    request_id: id,
+                    body:
+                        ResponseBody::RoomList {
+                            generation,
+                            adverts,
+                        },
+                }) if id == request_id => break (generation, adverts),
+                ControlFrame::Response(ControlResponse {
+                    request_id: id,
+                    body: ResponseBody::Error(error),
+                }) if id == request_id => return Err(error.into()),
+                ControlFrame::Response(_)
+                | ControlFrame::RoomView(_)
+                | ControlFrame::Closed { .. }
+                | ControlFrame::PeerEvent(_)
+                | ControlFrame::Hello(_)
+                | ControlFrame::Relay(_) => {}
+                other => {
+                    return Err(format!("unexpected browser frame {other:?}").into());
+                }
+            }
+        };
+        let mut current = state.lock().expect("master browser state poisoned");
+        current.loading = false;
+        current.ping_ms = Some(connection.rtt().as_millis().max(1) as u64);
+        current.generation = generation;
+        let have = current.have;
+        current.adverts = adverts
+            .into_iter()
+            .map(|advert| MasterAdvert {
+                id: advert.id,
+                name: advert.name,
+                map: advert.map,
+                mode: advert.mode,
+                players: advert.players,
+                max_players: advert.max_players,
+                locked: advert.locked,
+                in_match: advert.in_match,
+                requires: advert.requires,
+                available: advert.available,
+                password_protected: advert.password_protected,
+                missing: advert.requires.missing_from(have),
+            })
+            .collect();
+        current.error = None;
+        drop(current);
+        if !wait_for_refresh(refresh, cancel).await {
+            return Ok(());
+        }
+    }
+}
+
+async fn wait_for_refresh(refresh: &AtomicU64, cancel: &CancellationToken) -> bool {
+    let seen_refresh = refresh.load(Ordering::Relaxed);
+    for _ in 0..50 {
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        if refresh.load(Ordering::Relaxed) != seen_refresh {
+            break;
+        }
+    }
+    true
+}
+
 struct WorkerCtx {
     player_name: String,
     state: Arc<Mutex<MasterBridgeState>>,
-    commands: Arc<Mutex<Vec<MasterBridgeCommand>>>,
+    commands: Arc<Mutex<Vec<QueuedCommand>>>,
+    outcomes: Arc<Mutex<VecDeque<MasterOperationResult>>>,
     installed_load: Arc<Mutex<Option<frame::LocalLoadKey>>>,
     mailbox: RelayMailbox,
     bootstrap: Arc<BootstrapLane>,
@@ -1201,6 +1417,7 @@ fn spawn_worker(role: &'static str, kind: SessionKind, player_name: String) -> M
     }
     let state = Arc::new(Mutex::new(MasterBridgeState::Connecting { identity }));
     let commands = Arc::new(Mutex::new(Vec::new()));
+    let outcomes = Arc::new(Mutex::new(VecDeque::new()));
     let installed_load = Arc::new(Mutex::new(None));
     let bootstrap = BootstrapLane::new();
     let mailbox = RelayMailbox::new(HOST_DATA_CAP);
@@ -1212,6 +1429,7 @@ fn spawn_worker(role: &'static str, kind: SessionKind, player_name: String) -> M
         player_name,
         state: Arc::clone(&state),
         commands: Arc::clone(&commands),
+        outcomes: Arc::clone(&outcomes),
         installed_load: Arc::clone(&installed_load),
         mailbox: mailbox.clone(),
         bootstrap: Arc::clone(&bootstrap),
@@ -1235,6 +1453,7 @@ fn spawn_worker(role: &'static str, kind: SessionKind, player_name: String) -> M
     MasterBridge {
         state,
         commands,
+        outcomes,
         installed_load,
         mailbox,
         bootstrap,
@@ -1319,6 +1538,10 @@ pub fn register_master_bridge(app: &mut App) {
     app.init_resource::<PendingMasterMenuAction>()
         .add_systems(
             Update,
+            population::poll_communities.in_set(crate::ClientSet::Load),
+        )
+        .add_systems(
+            Update,
             (arm_master_browser, apply_master_menu_action)
                 .chain()
                 .in_set(crate::ClientSet::Load),
@@ -1356,6 +1579,8 @@ fn report_committed_authority_progress(
     bridge: Option<Res<MasterBridge>>,
     server_tick: Option<Res<crate::authority::runtime::ServerTick>>,
     hold: Option<Res<crate::AuthorityLoadHold>>,
+    installed: Option<Res<frame::InstalledMatch>>,
+    mut reported: Local<Option<(u64, frame::LocalLoadKey, sim::Tick)>>,
 ) {
     let Some(bridge) = bridge else {
         return;
@@ -1363,16 +1588,30 @@ fn report_committed_authority_progress(
     if hold.is_some_and(|hold| hold.0) {
         return;
     }
-    if server_tick.is_some_and(|tick| tick.0.is_some()) {
-        bridge.report_authority_progress();
+    let (Some(installed), Some(tick)) = (
+        installed,
+        server_tick
+            .as_ref()
+            .and_then(|tick| tick.0.as_ref())
+            .map(|tick| tick.snapshot.tick),
+    ) else {
+        return;
+    };
+    let context = (bridge.incarnation(), installed.load_key);
+    if reported.is_some_and(|(incarnation, key, previous)| {
+        (incarnation, key) == context && tick.0 <= previous.0
+    }) {
+        return;
     }
+    *reported = Some((context.0, context.1, tick));
+    bridge.report_authority_progress();
 }
 
 fn open_hosted_epoch_when_world_is_live(
     bridge: Option<Res<MasterBridge>>,
     intent: Res<MasterLaunchIntent>,
     admission: Res<crate::ClientAdmission>,
-    has_world: Option<Res<frame::HasWorld>>,
+    has_world: Option<Res<State<frame::MatchScope>>>,
     launch: Option<Res<frame::LaunchIdentity>>,
     hold: Option<Res<crate::AuthorityLoadHold>>,
     mut sent: Local<Option<(u64, frame::LocalLoadKey)>>,
@@ -1384,7 +1623,7 @@ fn open_hosted_epoch_when_world_is_live(
         return;
     };
     if !config.auto_start_map
-        || !has_world.is_some_and(|world| world.0)
+        || !has_world.is_some_and(|world| *world.get() == frame::MatchScope::Live)
         || hold.is_some_and(|hold| hold.0)
     {
         return;
@@ -1423,6 +1662,14 @@ fn observe_master_bridge(
     let Some(bridge) = bridge else {
         return;
     };
+    for result in bridge.take_operation_results() {
+        diag::info!(
+            Net,
+            "master operation: request={} outcome={:?}",
+            result.request_id,
+            result.outcome
+        );
+    }
     let current = bridge.state();
     let identity = current.identity();
     if current.in_match()
@@ -1434,6 +1681,7 @@ fn observe_master_bridge(
             map: map.to_owned(),
             mode: mode.to_owned(),
             match_key: identity.match_key(),
+            families: current.families().expect("live room asset families"),
         });
         *seen_start = Some((identity.room_id, identity.epoch));
     }
@@ -1505,7 +1753,7 @@ fn execute_host_match_effects(
     effects: Vec<HostMatchEffect>,
     map_ready: &Mutex<HashSet<MemberId>>,
     facts: &Mutex<Vec<MasterLifecycleFact>>,
-    control_tx: &tokio::sync::mpsc::Sender<ControlFrame>,
+    control_tx: &ControlSender,
     request_id: &mut u64,
     role: &'static str,
 ) -> std::result::Result<(), TransportFault> {
@@ -1606,6 +1854,7 @@ async fn session_main(
         player_name,
         state,
         commands,
+        outcomes,
         installed_load,
         mailbox,
         bootstrap,
@@ -1640,9 +1889,11 @@ async fn session_main(
         target.server_name,
         endpoint_build()
     );
-    let (_endpoint, connection) = connect(&target, &cancel)
-        .await
-        .map_err(|error| TransportFault::new("connect", role, error.to_string()))?;
+    let (_endpoint, connection) = tokio::select! {
+        _ = close.cancelled() => return Ok(()),
+        fault = command_deadline(&commands, role) => return Err(fault),
+        result = connect(&target, &cancel) => result.map_err(|error| TransportFault::new("connect", role, error.to_string()))?,
+    };
     diag::info!(
         Net,
         "master {role} hello build={} wire={} game={} attempt={}",
@@ -1651,7 +1902,7 @@ async fn session_main(
         crate::PROTOCOL_VERSION,
         identity.attempt_id
     );
-    let (mut send, recv) = io_timeout(&cancel, connection.open_bi())
+    let (mut send, recv) = cancellable(&cancel, connection.open_bi())
         .await
         .map_err(|error| TransportFault::with_connection("open_bi", role, error, &connection))?;
     send.set_priority(0).map_err(|error| {
@@ -1670,7 +1921,14 @@ async fn session_main(
     .await
     .map_err(|error| TransportFault::with_connection("hello", role, error, &connection))?;
 
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ControlFrame>(HOST_CONTROL_CAP);
+    let (tx, mut control_rx) =
+        tokio::sync::mpsc::channel::<QueuedControl>(limits::values().queue_items);
+    let control_tx = ControlSender {
+        tx,
+        pending: Mutex::new(HashMap::new()),
+        outcomes,
+        bytes: Arc::new(tokio::sync::Semaphore::new(limits::values().queue_bytes)),
+    };
     let mut children = tokio::task::JoinSet::new();
     {
         let writer_connection = connection.clone();
@@ -1683,7 +1941,10 @@ async fn session_main(
                     _ = writer_cancel.cancelled() => return Ok(()),
                     frame = control_rx.recv() => {
                         let Some(frame) = frame else { return Ok(()) };
-                        write_frame(&mut writer, &frame).await.map_err(|error| {
+                        tokio::time::timeout_at(frame.deadline, write_frame(&mut writer, &frame.frame))
+                            .await
+                            .map_err(|_| TransportFault::new("control_write", writer_role, "control queue/write deadline"))?
+                            .map_err(|error| {
                             TransportFault::with_connection(
                                 "control_write",
                                 writer_role,
@@ -1716,10 +1977,12 @@ async fn session_main(
         role,
         is_host,
     ));
-    let (bootstrap_jobs, bootstrap_rx) =
-        tokio::sync::mpsc::channel::<(frame::MatchKey, MemberId, Vec<u8>)>(
-            MAX_CONCURRENT_BOOTSTRAP as usize,
-        );
+    let (bootstrap_tx, bootstrap_rx) =
+        tokio::sync::mpsc::channel::<BootstrapJob>(MAX_CONCURRENT_BOOTSTRAP as usize);
+    let bootstrap_jobs = BootstrapSender {
+        tx: bootstrap_tx,
+        bytes: Arc::new(tokio::sync::Semaphore::new(limits::values().queue_bytes)),
+    };
     let (prepared_tx, mut prepared_rx) =
         tokio::sync::mpsc::channel::<HostMatchEvent>(MAX_CONCURRENT_BOOTSTRAP as usize);
     children.spawn(bootstrap_egress(
@@ -1779,6 +2042,9 @@ async fn session_main(
         if cancel.is_cancelled() {
             break Ok(());
         }
+        if !closing && let Err(error) = control_tx.expire(role) {
+            break Err(error);
+        }
         if !closing
             && let Err(error) = pump_local_queues(
                 identity.match_key(),
@@ -1792,6 +2058,9 @@ async fn session_main(
             )
         {
             break Err(error);
+        }
+        if let Err(error) = mailbox.check_control_deadlines() {
+            break Err(TransportFault::new("relay_queue", role, error));
         }
         let mut control_error = None;
         for (member_id, payload) in mailbox.take_control_outbound() {
@@ -1826,7 +2095,11 @@ async fn session_main(
             break Err(error);
         }
         let mut command_error = None;
-        for command in take_commands(&commands) {
+        let queued = match take_commands(&commands, role) {
+            Ok(commands) => commands,
+            Err(error) => break Err(error),
+        };
+        for command in queued {
             match handle_command(
                 command,
                 &installed_load,
@@ -1848,7 +2121,7 @@ async fn session_main(
                     );
                     closing = true;
                     leave_request = Some(request_id);
-                    leave_at = Some(tokio::time::Instant::now() + LEAVE_DRAIN);
+                    leave_at = Some(tokio::time::Instant::now() + limits::values().shutdown);
                 }
                 Err(error) => {
                     command_error = Some(error);
@@ -1861,7 +2134,14 @@ async fn session_main(
         }
         tokio::select! {
             _ = cancel.cancelled() => break Ok(()),
-            _ = close.cancelled(), if !closing => {}
+            _ = close.cancelled(), if !closing => {
+                let id = take_id(&mut request_id);
+                let body = if is_host { RequestBody::CloseRoom } else { RequestBody::LeaveRoom };
+                if let Err(error) = enqueue_control(&control_tx, ControlFrame::Request(ControlRequest { request_id: id, body }), role) { break Err(error); }
+                closing = true;
+                leave_request = Some(id);
+                leave_at = Some(tokio::time::Instant::now() + limits::values().shutdown);
+            }
             _ = async {
                 match leave_at {
                     Some(at) => tokio::time::sleep_until(at).await,
@@ -1871,7 +2151,7 @@ async fn session_main(
                 diag::warn!(
                     Net,
                     "master {role} closed: relay did not confirm within {}ms",
-                    LEAVE_DRAIN.as_millis()
+                    limits::values().shutdown.as_millis()
                 );
                 break Ok(());
             }
@@ -1911,6 +2191,9 @@ async fn session_main(
                 }
             }
             (recv, frame) = async {
+                while facts.lock().expect("master facts poisoned").len() >= limits::values().queue_items.max(master_protocol::MAX_SESSION_MEMBERS as usize + 1) {
+                    tokio::time::sleep(QUEUE_POLL).await;
+                }
                 mailbox.wait_control_inbound_capacity().await;
                 (&mut next_control).await
             } => {
@@ -1985,10 +2268,11 @@ async fn session_main(
         }
     };
 
+    control_tx.close_pending();
     cancel.cancel();
     connection.close(0_u8.into(), b"session closed");
     drop(bootstrap_jobs);
-    let _ = tokio::time::timeout(LEAVE_DRAIN, async {
+    let _ = tokio::time::timeout(limits::values().shutdown, async {
         while children.join_next().await.is_some() {}
     })
     .await;
@@ -2010,19 +2294,46 @@ fn take_id(request_id: &mut u64) -> u64 {
 }
 
 fn enqueue_control(
-    tx: &tokio::sync::mpsc::Sender<ControlFrame>,
+    tx: &ControlSender,
     frame: ControlFrame,
     role: &'static str,
 ) -> std::result::Result<(), TransportFault> {
-    classify_try_send(tx.try_send(frame), "control_write").map_err(|loss| {
-        TransportFault::new(
-            match loss {
-                QueueLoss::Full { operation } | QueueLoss::Closed { operation } => operation,
-            },
+    let encoded = encode_stream_frame(&frame)
+        .map_err(|error| TransportFault::new("control_encode", role, error.to_string()))?;
+    let bytes = tx
+        .bytes
+        .clone()
+        .try_acquire_many_owned(encoded.len() as u32)
+        .map_err(|_| TransportFault::new("control_write", role, "control byte budget exhausted"))?;
+    let deadline = tokio::time::Instant::now() + limits::values().queue_age;
+    let id = match &frame {
+        ControlFrame::Request(request) => Some(request.request_id),
+        _ => None,
+    };
+    let mut pending = tx.pending.lock().expect("control requests poisoned");
+    if id.is_some()
+        && pending.len() + tx.outcomes.lock().expect("control outcomes poisoned").len()
+            >= limits::values().queue_items
+    {
+        return Err(TransportFault::new(
+            "control_request",
             role,
-            loss.to_string(),
-        )
-    })
+            "pending request budget exhausted",
+        ));
+    }
+    classify_try_send(
+        tx.tx.try_send(QueuedControl {
+            frame,
+            deadline,
+            _bytes: bytes,
+        }),
+        "control_write",
+    )
+    .map_err(|loss| TransportFault::new("control_write", role, loss.to_string()))?;
+    if let Some(id) = id {
+        pending.insert(id, tokio::time::Instant::now() + limits::values().response);
+    }
+    Ok(())
 }
 
 fn flatten_task(
@@ -2107,6 +2418,7 @@ fn publish_room_view(
             max_players: view.max_players,
             skip_votes,
             in_match,
+            families: frame::AssetFamilies(view.requires.0),
         };
         return;
     }
@@ -2121,6 +2433,7 @@ fn publish_room_view(
             max_players: view.max_players,
             skip_votes,
             in_match,
+            families: frame::AssetFamilies(view.requires.0),
         };
     } else {
         *current = MasterBridgeState::Joining { identity };
@@ -2173,7 +2486,7 @@ fn sync_membership_facts(
 fn handle_command(
     command: MasterBridgeCommand,
     installed_load: &Mutex<Option<frame::LocalLoadKey>>,
-    control_tx: &tokio::sync::mpsc::Sender<ControlFrame>,
+    control_tx: &ControlSender,
     request_id: &mut u64,
     facts: &Mutex<Vec<MasterLifecycleFact>>,
     host_match: &mut HostMatchCore,
@@ -2340,14 +2653,11 @@ fn handle_command(
                 role,
             )?;
         }
-        MasterBridgeCommand::AuthorityProgress => {
+        MasterBridgeCommand::AuthorityProgress { now_ms } => {
             if !is_host {
                 return Ok(CommandEffect::Continue);
             }
-            let applied = apply_host(
-                host_match,
-                HostMatchEvent::AuthorityProgress { now_ms: now_ms() },
-            );
+            let applied = apply_host(host_match, HostMatchEvent::AuthorityProgress { now_ms });
             execute_host_match_effects(
                 applied.effects,
                 map_ready,
@@ -2428,7 +2738,7 @@ fn handle_frame(
     frame: ControlFrame,
     state: &Mutex<MasterBridgeState>,
     facts: &Mutex<Vec<MasterLifecycleFact>>,
-    control_tx: &tokio::sync::mpsc::Sender<ControlFrame>,
+    control_tx: &ControlSender,
     request_id: &mut u64,
     bootstrap: &BootstrapLane,
     session: &mut SessionCore,
@@ -2455,16 +2765,39 @@ fn handle_frame(
             "service sent a request on the client stream",
         )),
         ControlFrame::Response(response) => {
+            let deadline = control_tx.complete_response(&response);
+            let Some(deadline) = deadline else {
+                return Ok(());
+            };
+            if deadline <= tokio::time::Instant::now() {
+                return Err(TransportFault::new(
+                    "control_response",
+                    role,
+                    format!(
+                        "request {} deadline; remote outcome unknown",
+                        response.request_id
+                    ),
+                ));
+            }
             let (view, member) = match response.body {
                 ResponseBody::RoomCreated { member_id, view }
                 | ResponseBody::RoomJoined { member_id, view } => (view, member_id),
                 ResponseBody::RoomUpdated { view } => (view, identity.member_id),
                 ResponseBody::Error(error) => {
-                    return Err(TransportFault::new("control_rpc", role, error.to_string()));
+                    let message = match &error {
+                        master_protocol::ServiceError::MissingContent { requires, have } => {
+                            frame::AssetFamilies(requires.0)
+                                .missing_notice(have.0)
+                                .unwrap_or_else(|| error.to_string())
+                        }
+                        _ => error.to_string(),
+                    };
+                    return Err(TransportFault::new("control_rpc", role, message));
                 }
                 ResponseBody::RoomLeft
                 | ResponseBody::Ack
                 | ResponseBody::Status(_)
+                | ResponseBody::Population { .. }
                 | ResponseBody::RoomList { .. } => return Ok(()),
             };
             apply_room_view(
@@ -2543,7 +2876,7 @@ fn apply_room_view(
     local_member: MemberId,
     state: &Mutex<MasterBridgeState>,
     facts: &Mutex<Vec<MasterLifecycleFact>>,
-    control_tx: &tokio::sync::mpsc::Sender<ControlFrame>,
+    control_tx: &ControlSender,
     request_id: &mut u64,
     bootstrap: &BootstrapLane,
     session: &mut SessionCore,
@@ -2593,6 +2926,29 @@ fn apply_room_view(
         )?;
         *started_epoch = view.epoch;
     }
+    if is_host && view.phase.in_match() {
+        let applied = apply_host(
+            host_match,
+            HostMatchEvent::PeerRoster {
+                match_key: identity.match_key(),
+                members: view
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|member| *member != local_member)
+                    .collect(),
+                now_ms: now_ms(),
+            },
+        );
+        execute_host_match_effects(
+            applied.effects,
+            map_ready,
+            facts,
+            control_tx,
+            request_id,
+            role,
+        )?;
+    }
     if is_host && !view.phase.in_match() && *started_epoch != 0 {
         let applied = apply_host(
             host_match,
@@ -2627,7 +2983,7 @@ fn apply_room_view(
 fn apply_peer_event(
     event: master_protocol::PeerEvent,
     facts: &Mutex<Vec<MasterLifecycleFact>>,
-    control_tx: &tokio::sync::mpsc::Sender<ControlFrame>,
+    control_tx: &ControlSender,
     request_id: &mut u64,
     session: &mut SessionCore,
     host_match: &mut HostMatchCore,
@@ -2689,17 +3045,18 @@ fn apply_peer_event(
                         now_ms: now_ms(),
                     },
                 );
-                // A peer that reported its map and drew no effect is a peer
-                // that will wait out the match in the loading screen. Name the
-                // gate that owes it an offer.
-                if applied.effects.is_empty() {
+                // MapLoaded can arrive before AuthorityReady. The core retains
+                // that report and offers its bootstrap when the host is ready.
+                // Repeated reports from an admitted peer also need no effect.
+                if !applied.accepted {
                     diag::warn!(
                         Net,
-                        "peer map loaded admits nothing: epoch={epoch} host_phase={:?} host_match={:?} host_world={:?} peer={:?} — no bootstrap offer will follow",
+                        "peer map loaded rejected: epoch={epoch} host_phase={:?} host_match={:?} host_world={:?} peer={:?} transition={}",
                         host_match.phase(),
                         host_match.match_key(),
                         host_match.host_world(),
                         host_match.peer(member_id).map(|peer| peer.phase),
+                        applied.transition,
                     );
                 }
                 execute_host_match_effects(
@@ -2776,9 +3133,22 @@ fn apply_peer_event(
     Ok(())
 }
 
+struct BootstrapSender {
+    tx: tokio::sync::mpsc::Sender<BootstrapJob>,
+    bytes: Arc<tokio::sync::Semaphore>,
+}
+
+struct BootstrapJob {
+    _bytes: tokio::sync::OwnedSemaphorePermit,
+    match_key: frame::MatchKey,
+    member: MemberId,
+    bytes: Vec<u8>,
+    deadline: tokio::time::Instant,
+}
+
 fn enqueue_bootstrap_job(
     match_key: frame::MatchKey,
-    jobs: &tokio::sync::mpsc::Sender<(frame::MatchKey, MemberId, Vec<u8>)>,
+    jobs: &BootstrapSender,
     member: MemberId,
     bytes: Vec<u8>,
     role: &'static str,
@@ -2787,7 +3157,24 @@ fn enqueue_bootstrap_job(
     {
         return Ok(());
     }
-    classify_try_send(jobs.try_send((match_key, member, bytes)), "bootstrap_job").map_err(|loss| {
+    let permit = jobs
+        .bytes
+        .clone()
+        .try_acquire_many_owned(bytes.len() as u32)
+        .map_err(|_| {
+            TransportFault::new("bootstrap_job", role, "bootstrap byte budget exhausted")
+        })?;
+    classify_try_send(
+        jobs.tx.try_send(BootstrapJob {
+            _bytes: permit,
+            match_key,
+            member,
+            bytes,
+            deadline: tokio::time::Instant::now() + limits::values().queue_age,
+        }),
+        "bootstrap_job",
+    )
+    .map_err(|loss| {
         TransportFault::new(
             match loss {
                 QueueLoss::Full { operation } | QueueLoss::Closed { operation } => operation,
@@ -2801,13 +3188,16 @@ fn enqueue_bootstrap_job(
 fn pump_local_queues(
     match_key: frame::MatchKey,
     bootstrap: &BootstrapLane,
-    control_tx: &tokio::sync::mpsc::Sender<ControlFrame>,
-    jobs: &tokio::sync::mpsc::Sender<(frame::MatchKey, MemberId, Vec<u8>)>,
+    control_tx: &ControlSender,
+    jobs: &BootstrapSender,
     role: &'static str,
     is_host: bool,
     request_id: &mut u64,
     map_ready: &Mutex<HashSet<MemberId>>,
 ) -> std::result::Result<(), TransportFault> {
+    bootstrap
+        .check_deadline()
+        .map_err(|error| TransportFault::new("bootstrap_queue", role, error))?;
     for (peer, bytes) in bootstrap.take_to_worker() {
         if is_host {
             let Some(member) = peer else {
@@ -2865,7 +3255,7 @@ fn pump_local_queues(
 
 async fn bootstrap_egress(
     connection: quinn::Connection,
-    mut jobs: tokio::sync::mpsc::Receiver<(frame::MatchKey, MemberId, Vec<u8>)>,
+    mut jobs: tokio::sync::mpsc::Receiver<BootstrapJob>,
     prepared: tokio::sync::mpsc::Sender<HostMatchEvent>,
     cancel: CancellationToken,
     role: &'static str,
@@ -2874,9 +3264,10 @@ async fn bootstrap_egress(
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
             job = jobs.recv() => {
-                let Some((match_key, member, bytes)) = job else {
+                let Some(BootstrapJob { match_key, member, bytes, deadline, _bytes }) = job else {
                     return Ok(());
                 };
+                if deadline <= tokio::time::Instant::now() { return Err(TransportFault::new("bootstrap_job", role, "bootstrap queue deadline")); }
                 send_bootstrap_stream(&connection, member, &bytes, &cancel, role).await?;
                 if let Ok(Some(BootstrapMessage::Offer {
                     bootstrap_id,
@@ -2917,7 +3308,7 @@ async fn datagram_ingress(
     role: &'static str,
     is_host: bool,
 ) -> std::result::Result<(), TransportFault> {
-    let mut reassemblers: HashMap<MemberId, Reassembler> = HashMap::new();
+    let mut reassemblers: HashMap<MemberId, (Reassembler, Instant)> = HashMap::new();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
@@ -2952,7 +3343,15 @@ async fn datagram_ingress(
                         continue;
                     }
                 };
-                let reassembler = reassemblers.entry(member).or_insert_with(relay_reassembler);
+                let now = Instant::now();
+                reassemblers.retain(|_, (_, seen)| now.duration_since(*seen) < limits::values().queue_age);
+                if !reassemblers.contains_key(&member)
+                    && reassemblers.len() >= master_protocol::MAX_SESSION_MEMBERS as usize
+                {
+                    continue;
+                }
+                let (reassembler, seen) = reassemblers.entry(member).or_insert_with(|| (relay_reassembler(), now));
+                *seen = now;
                 match reassembler.push(payload) {
                     Ok(Some(packet)) => {
                         if mailbox.push_inbound(member, packet) {
@@ -2990,29 +3389,25 @@ async fn uni_ingress(
                         ));
                     }
                 };
-                let bytes = match tokio::time::timeout(
-                    IO_DEADLINE,
-                    recv.read_to_end(MAX_BOOTSTRAP_STREAM_BYTES),
-                )
-                .await
-                {
-                    Ok(Ok(bytes)) => bytes,
-                    Ok(Err(error)) => {
-                        return Err(TransportFault::with_connection(
-                            "bootstrap_uni_read",
-                            role,
-                            error,
-                            &connection,
-                        ));
-                    }
-                    Err(_) => {
-                        return Err(TransportFault::with_connection(
-                            "bootstrap_uni_read",
-                            role,
-                            "deadline",
-                            &connection,
-                        ));
-                    }
+                let bytes = tokio::select! {
+                    _ = cancel.cancelled() => return Ok(()),
+                    read = tokio::time::timeout(limits::values().transfer, read_transfer(&mut recv)) => match read {
+                        Err(_) => {
+                            let _ = recv.stop(0_u8.into());
+                            return Err(TransportFault::new("bootstrap_uni_read", role, "bootstrap transfer deadline"));
+                        }
+                        Ok(read) => match read {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            return Err(TransportFault::with_connection(
+                                "bootstrap_uni_read",
+                                role,
+                                error,
+                                &connection,
+                            ));
+                        }
+                        },
+                    },
                 };
                 match decode_relay_stream(&bytes) {
                     Ok(RelayDatagram::ServiceToMember(payload) | RelayDatagram::HostToMember { payload, .. }) => {
@@ -3050,6 +3445,9 @@ async fn gameplay_egress(
     is_host: bool,
 ) -> std::result::Result<(), TransportFault> {
     let mut fragmenter = relay_fragmenter();
+    // Quinn reserves bookkeeping space even for an empty datagram buffer.
+    let empty_buffer_space = connection.datagram_send_buffer_space();
+    let mut pending: VecDeque<(MemberId, Vec<u8>, tokio::time::Instant)> = VecDeque::new();
     let mut tick = tokio::time::interval(QUEUE_POLL);
     let mut sampled = tokio::time::Instant::now();
     loop {
@@ -3065,29 +3463,71 @@ async fn gameplay_egress(
                         stats.path.cwnd,
                         stats.path.lost_packets,
                         stats.path.congestion_events,
-                        (DATAGRAM_SEND_BUFFER - connection.datagram_send_buffer_space()) as u64,
+                        empty_buffer_space.saturating_sub(connection.datagram_send_buffer_space()) as u64,
                     );
                 }
                 for (member, packet) in mailbox.take_outbound() {
-                    let fragments = match fragmenter.split(&packet) {
+                    // Gameplay packets carry the newest input/snapshot plus
+                    // unacknowledged reliable rows. Replace unsent older state
+                    // for this peer rather than building a latency backlog.
+                    if let Some((_, previous, _)) = pending.iter_mut().find(|(id, _, _)| *id == member) {
+                        *previous = packet;
+                    } else {
+                        if pending.len() >= master_protocol::MAX_SESSION_MEMBERS as usize {
+                            return Err(TransportFault::new("send_datagram", role, "pending peer budget exhausted"));
+                        }
+                        pending.push_back((member, packet, tokio::time::Instant::now() + limits::values().queue_age));
+                    }
+                }
+                while let Some((member, packet, deadline)) = pending.front() {
+                    if *deadline <= tokio::time::Instant::now() {
+                        return Err(TransportFault::new("send_datagram", role, "gameplay queue deadline"));
+                    }
+                    let fragments = match fragmenter.split(packet) {
                         Ok(fragments) => fragments,
                         Err(error) => {
                             diag::warn!(Net, "master {role} packet not splittable: {error}");
+                            pending.pop_front();
                             continue;
                         }
                     };
-                    for fragment in fragments {
+                    let mut datagrams = Vec::with_capacity(fragments.len());
+                    for fragment in &fragments {
                         let datagram = if is_host {
                             RelayDatagram::HostToMember {
-                                member_id: member,
-                                payload: &fragment,
+                                member_id: *member,
+                                payload: fragment,
                             }
                         } else {
-                            RelayDatagram::ClientToHost(&fragment)
+                            RelayDatagram::ClientToHost(fragment)
                         };
-                        let bytes = encode_relay(datagram).map_err(|error| {
+                        datagrams.push(encode_relay(datagram).map_err(|error| {
                             TransportFault::with_connection("encode_relay", role, error, &connection)
-                        })?;
+                        })?);
+                    }
+                    let wire_bytes = datagrams.iter().map(Vec::len).sum::<usize>();
+                    if wire_bytes > DATAGRAM_SEND_BUFFER {
+                        return Err(TransportFault::with_connection(
+                            "send_datagram",
+                            role,
+                            "fragmented gameplay packet exceeds the send buffer",
+                            &connection,
+                        ));
+                    }
+                    let free = connection.datagram_send_buffer_space();
+                    let queued = empty_buffer_space.saturating_sub(free);
+                    let window = connection.stats().path.cwnd as usize;
+                    // Queue complete packets together. Quinn discards oldest
+                    // datagrams when its buffer fills, which can otherwise leave
+                    // every fragmented snapshot incomplete. One packet may exceed
+                    // the congestion window, but never enqueue a history behind it.
+                    if wire_bytes > free
+                        || (queued != 0 && queued.saturating_add(wire_bytes) > window)
+                    {
+                        break;
+                    }
+                    pending.pop_front();
+                    for bytes in datagrams {
                         if let Err(error) = connection.send_datagram(bytes.into()) {
                             return Err(TransportFault::with_connection(
                                 "send_datagram",
@@ -3124,7 +3564,7 @@ async fn send_bootstrap_stream(
             connection,
         ));
     }
-    let mut send = io_timeout(cancel, connection.open_uni())
+    let mut send = cancellable(cancel, connection.open_uni())
         .await
         .map_err(|error| {
             TransportFault::with_connection("open_bootstrap_uni", role, error, connection)
@@ -3132,14 +3572,56 @@ async fn send_bootstrap_stream(
     send.set_priority(BOOTSTRAP_PRIORITY).map_err(|error| {
         TransportFault::with_connection("bootstrap_priority", role, error, connection)
     })?;
-    io_timeout(cancel, send.write_all(&bytes))
+    let result = tokio::select! {
+        _ = cancel.cancelled() => Err("session canceled".into()),
+        result = tokio::time::timeout(limits::values().transfer, write_transfer(&mut send, &bytes)) =>
+            result.map_err(|_| Error::from("transfer total deadline")).and_then(|result| result),
+    };
+    if result.is_err() {
+        let _ = send.reset(0_u8.into());
+    }
+    result.map_err(|error| {
+        TransportFault::with_connection("bootstrap_uni_write", role, error, connection)
+    })
+}
+
+async fn read_transfer(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk =
+            tokio::time::timeout(limits::values().progress, recv.read_chunk(16 * 1024, true))
+                .await
+                .map_err(|_| "transfer progress deadline")??;
+        let Some(chunk) = chunk else {
+            return Ok(bytes);
+        };
+        if chunk.bytes.is_empty() || bytes.len() + chunk.bytes.len() > MAX_BOOTSTRAP_STREAM_BYTES {
+            return Err("transfer byte budget exceeded".into());
+        }
+        bytes.extend_from_slice(&chunk.bytes);
+    }
+}
+
+async fn write_transfer(send: &mut quinn::SendStream, bytes: &[u8]) -> Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + 16 * 1024).min(bytes.len());
+        let written =
+            tokio::time::timeout(limits::values().progress, send.write(&bytes[offset..end]))
+                .await
+                .map_err(|_| "transfer progress deadline")??;
+        if written == 0 {
+            return Err("transfer made no progress".into());
+        }
+        offset += written;
+    }
+    send.finish()?;
+    if let Some(code) = tokio::time::timeout(limits::values().progress, send.stopped())
         .await
-        .map_err(|error| {
-            TransportFault::with_connection("bootstrap_uni_write", role, error, connection)
-        })?;
-    send.finish().map_err(|error| {
-        TransportFault::with_connection("bootstrap_uni_finish", role, error, connection)
-    })?;
+        .map_err(|_| "transfer acknowledgement deadline")??
+    {
+        return Err(format!("transfer refused with code {code}").into());
+    }
     Ok(())
 }
 
@@ -3160,35 +3642,44 @@ async fn read_frame(recv: &mut quinn::RecvStream) -> Result<ControlFrame> {
 }
 
 async fn write_frame(send: &mut quinn::SendStream, frame: &ControlFrame) -> Result<()> {
-    send.write_all(&encode_stream_frame(frame)?).await?;
+    tokio::time::timeout(
+        limits::values().response,
+        send.write_all(&encode_stream_frame(frame)?),
+    )
+    .await
+    .map_err(|_| "control write deadline")??;
     Ok(())
 }
 
-async fn io_timeout<T>(
+async fn cancellable<T>(
     cancel: &CancellationToken,
     fut: impl std::future::Future<Output = std::result::Result<T, impl Into<Error>>>,
 ) -> Result<T> {
     tokio::select! {
         _ = cancel.cancelled() => Err("session cancelled".into()),
-        result = tokio::time::timeout(IO_DEADLINE, fut) => {
+        result = tokio::time::timeout(limits::values().response, fut) => {
+            result.map_err(|_| "operation deadline")?.map_err(Into::into)
+        },
+    }
+}
+
+async fn dns_timeout<T>(
+    cancel: &CancellationToken,
+    fut: impl std::future::Future<Output = std::result::Result<T, impl Into<Error>>>,
+) -> Result<T> {
+    tokio::select! {
+        _ = cancel.cancelled() => Err("session cancelled".into()),
+        result = tokio::time::timeout(DNS_DEADLINE, fut) => {
             match result {
                 Ok(Ok(value)) => Ok(value),
                 Ok(Err(error)) => Err(error.into()),
-                Err(_) => Err("master I/O deadline".into()),
+                Err(_) => Err("master address lookup deadline".into()),
             }
         }
     }
 }
 
-async fn connect(
-    target: &MasterTarget,
-    cancel: &CancellationToken,
-) -> Result<(quinn::Endpoint, quinn::Connection)> {
-    let address = target
-        .address
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| format!("{} resolved no addresses", target.address))?;
+fn client_config(target: &MasterTarget) -> Result<quinn::ClientConfig> {
     let mut crypto = rustls::ClientConfig::builder()
         .with_root_certificates(updater::trust_roots(&target.ca_pem)?)
         .with_no_client_auth();
@@ -3198,48 +3689,106 @@ async fn connect(
     transport.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(SESSION_IDLE).expect("session idle fits QUIC VarInt"),
     ));
-    transport.keep_alive_interval(Some(SESSION_KEEP_ALIVE));
+    transport.keep_alive_interval(Some(CLIENT_KEEP_ALIVE));
+    transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     transport.max_concurrent_uni_streams(MAX_RELAY_UNI_STREAMS.into());
     client_config.transport_config(Arc::new(transport));
+    Ok(client_config)
+}
 
-    let bind = if address.is_ipv4() {
+async fn connect(
+    target: &MasterTarget,
+    cancel: &CancellationToken,
+) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    limits::configured()?;
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + limits::values().connect;
+    let address = tokio::time::timeout_at(
+        deadline,
+        dns_timeout(cancel, tokio::net::lookup_host(target.address.as_str())),
+    )
+    .await
+    .map_err(|_| "connection deadline during address lookup")??
+    .next()
+    .ok_or_else(|| format!("{} resolved no addresses", target.address))?;
+    let client_config = client_config(target)?;
+    let bind: std::net::SocketAddr = if address.is_ipv4() {
         "0.0.0.0:0"
     } else {
         "[::]:0"
-    };
-    let mut endpoint = quinn::Endpoint::client(bind.parse()?)?;
-    endpoint.set_default_client_config(client_config);
-    let local = endpoint.local_addr()?;
-    let trust = "community-ca";
-    diag::info!(
-        Net,
-        "master quic handshake begin local={} remote={} server_name={} trust={} alpn={:?}",
-        local,
-        address,
-        target.server_name,
-        trust,
-        ALPN
-    );
-    let started = Instant::now();
-    let connecting = endpoint.connect(address, &target.server_name)?;
-    let connection = io_timeout(cancel, connecting)
-        .await
-        .map_err(|error| -> Error {
-            format!(
-            "quic handshake: {error}; local={local} remote={address} server_name={} elapsed_ms={}",
-            target.server_name,
-            started.elapsed().as_millis()
-        )
-        .into()
-        })?;
-    diag::info!(
-        Net,
-        "master quic handshake ok local={} remote={} elapsed_ms={}",
-        local,
-        connection.remote_address(),
-        started.elapsed().as_millis()
-    );
-    Ok((endpoint, connection))
+    }
+    .parse()?;
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut in_flight = VecDeque::new();
+    let mut next_attempt = tokio::time::Instant::now();
+    let mut retry = CONNECT_RETRY_FIRST;
+    let mut started_attempts = 0_u32;
+    loop {
+        if tokio::time::Instant::now() >= next_attempt {
+            if in_flight.len() == CONNECT_RACE {
+                let oldest: tokio::task::AbortHandle = in_flight.pop_front().expect("race is full");
+                oldest.abort();
+            }
+            started_attempts += 1;
+            let mut endpoint = quinn::Endpoint::client(bind)?;
+            endpoint.set_default_client_config(client_config.clone());
+            let local = endpoint.local_addr()?;
+            diag::info!(
+                Net,
+                "master quic handshake begin attempt={} local={} remote={} server_name={}",
+                started_attempts,
+                local,
+                address,
+                target.server_name
+            );
+            let connecting = endpoint.connect(address, &target.server_name)?;
+            in_flight.push_back(attempts.spawn(async move {
+                connecting
+                    .await
+                    .map(|connection| (endpoint, connection))
+                    .map_err(|error| (error, local))
+            }));
+            next_attempt += retry;
+            retry = (retry * 3 / 2).min(CONNECT_RETRY_MAX);
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return Err("session cancelled".into()),
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(format!(
+                    "quic handshake: no reply in {}ms over {started_attempts} attempts; remote={address} server_name={}",
+                    started.elapsed().as_millis(),
+                    target.server_name
+                )
+                .into());
+            }
+            _ = tokio::time::sleep_until(next_attempt) => {}
+            Some(done) = attempts.join_next() => {
+                let Ok(result) = done else { continue };
+                let (endpoint, connection) = match result {
+                    Ok(won) => won,
+                    Err((quinn::ConnectionError::TimedOut, _)) => continue,
+                    Err((error, local)) => {
+                        return Err(format!(
+                            "quic handshake: {error}; local={local} remote={address} server_name={} elapsed_ms={}",
+                            target.server_name,
+                            started.elapsed().as_millis()
+                        )
+                        .into());
+                    }
+                };
+                attempts.abort_all();
+                diag::info!(
+                    Net,
+                    "master quic handshake ok local={} remote={} attempts={} elapsed_ms={}",
+                    endpoint.local_addr()?,
+                    connection.remote_address(),
+                    started_attempts,
+                    started.elapsed().as_millis()
+                );
+                return Ok((endpoint, connection));
+            }
+        }
+    }
 }
 
 fn handshake_for_match(

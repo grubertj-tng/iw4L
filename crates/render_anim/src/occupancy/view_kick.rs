@@ -21,7 +21,7 @@ use crate::anim::view_kick_state::{KickParams, ViewKickState, add_kick_to_viewan
 use crate::anim::view_sway::ViewSwayState;
 use crate::occupancy::remote_body::RemotePlayer;
 use crate::occupancy::third_person::{
-    linked_weapon_camera, presented_is_third_person, remote_missile_camera, third_person_camera,
+    RemoteMissileView, linked_weapon_camera, presented_is_third_person, third_person_camera,
 };
 use render_scene::{FlyCamera, FpvLens, SimCamera, transform_from_iw_view};
 use render_scene::{WorldCameraPose, WorldScriptModelInstance};
@@ -37,6 +37,7 @@ pub struct PendingViewHurt(pub u32);
 
 #[derive(Resource, Default)]
 pub struct SessionViewKick {
+    context: Option<frame::PresentationContext>,
     pub state: ViewKickState,
     pub sway: ViewSwayState,
 
@@ -138,7 +139,16 @@ pub fn tick_session_view_kick(
     weapons: Option<Res<PreparedWeapons>>,
     walk: Option<Res<AppliedEntityEventWalk>>,
     mut kick: ResMut<SessionViewKick>,
+    context: (Res<frame::InstalledMatch>, Res<net::EntityEventCursor>),
 ) {
+    let context = Some(frame::PresentationContext::new(
+        context.0.load_key,
+        context.1.timeline(),
+    ));
+    if kick.context != context {
+        kick.clear_for_new_life();
+        kick.context = context;
+    }
     let Some(ps) = presented.player(local.0) else {
         return;
     };
@@ -160,7 +170,11 @@ pub fn tick_session_view_kick(
     let Some(reg) = weapons.as_ref() else {
         return;
     };
-    let Some(facts) = reg.0.fpv_facts_of(viewmodel) else {
+    let Some(facts) = reg
+        .snapshot_weapon(presented.weapon_epoch(), viewmodel)
+        .ok()
+        .and_then(|weapon| weapon.fpv_facts())
+    else {
         return;
     };
     if !facts.body_resolved {
@@ -224,8 +238,48 @@ pub fn sync_camera_from_presented(
     mut lenses: Query<&mut Projection, With<FpvLens>>,
     view: Res<ViewSubject>,
     death_cam_clip: Res<crate::occupancy::dyn_ent::DynEntPhysClip>,
+    mut missile_view: Local<RemoteMissileView>,
+    context: (
+        Local<Option<frame::PresentationContext>>,
+        Res<frame::InstalledMatch>,
+        Res<net::EntityEventCursor>,
+    ),
 ) {
+    let (mut previous, installed, timeline) = context;
+    let current = Some(frame::PresentationContext::new(
+        installed.load_key,
+        timeline.timeline(),
+    ));
+    if *previous != current {
+        *killcam = super::killcam::KillcamCamera::default();
+        *missile_view = RemoteMissileView::default();
+        kick.clear_for_new_life();
+        kick.context = current;
+        hurt.0 = 0;
+        *previous = current;
+    }
     kick.killcam_focus_distance = None;
+    if let Some(view) = sim_cam.view_override {
+        for mut transform in &mut q {
+            *transform = view.transform;
+        }
+        for mut projection in &mut lenses {
+            if let Projection::Perspective(perspective) = &mut *projection {
+                perspective.fov = horizontal_to_vertical_fov_deg(view.horizontal_fov).to_radians();
+            }
+        }
+        kick.horiz_fov_deg = view.horizontal_fov;
+        kick.refdef_vieworg = view.transform.translation.to_array();
+        let forward = *view.transform.forward();
+        let right = *view.transform.right();
+        let up = *view.transform.up();
+        kick.refdef_view_angles = [
+            -forward.z.clamp(-1.0, 1.0).asin().to_degrees(),
+            forward.y.atan2(forward.x).to_degrees(),
+            (-right.z).atan2(up.z).to_degrees(),
+        ];
+        return;
+    }
     if !sim_cam.enabled {
         return;
     }
@@ -258,7 +312,12 @@ pub fn sync_camera_from_presented(
         kick.killcam_focus_distance = focus_distance;
         return;
     }
-    if let Some(pose) = remote_missile_camera(&presented, local.0, clock.time()) {
+    if let Some(pose) = missile_view.camera(
+        &presented,
+        local.0,
+        clock.time(),
+        death_cam_clip.0.as_deref(),
+    ) {
         let pose = earthquake_pose(pose, &presented, clock.time());
         let eye = transform_from_iw_view(pose);
         for mut transform in &mut q {
@@ -304,8 +363,13 @@ pub fn sync_camera_from_presented(
             ps.link_flags,
             ps.e_flags,
             0.0,
+            ps.scope_zoom_level,
             viewmodel,
-            weapons.as_ref().and_then(|w| w.0.fpv_facts_of(viewmodel)),
+            weapons.as_ref().and_then(|w| {
+                w.snapshot_weapon(presented.weapon_epoch(), viewmodel)
+                    .ok()
+                    .and_then(|weapon| weapon.fpv_facts())
+            }),
             false,
             actions.as_deref_mut(),
         )
@@ -336,7 +400,11 @@ pub fn sync_camera_from_presented(
         ps.viewangles,
         clock.time(),
     );
-    let bob_angles = match weapons.as_ref().and_then(|w| w.0.fpv_facts_of(viewmodel)) {
+    let bob_angles = match weapons.as_ref().and_then(|w| {
+        w.snapshot_weapon(presented.weapon_epoch(), viewmodel)
+            .ok()
+            .and_then(|weapon| weapon.fpv_facts())
+    }) {
         Some(facts) if facts.body_resolved => view_angle_bob(ViewAngleBobInputs {
             org,
             e_flags: ps.e_flags,
@@ -427,8 +495,13 @@ pub fn sync_camera_from_presented(
         ps.link_flags,
         ps.e_flags,
         ps.f_weapon_pos_frac,
+        ps.scope_zoom_level,
         viewmodel,
-        weapons.as_ref().and_then(|w| w.0.fpv_facts_of(viewmodel)),
+        weapons.as_ref().and_then(|w| {
+            w.snapshot_weapon(presented.weapon_epoch(), viewmodel)
+                .ok()
+                .and_then(|weapon| weapon.fpv_facts())
+        }),
         kick.b_position_to_ads,
         actions.as_deref_mut(),
     ) {
@@ -443,6 +516,7 @@ fn apply_fpv_lens_fov(
     link_flags: u32,
     e_flags: u32,
     f_weapon_pos_frac: f32,
+    scope_zoom_level: u32,
     viewmodel: u32,
     facts: Option<WeaponFpvFacts>,
     b_position_to_ads: bool,
@@ -455,8 +529,12 @@ fn apply_fpv_lens_fov(
         overlay_reticle: facts.overlay_reticle,
         ..WeaponAdsOverlayFacts::default()
     };
-    let ads_target = if facts.ads_zoom_fov > 0.0 {
-        facts.ads_zoom_fov
+    let ads_target = facts
+        .scope_zoom
+        .fov(scope_zoom_level)
+        .unwrap_or(facts.ads_zoom_fov);
+    let ads_target = if ads_target.is_finite() && ads_target > 0.0 {
+        ads_target
     } else {
         base_fov
     };
@@ -470,7 +548,7 @@ fn apply_fpv_lens_fov(
         ads_zoom_fov: ads_target,
         overlay_zoom: 0.0,
         fov_scale: CG_FOV_SCALE_DEFAULT,
-        fov_min: CG_FOV_MIN_DEFAULT,
+        fov_min: CG_FOV_MIN_DEFAULT.min(ads_target),
     };
     let (horiz, _) = calc_fov_from_ads(&inputs, f_weapon_pos_frac, b_position_to_ads, &overlay);
     let zoom_sensitivity = zoom_sensitivity(horiz);

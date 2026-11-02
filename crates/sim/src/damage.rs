@@ -121,7 +121,7 @@ pub(crate) fn apply_explosion_blast(world: &mut FrameWorld, tick: Tick, blast: &
     let means = crate::script_player::means(world, blast.source, blast.weapon, 0, true);
     let ignore_model = world
         .ecs()
-        .get_resource::<crate::script::Runtime>()
+        .get_resource::<crate::script::RoundScript>()
         .and_then(|runtime| match blast.source {
             DamageSource::Projectile(id) => runtime
                 .missiles
@@ -272,7 +272,9 @@ pub(crate) fn apply_script_blast(
                 [0.0; 3]
             },
             hitloc: 0,
-            inflictor: None,
+            inflictor: blast
+                .inflictor
+                .map(crate::script_player::HitInflictor::ScriptModel),
             commit,
         };
         crate::script::player_damage(world.ecs(), tick, &hit);
@@ -351,7 +353,9 @@ pub(crate) fn apply_script_hit(world: &mut FrameWorld, tick: Tick, hit: &crate::
             [0.0; 3]
         },
         hitloc: hit.hitloc,
-        inflictor: None,
+        inflictor: hit
+            .inflictor
+            .map(crate::script_player::HitInflictor::ScriptModel),
         commit,
     };
     crate::script::player_damage(world.ecs(), tick, &player_hit);

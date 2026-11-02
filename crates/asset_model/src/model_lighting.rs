@@ -497,12 +497,17 @@ fn sample_light_grid_at(
         }
     }
 
+    let t6_visibility = grid.color_encoding == LightGridColorEncoding::T6Coefficients;
     let mut corners_needing_sight = 0u8;
     let mut corners_sight_cleared = 0u8;
     let mut corners_sight_suppressed = 0u8;
     let corners: [LightGridPickCorner; 8] = core::array::from_fn(|i| {
         let entry = entries[i];
-        let needs_trace = entry.map_or(0, |entry| entry.needs_trace);
+        let needs_trace = if t6_visibility {
+            0
+        } else {
+            entry.map_or(0, |entry| entry.needs_trace)
+        };
         let weight = weights[i];
         let asks = entry.is_some()
             && light_grid_corner_weight_keeps_entry(weight)
@@ -546,7 +551,7 @@ fn sample_light_grid_at(
     let selected_primary = light_grid_lookup_remap_primary(
         picked.primary_light,
         lookup_fallback,
-        grid.has_light_regions,
+        grid.has_light_regions && !t6_visibility,
         sun_base,
     );
 
@@ -796,6 +801,35 @@ pub struct SmodelLightingSample {
     pub path: LightGridAtPointPath,
     pub lighting_sh: Option<[[f32; 4]; 3]>,
     pub vertex_lighting: Option<std::sync::Arc<[Vec<[u8; 4]>; 4]>>,
+}
+
+pub fn t6_smodel_palette_lighting(
+    grid: &GridView<'_>,
+    index: u16,
+    authored_slot: usize,
+    lighting_origin: [f32; 3],
+) -> Option<SmodelLightingSample> {
+    if grid.color_encoding != LightGridColorEncoding::T6Coefficients {
+        return None;
+    }
+    let coefficients =
+        fastfile_t6::light_grid::decode_coefficients(grid.colors_row(u32::from(index))?)?;
+    let linear = fastfile_t6::light_grid::directional_colors(&coefficients);
+    let mut colors = [0u8; LIGHT_GRID_COLORS_BYTE_COUNT];
+    for (out, value) in colors.chunks_exact_mut(3).zip(linear) {
+        out.copy_from_slice(&value.map(|value| linear_light_grid_channel(value, true)));
+    }
+    let compressed = light_grid_compress_colors(&colors, 0xff)?;
+    Some(SmodelLightingSample {
+        authored_slot,
+        lighting_origin,
+        tile_rgba: linear_light_grid_tile(&linear, 0xff, true),
+        colors,
+        packed_lighting: [compressed.r, compressed.g, compressed.b, 0xff],
+        path: LightGridAtPointPath::SetFromIndex,
+        lighting_sh: Some(fastfile_t6::light_grid::lighting_sh(&coefficients)),
+        vertex_lighting: None,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -5,7 +5,7 @@ use bevy::prelude::*;
 use net::PresentedSnapshot;
 
 use crate::ambient::SoundBankNamespace;
-use crate::backend::{AudioScope, MatchEpoch};
+use crate::backend::AudioScope;
 use crate::playback::SoundBank;
 use crate::runtime::AudioRuntime;
 use crate::sources::{DesiredSource, SourceKey};
@@ -29,12 +29,12 @@ pub(crate) fn update(
     presented: Res<PresentedSnapshot>,
     bank: Option<Res<SoundBank>>,
     namespace: Option<Res<SoundBankNamespace>>,
-    epoch: Res<MatchEpoch>,
+    epoch: Option<Res<net::EntityEventCursor>>,
     runtime: Res<AudioRuntime>,
     mut sources: ResMut<DestructibleSources>,
 ) {
-    if sources.epoch != epoch.0 {
-        sources.epoch = epoch.0;
+    if sources.epoch != crate::backend::presentation_epoch(epoch.as_deref()) {
+        sources.epoch = crate::backend::presentation_epoch(epoch.as_deref());
         sources.live.clear();
         sources.desired.clear();
     }
@@ -66,6 +66,10 @@ pub(crate) fn update(
     });
     sources.desired.clear();
     for (row, alias) in speaking {
+        let (ns, alias) = alias
+            .split_once(':')
+            .and_then(|(family, name)| AssetNamespace::parse(family).map(|ns| (ns, name)))
+            .unwrap_or((ns, alias));
         let owner = row.owner.to_wire();
         let changed = sources.live.get(&owner).is_none_or(|current| {
             current.alias != alias || current.namespace != ns || current.emitter != row.snd_ent
@@ -81,7 +85,7 @@ pub(crate) fn update(
                 alias: alias.into(),
                 emitter: row.snd_ent,
                 scope: AudioScope::Match,
-                epoch: epoch.0,
+                epoch: crate::backend::presentation_epoch(epoch.as_deref()),
                 group: None,
             }) else {
                 continue;
@@ -100,7 +104,7 @@ pub(crate) fn update(
                     source: DesiredSource {
                         key: SourceKey {
                             scope: AudioScope::Match,
-                            epoch: epoch.0,
+                            epoch: crate::backend::presentation_epoch(epoch.as_deref()),
                             object: u64::from(owner),
                             slot: 1,
                         },

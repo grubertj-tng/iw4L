@@ -53,6 +53,7 @@ pub fn build_sky_model_draw_plan(
         };
         let Some(ordinal) = scene
             .runtime_material_catalog
+            .parts()
             .sorted_materials
             .ordinal_for_asset_id(authored.order())
         else {
@@ -115,11 +116,17 @@ pub fn build_sky_model_draw_plan(
     );
     revisions.bump_surfaces();
     revisions.bump_draws();
-    commands.insert_resource(SkyModelDrawPlan {
-        geometry,
-        draws,
-        refusals,
-        generation: 1,
-        revisions,
+    commands.queue(move |world: &mut World| {
+        frame::scope::insert(
+            world,
+            SkyModelDrawPlan {
+                geometry,
+                draws,
+                refusals,
+                generation: 1,
+                revisions,
+            },
+            frame::MatchScope::Live,
+        );
     });
 }

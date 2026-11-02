@@ -55,7 +55,7 @@ fn finish_replay_playback(
     let Some(playback) = playback.as_mut() else {
         return;
     };
-    if !playback.ended || playback.exit_queued {
+    if !playback.ended || playback.exit_queued || playback.retain_at_end {
         return;
     }
     playback.exit_queued = true;
@@ -97,7 +97,7 @@ pub(crate) fn register_diagnostics_mirror(app: &mut App) {
             mirror_runtime_diagnostics,
             drain_pending_console_lines,
             finish_replay_playback,
-            update_showpos_overlay,
+            update_showpos_overlay.in_set(frame::InMatch),
         )
             .in_set(ClientSet::Diag),
     );

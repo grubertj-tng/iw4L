@@ -5,15 +5,18 @@ use bevy::{
     input::mouse::{MouseButton, MouseMotion, MouseWheel},
     input_focus::{FocusCause, InputFocus, InputFocusSystems},
     picking::{
-        events::{Drag, Pointer, Press, Release},
+        events::{PointerDrag, PointerPress, PointerRelease},
         pointer::PointerButton,
     },
     prelude::*,
-    text::{EditableText, FontCx, LayoutCx, TextCursorStyle, TextEdit, TextLayoutInfo},
+    text::{
+        EditableText, FontCx, LayoutCx, TextCursorStyle, TextEdit, TextLayoutInfo,
+        TextReadWriteMode,
+    },
     ui::{ComputedUiRenderTargetInfo, UiGlobalTransform},
     window::{CursorEntered, CursorGrabMode, CursorOptions, PrimaryWindow, WindowFocused},
 };
-use frame::{AppScreen, HasWorld};
+use frame::AppScreen;
 use input_iw4::{SCRIPT_KEYNUM, command_names, input_cmd, key_event, key_up_command_id};
 use net::{ClientActionInput, ClientSet, PresentedSnapshot, frame_time_msec, key_frame_msec};
 use render_frontend::prepare::scene::world::WorldScene;
@@ -80,6 +83,7 @@ pub struct ConsolePlugin;
 impl Plugin for ConsolePlugin {
     fn build(&self, app: &mut App) {
         crate::startup::install_stdin(app);
+        crate::chat::install(app);
         app.init_resource::<ConsoleSettings>()
             .init_resource::<ConsoleState>()
             .init_resource::<frame::HudInputView>()
@@ -90,7 +94,11 @@ impl Plugin for ConsolePlugin {
             .init_resource::<ConsoleRegistry>()
             .init_resource::<crate::ConsoleQueue>()
             .init_resource::<crate::ConsoleLine>()
-            .init_resource::<crate::weapon_dispatch::WeaponArgCompletions>()
+            .init_resource::<crate::weapon_dispatch::CompletionSlot>()
+            .add_systems(
+                OnExit(frame::MatchScope::Live),
+                crate::weapon_dispatch::clear_weapon_arg_completions,
+            )
             .init_resource::<crate::user_settings::PendingMenuBinding>()
             .init_resource::<crate::user_settings::UserSettingsPersistence>()
             .init_resource::<crate::game_folders::FolderPicks>()
@@ -98,6 +106,7 @@ impl Plugin for ConsolePlugin {
             .init_resource::<sim::LocalPlayerProfile>()
             .init_resource::<crate::local_profile::ProfilePersistence>()
             .init_resource::<crate::local_account::AccountPersistence>()
+            .init_resource::<sim::LocalPlayerData>()
             .add_message::<ConsoleCommand>()
             .add_message::<frame::TestControllerRumble>()
             .add_systems(
@@ -113,6 +122,8 @@ impl Plugin for ConsolePlugin {
             .add_systems(PreUpdate, feed_console_keyboard.before(InputSystems))
             .init_resource::<frame::ActivePad>()
             .init_resource::<frame::InputDevices>()
+            .init_resource::<frame::UiPointerFree>()
+            .init_resource::<frame::UiOverlayInput>()
             .add_systems(
                 PreUpdate,
                 (
@@ -133,11 +144,13 @@ impl Plugin for ConsolePlugin {
                 PreUpdate,
                 (
                     handle_console_input,
+                    crate::chat::keyboard,
                     handle_scrollback_pointer,
                     copy_console_selection_on_release,
                     isolate_gameplay_input,
                     expire_pressed_inputs,
-                    publish_client_action_input,
+                    publish_ui_input_capture,
+                    publish_client_action_input.in_set(frame::InMatch),
                     sync_cursor_grab,
                 )
                     .chain()
@@ -154,7 +167,11 @@ impl Plugin for ConsolePlugin {
                         dispatch_menu_commands,
                         handle_input_commands,
                         apply_console_os_paste,
-                        crate::feature_dispatch::route_replay_commands,
+                        (
+                            crate::local_account::route_unlock_commands,
+                            crate::feature_dispatch::route_replay_commands,
+                        )
+                            .chain(),
                         crate::feature_dispatch::route_ui_commands,
                         (
                             crate::frontend::route,
@@ -165,17 +182,18 @@ impl Plugin for ConsolePlugin {
                         crate::feature_dispatch::route_capture_commands,
                         crate::feature_dispatch::route_state_dump_commands,
                         crate::feature_dispatch::route_hitvol_commands,
-                        crate::feature_dispatch::route_debug_feature_commands,
+                        crate::feature_dispatch::route_debug_feature_commands
+                            .in_set(frame::InMatch),
                         crate::feature_dispatch::route_session_commands,
                         crate::feature_dispatch::resume_lifecycle_commands,
                         (
-                            crate::barracks_menu::sync_profile,
-                            crate::class_dispatch::route_class_commands,
+                            crate::barracks_menu::sync_profile.in_set(frame::InMatch),
+                            crate::class_dispatch::route_class_commands.in_set(frame::InMatch),
                         )
                             .chain(),
-                        crate::class_dispatch::complete_pending_spawn,
-                        crate::weapon_dispatch::clear_weapon_args_on_torn_down,
-                        crate::weapon_dispatch::refresh_weapon_arg_completions,
+                        crate::class_dispatch::complete_pending_spawn.in_set(frame::InMatch),
+                        crate::weapon_dispatch::refresh_weapon_arg_completions
+                            .in_set(frame::InMatch),
                         crate::weapon_dispatch::route_weapon_commands,
                     )
                         .chain(),
@@ -193,17 +211,17 @@ impl Plugin for ConsolePlugin {
                         crate::debug_draw_method::route_debug_draw_method_commands,
                         crate::debug_view_proj::route_view_proj_commands,
                         (
-                            crate::debug_dof::route,
-                            crate::debug_distortion::route,
-                            crate::debug_glow::route,
-                            crate::debug_vision::route,
+                            crate::debug_dof::route.in_set(frame::InMatch),
+                            crate::debug_distortion::route.in_set(frame::InMatch),
+                            crate::debug_glow::route.in_set(frame::InMatch),
+                            crate::debug_vision::route.in_set(frame::InMatch),
                         )
                             .chain(),
-                        crate::debug_fog::route,
+                        crate::debug_fog::route.in_set(frame::InMatch),
                         crate::debug_smc::route_smc_enable_commands,
                         crate::debug_sm::route_sm_commands,
                         crate::debug_lod::route_lod_ramp_commands,
-                        crate::debug_cg_gun::route_cg_gun_commands,
+                        crate::debug_cg_gun::route_cg_gun_commands.in_set(frame::InMatch),
                         crate::debug_cl_yawspeed::route_cl_yawspeed_commands,
                         crate::debug_fx::route_debug_fx_commands,
                         crate::debug_fx_marks::route_fx_mark_commands,
@@ -216,7 +234,7 @@ impl Plugin for ConsolePlugin {
                             .chain(),
                         crate::user_settings::sync_binding_view,
                         crate::user_settings::apply_master_volume,
-                        crate::user_settings::sync_player_name,
+                        crate::user_settings::sync_player_name.in_set(frame::InMatch),
                         crate::user_settings::save_user_settings,
                         update_console_ui,
                     )
@@ -288,10 +306,11 @@ fn dispatch_menu_commands(
 
 fn isolate_gameplay_input(
     console: Res<ConsoleState>,
+    chat: Option<Res<crate::chat::ChatState>>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
     mut mouse: MessageReader<MouseMotion>,
 ) {
-    if !console.open {
+    if !console.open && !chat.as_ref().is_some_and(|chat| chat.captures_input()) {
         return;
     }
     keys.reset_all();
@@ -306,7 +325,16 @@ struct PhysicalInputState {
     look_ready: bool,
     mouse_activity: f32,
     mouse_activity_start: f32,
-    prompts: Option<(bool, frame::PromptStyle)>,
+    prompts: Option<bool>,
+}
+
+fn publish_ui_input_capture(
+    console: Res<ConsoleState>,
+    chat: Option<Res<crate::chat::ChatState>>,
+    mut hud_input: ResMut<frame::HudInputView>,
+) {
+    hud_input.console_open =
+        console.open || chat.as_ref().is_some_and(|chat| chat.captures_input());
 }
 
 fn publish_client_action_input(
@@ -321,7 +349,9 @@ fn publish_client_action_input(
     binds: Res<KeyBinds>,
     mut scripted: ResMut<ConsoleInputState>,
     console: Res<ConsoleState>,
-    script_menus: Option<Res<hud::ScriptMenus>>,
+    chat: Option<Res<crate::chat::ChatState>>,
+    script_menus: hud::MenuState<'_>,
+    overlay: Res<frame::UiOverlayInput>,
     mut hud_input: ResMut<frame::HudInputView>,
     settings: Res<frame::GameSettings>,
     mut out: ResMut<ClientActionInput>,
@@ -374,12 +404,12 @@ fn publish_client_action_input(
     if binds.is_changed() {
         *wheel_carry = 0.0;
     }
-    let modal_captured = console.open
+    let modal_captured = chat.as_ref().is_some_and(|chat| chat.captures_input())
+        || console.open
         || script_menus.is_some_and(|menus| menus.captures_input())
         || keys.just_pressed(KeyCode::Escape)
         || pad.is_some_and(|pad| pad.just_pressed(bevy::input::gamepad::GamepadButton::Start));
-    let captured = !devices.focused || modal_captured;
-    hud_input.console_open = console.open;
+    let captured = !devices.focused || modal_captured || overlay.0;
     physical.blocked.retain(|button| inputs.pressed(*button));
 
     let akimbo = prediction
@@ -448,6 +478,7 @@ fn publish_client_action_input(
         physical.look_ready = false;
     } else {
         out.pad_sensitivity = settings.pad_look_sensitivity();
+        out.pad_invert = settings.pad_invert;
         out.pad_ads_sensitivity = settings.pad_ads_sensitivity;
         out.pad_acceleration = settings.pad_acceleration;
         if let Some(pad) = pad {
@@ -544,7 +575,7 @@ fn publish_client_action_input(
         devices.pad_prompts = false;
         physical.mouse_activity = 0.0;
     }
-    let prompts = (devices.pad_prompts, devices.style);
+    let prompts = devices.pad_prompts;
     if physical.prompts == Some(prompts) && !binds.is_changed() {
         return;
     }
@@ -559,7 +590,7 @@ fn publish_client_action_input(
     hud_input.action_slot_keys = [None, None, None, None];
     for (button, id) in labels {
         let label = match button {
-            BindButton::Pad(button) => button.prompt(devices.style).to_owned(),
+            BindButton::Pad(button) => button.icon_prompt().to_owned(),
             _ => crate::binds::display_button(button).to_uppercase(),
         };
         if let Some(command) = binds.binding_name(button) {
@@ -593,8 +624,10 @@ fn publish_client_action_input(
 /// only reports relative motion to a held pointer the view stops turning while
 /// every key, and the console, still work.
 fn sync_cursor_grab(
+    free_pointer: Res<frame::UiPointerFree>,
     console: Res<ConsoleState>,
-    script_menus: Option<Res<hud::ScriptMenus>>,
+    chat: Option<Res<crate::chat::ChatState>>,
+    script_menus: hud::MenuState<'_>,
     screen: Option<Res<AppScreen>>,
     mut focused: MessageReader<WindowFocused>,
     mut entered: MessageReader<CursorEntered>,
@@ -610,7 +643,11 @@ fn sync_cursor_grab(
     let in_game = screen
         .as_ref()
         .is_some_and(|s| matches!(**s, AppScreen::InGame));
-    let grab = in_game && !console.open && !menu_open;
+    let grab = in_game
+        && !console.open
+        && !chat.as_ref().is_some_and(|chat| chat.open)
+        && !menu_open
+        && !free_pointer.0;
     let Ok(mut cursor) = windows.single_mut() else {
         return;
     };
@@ -639,7 +676,7 @@ fn setup_console(
     settings: Res<ConsoleSettings>,
     mut registry: ResMut<ConsoleRegistry>,
     mut binds: ResMut<KeyBinds>,
-    weapon_completions: Res<crate::weapon_dispatch::WeaponArgCompletions>,
+    weapon_completions: Res<crate::weapon_dispatch::CompletionSlot>,
 ) {
     binds.apply_defaults();
     if registry.resolve("hold").is_none() {
@@ -742,6 +779,13 @@ fn setup_console(
                 .arg(crate::StaticCompleter::new(presets)),
         );
     }
+    if registry.resolve("unlock").is_none() {
+        registry.register(
+            crate::CommandSpec::new("unlock")
+                .usage("unlock <all|reset> — save maximum unlocks or reset progression (main menu)")
+                .arg(crate::StaticCompleter::new(["all", "reset"])),
+        );
+    }
     crate::weapon_dispatch::register_weapon_commands(&mut registry, &weapon_completions);
     crate::debug_move::register_debug_move_commands(&mut registry);
     crate::saved_position::register_saved_position_commands(&mut registry);
@@ -809,6 +853,7 @@ fn setup_console(
                     log_entity = Some(
                         clip.spawn((
                             ConsoleLogText,
+                            TextReadWriteMode::ReadOnly,
                             Text::new(""),
                             TextFont {
                                 font: font.clone().into(),
@@ -821,6 +866,7 @@ fn setup_console(
                                 selection_color: Color::srgba(0.35, 0.55, 0.85, 0.45),
                                 unfocused_selection_color: Color::srgba(0.35, 0.55, 0.85, 0.45),
                                 selected_text_color: None,
+                                ..default()
                             },
                         ))
                         .id(),
@@ -871,6 +917,7 @@ fn setup_console(
                     prompt_entity = Some(
                         row.spawn((
                             ConsoleInputText,
+                            bevy::ui_widgets::TextInput,
                             EditableText {
                                 allow_newlines: false,
                                 visible_lines: Some(1.0),
@@ -888,6 +935,7 @@ fn setup_console(
                                 selection_color: Color::srgba(0.35, 0.55, 0.85, 0.45),
                                 unfocused_selection_color: Color::srgba(0.35, 0.55, 0.85, 0.2),
                                 selected_text_color: None,
+                                ..default()
                             },
                             Node {
                                 flex_grow: 1.0,
@@ -1388,7 +1436,7 @@ fn handle_console_input(
 }
 
 fn copy_console_selection_on_release(
-    mut releases: MessageReader<Pointer<Release>>,
+    mut releases: MessageReader<PointerRelease>,
     prompt: Query<&EditableText, With<ConsoleInputText>>,
     mut state: ResMut<ConsoleState>,
     settings: Res<ConsoleSettings>,
@@ -1454,8 +1502,8 @@ fn copy_console_selection_on_release(
 }
 
 fn handle_scrollback_pointer(
-    mut presses: MessageReader<Pointer<Press>>,
-    mut drags: MessageReader<Pointer<Drag>>,
+    mut presses: MessageReader<PointerPress>,
+    mut drags: MessageReader<PointerDrag>,
     prompt: Option<Res<ConsolePrompt>>,
     log: Option<Res<ConsoleLog>>,
     mut state: ResMut<ConsoleState>,
@@ -1496,13 +1544,9 @@ fn handle_scrollback_pointer(
         if !on_log(press.entity) {
             continue;
         }
-        let Some(local) = pointer_to_text_local(
-            transform,
-            node,
-            target,
-            ui_scale.0,
-            press.pointer_location.position,
-        ) else {
+        let Some(local) =
+            pointer_to_text_local(transform, node, target, ui_scale.0, press.pointer.position)
+        else {
             continue;
         };
         state.scroll_gesture = true;
@@ -1552,13 +1596,9 @@ fn handle_scrollback_pointer(
         if drag.button != PointerButton::Primary || !on_log(drag.entity) {
             continue;
         }
-        let Some(local) = pointer_to_text_local(
-            transform,
-            node,
-            target,
-            ui_scale.0,
-            drag.pointer_location.position,
-        ) else {
+        let Some(local) =
+            pointer_to_text_local(transform, node, target, ui_scale.0, drag.pointer.position)
+        else {
             continue;
         };
         let Some((_, _, ch)) = hit_scrollback_cell(&joined, layout, local) else {
@@ -1641,7 +1681,7 @@ fn scrollback_cells(text: &str, layout: &TextLayoutInfo) -> Vec<crate::input::Sc
         .glyphs
         .iter()
         .zip(mapped)
-        .map(|(glyph, ch)| (glyph.line_index, ch))
+        .map(|(glyph, ch)| (glyph.line_index as usize, ch))
         .collect()
 }
 
@@ -1747,8 +1787,9 @@ fn sync_prompt_focus(
     }
 }
 
-fn world_is_torn(has_world: Option<&HasWorld>, scene: Option<&WorldScene>) -> bool {
-    !has_world.is_some_and(|h| h.0) && !scene.is_some_and(|s| s.spawned)
+fn world_is_torn(has_world: Option<&State<frame::MatchScope>>, scene: Option<&WorldScene>) -> bool {
+    !has_world.is_some_and(|h| *h.get() == frame::MatchScope::Live)
+        && !scene.is_some_and(|s| s.spawned)
 }
 
 fn promote_interactive_interrupt(
@@ -1811,8 +1852,13 @@ fn dispatch_console_command(
     mut console: ResMut<ConsoleState>,
     settings: Res<ConsoleSettings>,
     scene: Option<Res<WorldScene>>,
-    screen: Option<Res<AppScreen>>,
-    has_world: Option<Res<HasWorld>>,
+    (screen, class_phase, class_status, player_data): (
+        Option<Res<AppScreen>>,
+        Option<Res<ui::ClassSelectPhase>>,
+        Option<Res<ui::ClassSelectStatus>>,
+        Option<Res<sim::LocalPlayerData>>,
+    ),
+    has_world: Option<Res<State<frame::MatchScope>>>,
     ambient_booted: Option<Res<audio::MapAmbientBooted>>,
     presented: Option<Res<PresentedSnapshot>>,
     (authority, clock, adopted, client_clock): (
@@ -1826,13 +1872,16 @@ fn dispatch_console_command(
 ) {
     let capacity = settings.log_capacity;
     let world_up = if headless.is_some() {
-        has_world.as_ref().is_some_and(|h| h.0)
+        has_world
+            .as_ref()
+            .is_some_and(|h| *h.get() == frame::MatchScope::Live)
     } else {
         scene.as_ref().is_some_and(|s| s.spawned)
     };
 
     let waiting = dispatch.paused
         || dispatch.wait_world
+        || dispatch.wait_progression
         || dispatch.wait_spawn
         || dispatch.wait_spawn_admit
         || dispatch.wait_torn
@@ -1884,6 +1933,29 @@ fn dispatch_console_command(
             }
         }
     }
+    if dispatch.wait_progression {
+        if player_data
+            .as_ref()
+            .is_some_and(|data| data.unlock_data_ready())
+        {
+            dispatch.wait_progression = false;
+            diag::info!(Console, "wait progression: native account content ready");
+        } else {
+            dispatch.wait_progression_elapsed += time.delta_secs();
+            if dispatch.wait_progression_elapsed >= WAIT_WORLD_TIMEOUT_SECS {
+                dispatch.wait_progression = false;
+                abort_script_on_wait_timeout(
+                    "wait progression",
+                    "native account content unavailable",
+                    &mut queue,
+                    &mut console,
+                    capacity,
+                );
+            } else {
+                return;
+            }
+        }
+    }
     if dispatch.wait_spawn_admit {
         dispatch.wait_spawn_elapsed += time.delta_secs();
         if dispatch.wait_spawn_elapsed >= WAIT_WORLD_TIMEOUT_SECS {
@@ -1899,6 +1971,17 @@ fn dispatch_console_command(
         } else {
             return;
         }
+    }
+    if dispatch.wait_spawn
+        && class_phase
+            .as_ref()
+            .is_some_and(|phase| !phase.is_pending())
+        && let Some(reason) = class_status.as_ref().and_then(|status| status.0.as_ref())
+    {
+        dispatch.wait_spawn = false;
+        let message = format!("spawn: refused — {reason}");
+        diag::warn!(Console, "{message}");
+        console.echo(message, capacity);
     }
     if dispatch.wait_spawn {
         if screen
@@ -1965,7 +2048,7 @@ fn dispatch_console_command(
                 dispatch.wait_torn = false;
                 abort_script_on_wait_timeout(
                     "wait torn",
-                    "HasWorld or scene.spawned still set",
+                    "match scope or scene.spawned still set",
                     &mut queue,
                     &mut console,
                     capacity,
@@ -2165,6 +2248,12 @@ fn dispatch_console_command(
         }
         if command.name == "wait" {
             match parse_wait_args(&command.args) {
+                WaitKind::Progression => {
+                    dispatch.wait_progression = !player_data
+                        .as_ref()
+                        .is_some_and(|data| data.unlock_data_ready());
+                    dispatch.wait_progression_elapsed = 0.0;
+                }
                 WaitKind::World => {
                     if world_up {
                         diag::info!(Console, "wait world: already spawned");
@@ -2192,7 +2281,10 @@ fn dispatch_console_command(
                     } else {
                         dispatch.wait_torn = true;
                         dispatch.wait_torn_elapsed = 0.0;
-                        diag::info!(Console, "wait torn: until HasWorld=0 and scene.spawned=0");
+                        diag::info!(
+                            Console,
+                            "wait torn: until match scope absent and scene.spawned=0"
+                        );
                     }
                 }
                 WaitKind::Ambient => {

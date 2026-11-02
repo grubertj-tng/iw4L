@@ -191,11 +191,11 @@ pub fn seal_render_frame(
         insert_empty_colour(&mut commands);
         return;
     };
-    let generation = runtime.catalog.generation_id;
+    let generation = runtime.catalog.generation_id();
     let world_generation = world_generation
         .as_ref()
-        .map(|generation| **generation)
-        .unwrap_or(frame::WorldGeneration(None));
+        .map(|generation| generation.stamp())
+        .unwrap_or(frame::WorldStamp(None));
     let Some(products) = products.as_ref() else {
         insert_empty_colour(&mut commands);
         return;
@@ -340,11 +340,11 @@ pub fn seal_render_frame(
     let mut smc_index_baked = Vec::new();
     let smodel_pretess_indices = retained
         .as_ref()
-        .map(|retained| Arc::clone(&retained.smodel_pretess_indices))
+        .map(|retained| Arc::clone(retained.smodel_pretess_indices()))
         .unwrap_or_else(|| Arc::new(Vec::new()));
     let smodel_index_layout_revision = retained
         .as_ref()
-        .map(|retained| retained.smodel_index_layout_revision)
+        .map(|retained| retained.smodel_index_layout_revision())
         .unwrap_or(0);
     if let Some(cache) = smc.as_ref() {
         smc_vb_patches = cache.vb_patches().to_vec();
@@ -389,10 +389,6 @@ pub fn seal_render_frame(
             1u32,
         ),
     };
-    let xmodel_packed_segments = xmodel
-        .as_ref()
-        .map(|plan| plan.packed_segments)
-        .unwrap_or_default();
     let xmodel_revision = xmodel.as_ref().map(|plan| plan.revision).unwrap_or(0);
     let xmodel_topology_revision = xmodel
         .as_ref()
@@ -583,6 +579,10 @@ pub fn seal_render_frame(
         sun_effects: sun.0.and_then(|sun| sun.def),
     };
     let next_frame = render_gpu::RenderFrameData {
+        skin_jobs: xmodel
+            .as_ref()
+            .map(|plan| plan.skin_jobs.clone())
+            .unwrap_or_default(),
         frame_products,
         generation,
         world_generation,
@@ -615,7 +615,6 @@ pub fn seal_render_frame(
         fx_revision,
         xmodel_revision,
         xmodel_topology_revision,
-        xmodel_packed_segments,
         particle_cloud_vertices,
         particle_cloud_indices,
         particle_cloud_surface_ranges,
@@ -684,7 +683,7 @@ fn frame_submission_matches(
     inputs: Option<&render_frontend::assemble::drawsurf::FrameAssemblyInputs>,
     snapshot: &render_frame::FrameProductsSnapshot,
     generation: render_frontend::assemble::drawsurf::MaterialGenerationId,
-    world_generation: frame::WorldGeneration,
+    world_generation: frame::WorldStamp,
 ) -> bool {
     inputs.is_some_and(|inputs| {
         inputs.frame_id == snapshot.frame_id
@@ -726,7 +725,6 @@ pub fn extract_postfx(
     film: Extract<Res<render_frontend::assemble::drawsurf::FilmVisionView>>,
     glow_dvars: Extract<Res<render_frontend::assemble::drawsurf::dof::GlowDvars>>,
     draw_method: Extract<Res<render_frontend::assemble::drawsurf::ColourDrawMethod>>,
-    scene: Extract<Option<Res<render_frontend::prepare::scene::world::WorldScene>>>,
     mut extracted: ResMut<render_gpu::ExtractedPostFx>,
 ) {
     use render_frontend::assemble::drawsurf::postfx_plan::RuntimePostFxResources;
@@ -744,6 +742,7 @@ pub fn extract_postfx(
                 .map(|film| render_gpu::ExtractedFilm {
                     name: film.name,
                     generation: film.generation,
+                    catalog: std::sync::Arc::clone(&runtime.as_ref().expect("film owner").catalog),
                     port: render_gpu::AdmittedExactPort {
                         id: film.port.id(),
                         abi: film.port.abi().clone(),
@@ -764,6 +763,7 @@ pub fn extract_postfx(
             film: render_gpu::ExtractedFilm {
                 name: blood.film.name,
                 generation: blood.film.generation,
+                catalog: std::sync::Arc::clone(&runtime.as_ref().expect("blood owner").catalog),
                 port: render_gpu::AdmittedExactPort {
                     id: blood.film.port.id(),
                     abi: blood.film.port.abi().clone(),
@@ -777,7 +777,7 @@ pub fn extract_postfx(
         });
     }
     extracted.vision = film.current;
-    extracted.t6_film_grade = scene.as_ref().and_then(|scene| scene.t6_film_grade);
+    extracted.t6_vision = film.native_vision;
     extracted.frame = render_gpu::DofFrame {
         dof: render_gpu::DepthOfField {
             view_model_start: frame.dof.view_model_start,
@@ -830,7 +830,7 @@ pub fn extract_geometry(
         .as_ref()
         .map(|stats| stats.g0_world_surfs.clone())
         .unwrap_or_default();
-    let generation = runtime.catalog.generation_id;
+    let generation = runtime.catalog.generation_id();
     let world_v = world
         .as_ref()
         .map_or(0, |plan| plan.decoded_vertices().len());

@@ -1,3 +1,4 @@
+use frame::ScopeApp;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -10,10 +11,8 @@ use crate::adapters::fx::present::{FxElemInfoCache, play_named_oriented_in_world
 use crate::adapters::fx::world_mark::FrontendFxScene;
 use crate::prepare::scene::cull::DynEntModelEntity;
 use crate::prepare::scene::world::{WorldDynEntInstance, WorldScene};
-use assets::PreparedWeapons;
-use net::{
-    ClientPredictionState, EntityBulletHit, EntityEventSound, EntityExplosion, EntityPhysicsSphere,
-};
+use assets::{BoundWeapons, PreparedWeapons};
+use net::{ClientPredictionState, EntityEventSound, EntityExplosion, EntityPhysicsSphere};
 use render_fx::{EntityMarks, HostFxSystem, PreparedFxCatalog};
 
 pub const DYNENT_BULLET_FORCE: f32 = 1000.0;
@@ -346,8 +345,8 @@ fn can_wake(inst: &WorldDynEntInstance) -> Option<&asset_world::OwnedPhysPreset>
     Some(preset)
 }
 
-fn weapon_radii(weapons: Option<&PreparedWeapons>, weapon: u32) -> Option<(f32, f32)> {
-    let facts = weapons?.0.event_facts_of(weapon)?;
+fn weapon_radii(weapons: Option<&BoundWeapons<'_>>, weapon: u32) -> Option<(f32, f32)> {
+    let facts = weapons?.row(weapon)?.event_facts()?;
     let outer = facts.explosion_radius.max(0) as f32;
     if outer <= 0.0 {
         return None;
@@ -356,16 +355,16 @@ fn weapon_radii(weapons: Option<&PreparedWeapons>, weapon: u32) -> Option<(f32, 
     Some((inner, outer))
 }
 
-fn weapon_explosion_damage(weapons: Option<&PreparedWeapons>, weapon: u32) -> (i32, i32) {
+fn weapon_explosion_damage(weapons: Option<&BoundWeapons<'_>>, weapon: u32) -> (i32, i32) {
     weapons
-        .and_then(|w| w.0.event_facts_of(weapon))
+        .and_then(|w| w.row(weapon).and_then(|weapon| weapon.event_facts()))
         .map(|f| (f.explosion_inner_damage, f.explosion_outer_damage))
         .unwrap_or((0, 0))
 }
 
-fn weapon_hit_damage(weapons: Option<&PreparedWeapons>, weapon: u32) -> i32 {
+fn weapon_hit_damage(weapons: Option<&BoundWeapons<'_>>, weapon: u32) -> i32 {
     weapons
-        .and_then(|w| w.0.event_facts_of(weapon))
+        .and_then(|w| w.row(weapon).and_then(|weapon| weapon.event_facts()))
         .map(|f| f.damage)
         .unwrap_or(0)
 }
@@ -489,11 +488,14 @@ pub(crate) fn on_entity_explosion(
     scene: Option<Res<WorldScene>>,
     entity_marks: Res<EntityMarks>,
 ) {
+    let weapons = weapons
+        .as_deref()
+        .and_then(|weapons| weapons.for_event(explosion.event.world).ok());
     let payload = explosion.event.payload;
-    let Some((inner, outer)) = weapon_radii(weapons.as_deref(), payload.weapon) else {
+    let Some((inner, outer)) = weapon_radii(weapons.as_ref(), payload.weapon) else {
         return;
     };
-    let (inner_damage, outer_damage) = weapon_explosion_damage(weapons.as_deref(), payload.weapon);
+    let (inner_damage, outer_damage) = weapon_explosion_damage(weapons.as_ref(), payload.weapon);
     let origin = Vec3::from_array(payload.origin);
     let explicit = if matches!(
         explosion.event.event,
@@ -665,8 +667,9 @@ fn hit_one_dyn_ent(
     }
 }
 
-pub(crate) fn on_entity_bullet_hit(
-    hit: On<EntityBulletHit>,
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hit_dyn_ents_from_pellets(
+    mut hits: MessageReader<net::AcceptedImpact>,
     weapons: Option<Res<PreparedWeapons>>,
     catalog: Option<Res<asset_world::MapXModelSceneCatalog>>,
     mut broadphase: ResMut<DynEntWakeBroadphase>,
@@ -686,43 +689,44 @@ pub(crate) fn on_entity_bullet_hit(
     scene: Option<Res<WorldScene>>,
     entity_marks: Res<EntityMarks>,
 ) {
-    let payload = hit.event.payload;
-    let start = Vec3::from_array(payload.origin2);
-    let end = Vec3::from_array(payload.origin);
     let catalog = catalog.as_deref();
-    let mut host = host.as_deref_mut();
     let fx = fx.as_deref();
     let scene = scene.as_deref();
     let marks = entity_marks.as_ref();
-    if let Some((entity, pose, bullet_scale)) =
-        closest_segment_hit(start, end, catalog, &mut broadphase, &instances)
-    {
-        hit_one_dyn_ent(
-            entity,
-            pose,
-            start,
-            end,
-            bullet_scale,
-            weapon_hit_damage(weapons.as_deref(), payload.weapon),
-            &mut instances,
-            &mut impulses,
-            phys.as_mut(),
-            host.as_deref_mut(),
-            fx,
-            scene,
-            marks,
+    for hit in hits.read() {
+        let direct = closest_segment_hit(
+            Vec3::from_array(hit.record.start),
+            Vec3::from_array(hit.record.end),
+            catalog,
+            &mut broadphase,
+            &instances,
         );
-    }
-    if matches!(
-        hit.event.event,
-        EntityEventKind::BULLET_HIT_EXPLODE | EntityEventKind::BULLET_HIT_CLIENT_EXPLODE
-    ) {
-        let Some((inner, outer)) = weapon_radii(weapons.as_deref(), payload.weapon) else {
-            return;
+        let weapons = weapons
+            .as_deref()
+            .and_then(|weapons| weapons.for_event(hit.world).ok());
+        if let Some((entity, pose, bullet_scale)) = direct {
+            hit_one_dyn_ent(
+                entity,
+                pose,
+                Vec3::from_array(hit.record.start),
+                Vec3::from_array(hit.record.end),
+                bullet_scale,
+                weapon_hit_damage(weapons.as_ref(), hit.record.weapon),
+                &mut instances,
+                &mut impulses,
+                phys.as_mut(),
+                host.as_deref_mut(),
+                fx,
+                scene,
+                marks,
+            );
+        }
+        let Some((inner, outer)) = weapon_radii(weapons.as_ref(), hit.record.weapon) else {
+            continue;
         };
         let (inner_damage, outer_damage) =
-            weapon_explosion_damage(weapons.as_deref(), payload.weapon);
-        let origin = end;
+            weapon_explosion_damage(weapons.as_ref(), hit.record.weapon);
+        let origin = Vec3::from_array(hit.record.end);
         let started = Instant::now();
         if let Some(candidates) = broadphase.sphere_candidates(origin, outer) {
             for &entity in candidates {
@@ -801,6 +805,9 @@ pub(crate) fn on_entity_event_sound(
     if sound.event.event != EntityEventKind::MELEE_HIT {
         return;
     }
+    let weapons = weapons
+        .as_deref()
+        .and_then(|weapons| weapons.for_event(sound.event.world).ok());
     let payload = sound.event.payload;
     let start = Vec3::from_array(payload.origin2);
     let end = Vec3::from_array(payload.origin);
@@ -820,7 +827,7 @@ pub(crate) fn on_entity_event_sound(
         start,
         end,
         bullet_scale,
-        weapon_hit_damage(weapons.as_deref(), payload.weapon),
+        weapon_hit_damage(weapons.as_ref(), payload.weapon),
         &mut instances,
         &mut impulses,
         phys.as_mut(),
@@ -850,7 +857,7 @@ pub(crate) fn wake_player_overlap(
     let maxs = origin + PLAYER_MAXS;
     let catalog = catalog.as_deref();
     for (entity, inst, transform) in &instances {
-        if world.is_awake(entity) {
+        if inst.ty != asset_world::DynEntType::Clutter || world.is_awake(entity) {
             continue;
         }
         let Some(preset) = can_wake(inst) else {
@@ -902,19 +909,77 @@ fn on_physics_sphere(
     }
 }
 
+#[derive(Resource, Default)]
+struct DynEntPresentationCheckpoint {
+    initial: HashMap<Entity, (WorldDynEntInstance, Transform, Visibility)>,
+}
+
+fn reconstruct_dyn_ent_presentation(
+    mut reset: MessageReader<net::ImpactReconstruction>,
+    mut checkpoint: ResMut<DynEntPresentationCheckpoint>,
+    mut instances: Query<
+        (
+            Entity,
+            &mut WorldDynEntInstance,
+            &mut Transform,
+            &mut Visibility,
+        ),
+        With<DynEntModelEntity>,
+    >,
+    mut physics: ResMut<DynEntPhysWorld>,
+    mut impulses: ResMut<Messages<DynEntPhysImpulse>>,
+) {
+    let reset = reset.read().count() != 0;
+    checkpoint
+        .initial
+        .retain(|entity, _| instances.contains(*entity));
+    for (entity, mut instance, mut transform, mut visibility) in &mut instances {
+        let initial = checkpoint
+            .initial
+            .entry(entity)
+            .or_insert_with(|| (instance.clone(), *transform, *visibility));
+        if reset {
+            *instance = initial.0.clone();
+            *transform = initial.1;
+            *visibility = initial.2;
+        }
+    }
+    if reset {
+        physics.reset_presentation();
+        impulses.clear();
+    }
+}
+
 pub fn register_dyn_ent_wake(app: &mut App) {
-    app.init_resource::<DynEntWakeBroadphase>()
+    app.scoped::<DynEntWakeBroadphase>(frame::MatchScope::Live)
+        .scoped::<DynEntPresentationCheckpoint>(frame::MatchScope::Live)
+        .add_systems(
+            Update,
+            reconstruct_dyn_ent_presentation
+                .in_set(frame::InMatch)
+                .in_set(net::ClientSet::Present)
+                .before(rebuild_dyn_ent_wake_broadphase),
+        )
         .add_observer(on_entity_explosion)
         .add_observer(on_physics_sphere)
-        .add_observer(on_entity_bullet_hit)
         .add_observer(on_entity_event_sound)
         .add_systems(
             Update,
-            rebuild_dyn_ent_wake_broadphase.in_set(net::ClientSet::Receive),
+            rebuild_dyn_ent_wake_broadphase
+                .in_set(frame::InMatch)
+                .in_set(net::ClientSet::Present)
+                .before(hit_dyn_ents_from_pellets),
+        )
+        .add_systems(
+            Update,
+            hit_dyn_ents_from_pellets
+                .in_set(frame::InMatch)
+                .in_set(net::ClientSet::Present),
         )
         .add_systems(
             Update,
             wake_player_overlap
+                .in_set(frame::InMatch)
                 .in_set(frame::WorkerCmdSet::Physics)
                 .before(render_anim::occupancy::dyn_ent_phys::step_phys_world0),
         );

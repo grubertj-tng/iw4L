@@ -291,7 +291,12 @@ pub(crate) fn advance_weapon_command(
                 stock,
                 shot_count: meta.weapon_shot_count,
                 burst_latch: meta.burst_latch,
-                rechamber_pending: meta.rechamber_pending,
+                rechamber_pending: weapon_iw4::weapon_rechamber_pending(
+                    &ps.weapons,
+                    &ps.weapon_data,
+                    started_weapon,
+                    0,
+                ),
                 delayed_rechamber: false,
                 weapon_restrict_kick_time: ps.weapon_restrict_kick_time,
                 quick_reload,
@@ -307,7 +312,12 @@ pub(crate) fn advance_weapon_command(
                 stock,
                 shot_count: ps.weapon_shot_count_secondary as u8,
                 burst_latch: meta.burst_latch_secondary,
-                rechamber_pending: meta.rechamber_pending_secondary,
+                rechamber_pending: weapon_iw4::weapon_rechamber_pending(
+                    &ps.weapons,
+                    &ps.weapon_data,
+                    started_weapon,
+                    1,
+                ),
                 delayed_rechamber: false,
                 weapon_restrict_kick_time: ps.weapon_restrict_kick_time_secondary,
                 quick_reload,
@@ -451,6 +461,7 @@ pub(crate) fn advance_weapon_command(
                 }
             },
             perks0: ps.perks[0],
+            perks1: ps.perks[1],
             perk_weap_reload_multiplier: weapon_iw4::PERK_WEAP_RELOAD_MULTIPLIER_DEFAULT,
             offhand: {
                 let mut inventory = [OffhandInvRow::default(); OFFHAND_INV_SLOTS];
@@ -549,8 +560,19 @@ pub(crate) fn advance_weapon_command(
         }
 
         if let Some(ps_mut) = world.player_mut(*id) {
+            for (index, hand) in hands.iter().enumerate().take(last_hand as usize + 1) {
+                weapon_iw4::set_weapon_rechamber_pending(
+                    &ps_mut.weapons,
+                    &mut ps_mut.weapon_data,
+                    started_weapon,
+                    index,
+                    hand.rechamber_pending,
+                );
+            }
+            weapon_iw4::update_scope_zoom(ps_mut, cmd.buttons, old_buttons, facts.scope_zoom);
             ps_mut.weapon = hand0.weapon;
             if hand0.weapon != started_weapon {
+                ps_mut.scope_zoom_level = 0;
                 if hand0.weaponstate == weapon_iw4::WeaponState::RaisingAltswitch as i32 {
                     ps_mut.aim_spread_scale = ps_mut.aim_spread_scale.max(128.0);
                 }
@@ -587,6 +609,11 @@ pub(crate) fn advance_weapon_command(
             .client_meta(*id)
             .map(|m| m.life_sequence)
             .unwrap_or_default();
+        let held_rechamber_pending = world.player(*id).map_or([false; 2], |ps| {
+            std::array::from_fn(|hand| {
+                weapon_iw4::weapon_rechamber_pending(&ps.weapons, &ps.weapon_data, ps.weapon, hand)
+            })
+        });
         let meta = world.client_meta_mut(*id);
         if hand0.weapon != started_weapon {
             if started_weapon != 0 {
@@ -600,9 +627,9 @@ pub(crate) fn advance_weapon_command(
         }
         meta.weapon_shot_count = hand0.shot_count;
         meta.burst_latch = hand0.burst_latch;
-        meta.rechamber_pending = hand0.rechamber_pending;
+        meta.rechamber_pending = held_rechamber_pending[0];
         meta.burst_latch_secondary = last_hand >= 1 && hands[1].burst_latch;
-        meta.rechamber_pending_secondary = last_hand >= 1 && hands[1].rechamber_pending;
+        meta.rechamber_pending_secondary = held_rechamber_pending[1];
         if facts.dual_mag.is_some() && started_weapon != 0 {
             meta.set_quick_reload_ready(started_weapon, hand0.quick_reload);
         }
@@ -724,7 +751,10 @@ pub(crate) fn advance_weapon_command(
                         continue;
                     };
                     apply_player_anim_event(world, *id, ANIM_ET_FIREWEAPON);
-                    let combat_seed = world.combat_rng_mut().next_u32();
+                    let combat_seed = match fire_cause {
+                        Some(cause) => cause.combat_seed(world.root_seed()),
+                        None => world.combat_rng_mut().next_u32(),
+                    };
                     let origin = world
                         .client_meta(*id)
                         .and_then(|meta| meta.linked_weapon_view)
@@ -1119,7 +1149,16 @@ pub fn spread_direction_on_plane(
     }
 }
 
-pub(crate) fn phase_emit(world: &FrameWorld, shots: &[AcceptedShot]) -> Vec<Emission> {
+fn flame_burns_this_tick(facts: &weapon_iw4::WeaponCombatFacts, now_ms: i32) -> bool {
+    let interval = facts
+        .flame_damage_interval_ms
+        .max(facts.fire_time_ms)
+        .max(1);
+    let window = facts.fire_time_ms.max(1);
+    now_ms.div_euclid(interval) != (now_ms - window).div_euclid(interval)
+}
+
+pub(crate) fn phase_emit(world: &FrameWorld, tick: Tick, shots: &[AcceptedShot]) -> Vec<Emission> {
     let mut out = Vec::new();
     for shot in shots {
         let Some(facts) = world.combat_facts_for(shot.weapon) else {
@@ -1129,6 +1168,14 @@ pub(crate) fn phase_emit(world: &FrameWorld, shots: &[AcceptedShot]) -> Vec<Emis
         match fire_weapon_kind(facts.weap_type, facts.weap_class) {
             Some(FireWeaponKind::Bullet) => {
                 if facts.damage <= 0 || facts.bullet_range() <= 0.0 {
+                    continue;
+                }
+            }
+            Some(FireWeaponKind::Flame) => {
+                if facts.damage <= 0
+                    || facts.bullet_range() <= 0.0
+                    || !flame_burns_this_tick(&facts, crate::level_time_ms(tick))
+                {
                     continue;
                 }
             }
@@ -1177,6 +1224,7 @@ pub(crate) fn phase_trace(
     emissions: &[Emission],
 ) -> TracePhaseOutput {
     let mut output = TracePhaseOutput::default();
+    let mut segment_ordinals = HashMap::<(ShotId, PelletId), u16>::new();
     let mut pending: std::collections::VecDeque<_> =
         emissions.iter().copied().map(|em| (em, 0u8)).collect();
     while let Some((em, bounces)) = pending.pop_front() {
@@ -1319,6 +1367,11 @@ pub(crate) fn phase_trace(
         }
         let mut glass_hit: Vec<u32> = Vec::new();
         for segment in &segments {
+            let ordinal = segment_ordinals.entry((em.shot_id, em.pellet)).or_default();
+            let segment_ordinal = *ordinal;
+            *ordinal = ordinal
+                .checked_add(1)
+                .expect("bullet segment count exceeds wire limit");
             let exit = segment.surface_flags & fx_iw4::FX_IMPACT_EXIT_SURFACE_FLAG != 0;
             let dist = {
                 let dx = segment.end[0] - em.origin[0];
@@ -1403,6 +1456,7 @@ pub(crate) fn phase_trace(
                 correlation: em.shot_id.0,
                 fire_cause: em.fire_cause,
                 pellet: em.pellet.0,
+                segment: segment_ordinal,
                 hand: em.hand,
                 origin: segment.end,
                 origin2: segment.start,
@@ -1449,7 +1503,9 @@ pub(crate) fn phase_trace(
                         attacker: em.attacker.0 as i32,
                         weapon: em.weapon,
                         correlation: em.shot_id.0,
+                        fire_cause: em.fire_cause,
                         pellet: em.pellet.0,
+                        segment: segment_ordinal,
                         hand: em.hand,
                         start: segment.start,
                         end: segment.end,
@@ -1464,7 +1520,9 @@ pub(crate) fn phase_trace(
                     attacker: em.attacker.0 as i32,
                     weapon: em.weapon,
                     correlation: em.shot_id.0,
+                    fire_cause: em.fire_cause,
                     pellet: em.pellet.0,
+                    segment: segment_ordinal,
                     hand: em.hand,
                     start: segment.start,
                     end: segment.end,

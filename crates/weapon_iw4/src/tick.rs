@@ -51,6 +51,7 @@ pub struct CapturedCombatInput {
     pub first_raise_time_ms: i32,
     pub reload_time_ms: i32,
     pub reload_empty_time_ms: i32,
+    pub empty_reload: crate::reload::EmptyReloadPolicy,
     pub clip_size: i32,
     pub start_ammo: i32,
     pub max_ammo: i32,
@@ -92,6 +93,7 @@ pub struct CapturedCombatInput {
     pub stunned_start_time_ms: i32,
     pub stunned_end_time_ms: i32,
     pub damage: i32,
+    pub flame_damage_interval_ms: i32,
     pub min_damage: i32,
     pub max_damage_range: f32,
     pub min_damage_range: f32,
@@ -127,6 +129,7 @@ pub struct CapturedCombatInput {
     pub melee_damage: i32,
 
     pub can_hold_breath: bool,
+    pub scope_zoom: crate::ScopeZoom,
     pub overlay_reticle: i32,
 
     pub melee_time_ms: i32,
@@ -188,6 +191,7 @@ pub struct WeaponCombatFacts {
     pub first_raise_time_ms: i32,
     pub reload_time_ms: i32,
     pub reload_empty_time_ms: i32,
+    pub empty_reload: crate::reload::EmptyReloadPolicy,
     pub clip_size: i32,
     pub start_ammo: i32,
     pub max_ammo: i32,
@@ -243,6 +247,7 @@ pub struct WeaponCombatFacts {
     pub stunned_start_time_ms: i32,
     pub stunned_end_time_ms: i32,
     pub damage: i32,
+    pub flame_damage_interval_ms: i32,
     pub min_damage: i32,
     pub max_damage_range: f32,
     pub min_damage_range: f32,
@@ -276,6 +281,7 @@ pub struct WeaponCombatFacts {
     pub melee_damage: i32,
 
     pub can_hold_breath: bool,
+    pub scope_zoom: crate::ScopeZoom,
     pub overlay_reticle: i32,
 
     pub melee_time_ms: i32,
@@ -329,6 +335,7 @@ impl WeaponCombatFacts {
             first_raise_time_ms: 0,
             reload_time_ms: 0,
             reload_empty_time_ms: 0,
+            empty_reload: crate::reload::EmptyReloadPolicy::Authored,
             clip_size: 0,
             start_ammo: 0,
             max_ammo: 0,
@@ -360,6 +367,7 @@ impl WeaponCombatFacts {
             stunned_start_time_ms: 0,
             stunned_end_time_ms: 0,
             damage: 0,
+            flame_damage_interval_ms: 0,
             min_damage: 0,
             max_damage_range: 0.0,
             min_damage_range: 0.0,
@@ -386,6 +394,7 @@ impl WeaponCombatFacts {
             ads_fire_only: false,
             melee_damage: 0,
             can_hold_breath: false,
+            scope_zoom: crate::ScopeZoom::NONE,
             overlay_reticle: 0,
             melee_time_ms: 0,
             melee_delay_ms: 0,
@@ -444,6 +453,7 @@ impl WeaponCombatFacts {
             first_raise_time_ms: input.first_raise_time_ms,
             reload_time_ms: input.reload_time_ms,
             reload_empty_time_ms: input.reload_empty_time_ms,
+            empty_reload: input.empty_reload,
             clip_size: input.clip_size,
             start_ammo: input.start_ammo,
             max_ammo: input.max_ammo,
@@ -476,6 +486,7 @@ impl WeaponCombatFacts {
             stunned_start_time_ms: input.stunned_start_time_ms,
             stunned_end_time_ms: input.stunned_end_time_ms,
             damage: input.damage,
+            flame_damage_interval_ms: input.flame_damage_interval_ms,
             min_damage: input.min_damage,
             max_damage_range: input.max_damage_range,
             min_damage_range: input.min_damage_range,
@@ -501,6 +512,7 @@ impl WeaponCombatFacts {
             ads_fire_only: input.ads_fire_only,
             melee_damage: input.melee_damage,
             can_hold_breath: input.can_hold_breath,
+            scope_zoom: input.scope_zoom,
             overlay_reticle: input.overlay_reticle,
             melee_time_ms: input.melee_time_ms,
             melee_delay_ms: input.melee_delay_ms,
@@ -547,8 +559,14 @@ impl WeaponCombatFacts {
         }
     }
 
+    pub fn uses_empty_reload(self, clip_empty: bool) -> bool {
+        clip_empty
+            && self.empty_reload == crate::reload::EmptyReloadPolicy::Authored
+            && self.reload_empty_time_ms > 0
+    }
+
     pub fn reload_duration_ms(self, clip_empty: bool) -> i32 {
-        if clip_empty && self.reload_empty_time_ms > 0 {
+        if self.uses_empty_reload(clip_empty) {
             self.reload_empty_time_ms
         } else {
             self.reload_time_ms
@@ -564,7 +582,7 @@ impl WeaponCombatFacts {
     }
 
     pub fn bullet_range(self) -> f32 {
-        if self.weap_class == crate::WEAPCLASS_SPREAD {
+        if self.weap_class == crate::WEAPCLASS_SPREAD || self.weap_type == crate::WEAPTYPE_GAS {
             self.min_damage_range
         } else {
             crate::BULLET_MAX_RANGE
@@ -697,6 +715,7 @@ pub struct WeaponCmd {
     pub offhand: crate::offhand::OffhandCmd,
 
     pub perks0: u32,
+    pub perks1: u32,
 
     pub perk_weap_reload_multiplier: f32,
 }
@@ -733,6 +752,7 @@ impl Default for WeaponCmd {
             switch_first_raise_time_ms: 0,
             offhand: crate::offhand::OffhandCmd::default(),
             perks0: 0,
+            perks1: 0,
             perk_weap_reload_multiplier: PERK_WEAP_RELOAD_MULTIPLIER_DEFAULT,
         }
     }

@@ -10,6 +10,7 @@ pub struct WeaponFpvFacts {
     pub ads_overlay_width: f32,
     pub ads_view_bob_mult: f32,
     pub ads_zoom_fov: f32,
+    pub scope_zoom: weapon_iw4::ScopeZoom,
     pub ads_zoom_in_frac: f32,
     pub ads_zoom_out_frac: f32,
     pub aim_down_sight: bool,
@@ -50,7 +51,7 @@ impl WeaponFpvFacts {
     pub(super) fn prepare(
         f: WeaponBodyFacts,
         right_idle_bound: bool,
-        namespace: crate::AssetNamespace,
+        ads_overlay: crate::AdsOverlayConvention,
     ) -> Self {
         Self {
             ads_aim_pitch: f.ads_aim_pitch,
@@ -59,6 +60,7 @@ impl WeaponFpvFacts {
             ads_overlay_width: f.ads_overlay_width,
             ads_view_bob_mult: f.ads_view_bob_mult,
             ads_zoom_fov: f.ads_zoom_fov,
+            scope_zoom: f.scope_zoom,
             ads_zoom_in_frac: f.ads_zoom_in_frac,
             ads_zoom_out_frac: f.ads_zoom_out_frac,
             aim_down_sight: f.aim_down_sight,
@@ -79,7 +81,7 @@ impl WeaponFpvFacts {
             sway: f.sway,
             motion_tracker: f.motion_tracker,
             inherits_perks: f.inherits_perks,
-            ads_overlay: crate::AdsOverlayConvention::from_namespace(namespace.content()),
+            ads_overlay,
             alternate: f.inventory_type == 3,
             dual_animation: !f.no_dual_wield && right_idle_bound,
         }
@@ -87,7 +89,7 @@ impl WeaponFpvFacts {
 }
 
 impl WeaponRegistry {
-    pub fn fpv_facts_of(&self, id: u32) -> Option<WeaponFpvFacts> {
+    pub(crate) fn fpv_facts_of(&self, id: u32) -> Option<WeaponFpvFacts> {
         self.rows.get(id as usize)?.fpv
     }
 }

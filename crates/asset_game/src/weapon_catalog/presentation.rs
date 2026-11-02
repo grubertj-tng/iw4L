@@ -21,6 +21,8 @@ pub struct WeaponHudFacts {
     pub ammo_counter_clip: i32,
     pub ammo_index: i32,
     pub can_hold_breath: bool,
+    pub cooks_grenade: bool,
+    pub scope_zoom: weapon_iw4::ScopeZoom,
     pub clip_index: i32,
     pub clip_only: bool,
     pub clip_size: i32,
@@ -67,6 +69,8 @@ impl WeaponHudFacts {
             ammo_counter_clip: f.ammo_counter_clip,
             ammo_index: f.ammo_index,
             can_hold_breath: f.can_hold_breath,
+            cooks_grenade: f.weap_type == weapon_iw4::WEAPTYPE_GRENADE && f.cook_off_hold,
+            scope_zoom: f.scope_zoom,
             clip_index: f.clip_index,
             clip_only: f.clip_only,
             clip_size: f.clip_size,
@@ -162,13 +166,13 @@ impl WeaponWorldFacts {
 }
 
 impl WeaponRegistry {
-    pub fn hud_facts_of(&self, id: u32) -> Option<WeaponHudFacts> {
+    pub(crate) fn hud_facts_of(&self, id: u32) -> Option<WeaponHudFacts> {
         self.rows.get(id as usize)?.hud
     }
-    pub fn event_facts_of(&self, id: u32) -> Option<WeaponEventFacts> {
+    pub(crate) fn event_facts_of(&self, id: u32) -> Option<WeaponEventFacts> {
         self.rows.get(id as usize)?.events
     }
-    pub fn world_facts_of(&self, id: u32) -> Option<WeaponWorldFacts> {
+    pub(crate) fn world_facts_of(&self, id: u32) -> Option<WeaponWorldFacts> {
         self.rows.get(id as usize)?.world
     }
 }

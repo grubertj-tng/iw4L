@@ -26,7 +26,19 @@ pub(crate) struct FxModelGeometry {
 pub struct FxModelStaging(pub FxModelDrawPlan);
 
 #[derive(Resource, Clone, Debug, Default)]
-pub struct PreparedFxModelGeometry(pub FxModelDrawPlan);
+pub struct PreparedFxModelGeometry {
+    geometry: Arc<FxModelGeometry>,
+    generation: u64,
+}
+
+impl From<FxModelDrawPlan> for PreparedFxModelGeometry {
+    fn from(plan: FxModelDrawPlan) -> Self {
+        Self {
+            geometry: plan.geometry,
+            generation: plan.generation,
+        }
+    }
+}
 
 #[derive(Resource, Clone, Debug, Default)]
 pub struct FxModelDrawPlan {
@@ -74,6 +86,13 @@ impl FxModelDrawPlan {
         &self.geometry.packed_vertices
     }
 
+    pub fn packed_exact(&self) -> bool {
+        matches!(
+            &self.geometry.packed_vertices,
+            asset_world::PackedVertexPayload::Iw4(rows) if rows.len() == self.geometry.vertices.len()
+        )
+    }
+
     pub fn clear(&mut self) {
         self.draws.clear();
         self.generated = 0;
@@ -86,7 +105,7 @@ impl FxModelDrawPlan {
         self.skipped_render_fx_flags = 0;
     }
 
-    pub fn use_prepared(&mut self, prepared: &Self) {
+    pub fn use_prepared(&mut self, prepared: &PreparedFxModelGeometry) {
         self.geometry = Arc::clone(&prepared.geometry);
         self.generation = prepared.generation;
     }

@@ -31,6 +31,12 @@ pub enum ClientAction {
         model: u8,
     },
 
+    ChangeWeaponCamo {
+        request_id: ActionRequestId,
+        weapon: u32,
+        model: u8,
+    },
+
     ChangeWeaponConfiguration {
         request_id: ActionRequestId,
         from: u32,
@@ -87,6 +93,12 @@ pub enum ClientAction {
     SetName {
         request_id: ActionRequestId,
         name: [u8; 16],
+    },
+
+    Chat {
+        request_id: ActionRequestId,
+        team_only: bool,
+        text: [u8; crate::chat::CHAT_BYTES],
     },
 
     UseCopycat {
@@ -212,6 +224,7 @@ pub fn action_request_id(action: &ClientAction) -> ActionRequestId {
         | ClientAction::LeaveMatch { request_id }
         | ClientAction::SelectClass { request_id, .. }
         | ClientAction::GiveWeapon { request_id, .. }
+        | ClientAction::ChangeWeaponCamo { request_id, .. }
         | ClientAction::ChangeWeaponConfiguration { request_id, .. }
         | ClientAction::ForceDeath { request_id }
         | ClientAction::SpawnClient { request_id }
@@ -224,6 +237,7 @@ pub fn action_request_id(action: &ClientAction) -> ActionRequestId {
         | ClientAction::DebugDamage { request_id, .. }
         | ClientAction::SetName { request_id, .. }
         | ClientAction::SetProfile { request_id, .. }
+        | ClientAction::Chat { request_id, .. }
         | ClientAction::UseCopycat { request_id }
         | ClientAction::ActionSlot { request_id, .. }
         | ClientAction::ChooseDefaultClass { request_id, .. }

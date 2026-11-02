@@ -1,47 +1,59 @@
 # Weapon configuration products
 
-Capture belongs to `asset_game::WeaponCatalog`; `WeaponBuild` owns preparation
-and dependency linking. `WeaponBuild::publish` freezes the registry and compiles
-combat, equipment, penetration, FPV, HUD, world and event projections from each effective row.
-Every publication receives a fresh revision; an exact registry clone retains its revision. IDs and selections belong to that registry revision. Replacing content requires
-rebuilding its registry and all tables retaining those IDs.
+`asset_game::WeaponCatalog` captures source rows. `WeaponBuild` links dependencies and publishes immutable effective rows, semantic policies and consumer projections.
+`weapon_catalog/{capture_merge,catalog_linking,model_linking,publication}` own
+those operations; `configuration/{iw4,iw5,t5,t6}` own source selection rules.
 
-`WeaponFamilies` exposes offered families, descriptions and attachment options.
-Selection resolution normalizes attachments and checks offers, family
-compatibility and host loadout limits. The internal configuration compiler
-selects an authored row or an IW5 prepared row and applies registry admission.
-Success returns that ID and canonical selection; missing content, missing
-bindings, unsupported mechanisms and match restrictions remain distinct
-refusals. Options test each toggle through the same resolver.
+`WeaponFamilies` normalizes selections and checks attachments and host limits.
+Frontend loadout publication defers map-selected hands admission; matches validate soldiers and skeletons. Saved class previews include unavailable captured families.
+Resolution and UI toggles return a private registry-issued `WeaponHandle` plus read-only canonical selection. Console/UI use this resolver. Publication iteration
+includes the last valid row; unarmed, unknown and unsupported remain distinct.
 
-Family preparation applies overrides once. Simulation, FPV, world models,
-HUD and events use the same effective registry row and existing prepared
-assemblies. Catalog capture rows, the broad capture body/accessor and native IW5 override helpers are private to asset_game.
+`WeaponRegistry::bind` rejects foreign revisions before row access. Exact clones
+retain identity; republishing changes it. Raw projection getters are crate-private;
+consumers use `BoundWeapon`. `PreparedWeapons` admits wire IDs only after checking
+the installed snapshot epoch or original event generation. Local revisions never
+enter wire IDs/content digests. Queued effects retain their producing generation.
 
-Combat projection publication resolves the melee weapon, charge animation and
-melee classification. `combat_facts_of` binds the match location-damage table
-and explicit `WeaponHostRules`, validates the result and returns simulation
-facts or a typed refusal. The default host burst cooldown is 200 ms for every
-source family. Unknown IDs, unpublished rows and unsupported configurations
-refuse; session logs the reason and disables that combat row.
+Combat, equipment, penetration, FPV, HUD, world and event projections use one
+effective row. Combat binds host rules and location damage before simulation.
+The host burst cooldown remains 200 ms across sources. Presentation facts carry
+camera, alternate, dual, shield, overlay and event policies without reinterpreting
+capture classifications. Loadout labels/archive hints are prepared by asset_game.
 
-Equipment and penetration projections use the shared `weapon_iw4` products.
-Source-specific rotation and ballistic-blade identification are compiled before
-session publishes its tables. FPV and camera consumers use `WeaponFpvFacts`,
-which contains placement/camera data and prepared alternate/dual-animation
-classification rather than the capture body. Existing FPV assemblies retain
-model and skeleton validation; motion-tracker presentation shares one query.
+Underbarrels retain their native alternate inventory identity, reload stages and
+switch clips. An absent empty-reload clip selects the ordinary reload with its
+authored timing through an explicit reload policy; captured timing remains intact. Independent T6 underbarrels keep their own reload clips when
+the rifle has fast magazines. Effective IW5 attachment reticles resolve their
+material images after composition; T6 reticle materials enter the native HUD
+image set with their authored sizes and minimum spread offset.
 
-`WeaponHudFacts` publishes ammo/reticle/overlay data and primary, alternate and guided-overlay rules. `WeaponWorldFacts` publishes shield classification. `WeaponEventFacts` publishes impact, explosion and ignition data, projectile camera policy, ground-rest policy and fire-ping suppression. Killcam camera classification preserves the existing guidance-before-class-before-type priority. Consumers no longer read numeric capture classifications to decide these behaviors. Animation overlay convention and perk inheritance are also published with FPV facts.
+`BoundWeapon::preparation` retains source keys and per-component targets/refusals.
+T6 models, clips, cues and materials retain T6 source and storage identity.
+Missing native dependencies refuse their dependent capabilities; source weapon
+rows never inherit another family's row. Publication retains captured family.
 
-Console completion names are compiled once with the catalog's family descriptions, admission and naming rules; console reads the resulting list. Registry lookup owns name normalization, including authored suffix handling. Presentation projections are metadata for an existing published row: they do not replace configuration admission, allow an unsupported selection or imply residency. An unknown ID or unpublished projection has no product.
+The map selects the soldier kit and hands family. Weapon-authored hands are
+eligible only for that family. FPV composition validates typed native model
+pairs; T6 guns additionally admit an explicit `T6WithIw4Hands` connection for
+IW4 soldiers. Catalog owners must match. Unsupported family pairs refuse.
 
-Loadout catalog preparation compiles `CacItemPresentation` labels and archive-icon hints once per catalog. Source suffix/prefix rules, equipment table references, localization namespaces and image namespaces belong to asset_game preparation; display reads prepared labels and previews. Archive hints serve the explicit host bootstrap roster and do not establish source asset residency. Unknown keys without a prepared presentation remain visible as their identity. Replacing the retained registry requires rebuilding the loadout catalog; authored table replacement requires reapplying preview preparation.
+`FpvWeaponTable::bind` checks registry, mesh, clip, material, image and atlas owners
+before accepting handles and alternate links. Retained compositions validate model
+and hide identity; track mappings/rigs retain actual clips and meshes. Foreign clips
+or rig poses refuse before writes. Optional bones/clips and preparation budget remain.
+Material admission retains mesh/material owners; raw assembly construction is internal.
+Items and remote kits share `ItemComposition` topology/hide and registry/world owners. Required model/pose failures are cached;
+optional attachments and camo-to-base fallback preserve policy. Replacement clears
+successes/refusals. Kits retain body/world catalogs; `models()` accepts no catalogs.
+Prepared DObj identity controls reuse; heads use checked soldier capabilities.
+`PlayerAnimationBinding` retains the character kit/rig, paired tree/script and clips.
+Multiplayer body tracks validate leaves/tracks and soldier tree/script/clip family.
+Missing native profiles refuse; persistent trees reuse only the same binding.
+Body/tree/script/clip replacement resets animation and preserves corpse occupation; unchanged bindings preserve blend, phase and rate.
 
-Dropped-item DObj preparation follows item occupancy demand. It admits each encountered configuration, caches successful compositions and refusals within the weapon revision/world-catalog identity, and retains its registry owner. Revision or world replacement invalidates the cache; match installation/teardown clears it. No dropped-item composition is prepared by enumerating unused registry rows.
-
-Remote-body kits follow current player/corpse demand after entity synchronization. Admitted configurations (or the explicit unarmed ID zero) share cached DObjs by body/world model identities and attachment topology; refusals are cached. The cache retains body/registry owners and clears on body, weapon revision, world identity or match replacement. Shield attachments retain their existing per-entity DObj path.
-
-These CPU contracts do not imply GPU or media readiness. Material admission,
-FPV layout, audio preparation and match generation readiness keep their own
-validation and lifetime boundaries.
+Publication compiles appearance plans once; `SelectedWeaponAppearance` binds models, overrides and UI metadata.
+Raw hand/camouflage data stays on `WeaponBuild`; runtime consumers select appearances.
+The editor reopens attachments/camouflage; previews retain namespace material/image bindings and fall back to authored HUD icons. IW4 scripts bridge foreign smoke, gas, sticky, knife and C4 equipment names.
+Explosive crossbow payloads publish their own script lifecycle and use BO1
+warning FX and audio. Qualified script FX names select the authored family.

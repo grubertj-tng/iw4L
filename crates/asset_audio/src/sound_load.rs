@@ -12,14 +12,6 @@ use crate::zone::{ZoneMemory, open_zone_shared};
 use crate::zone_sound::{ZoneSoundOrigin, ensure_zone_sound};
 use crate::{AssetNamespace, ZoneGame};
 
-pub fn namespace_for_zone(games: &GamesRoot, zone: &str) -> AssetNamespace {
-    find_zone_file(games, zone)
-        .ok()
-        .and_then(|found| crate::zone_game_for_path(&found.path))
-        .map(AssetNamespace::from_zone_game)
-        .unwrap_or(AssetNamespace::Iw4)
-}
-
 struct SoundSink {
     catalog: SoundCatalog,
     walked: usize,
@@ -257,18 +249,29 @@ fn origin_label(origin: ZoneSoundOrigin) -> String {
 }
 
 pub fn gather_sound_sources(games: &GamesRoot, map: &Path) -> SoundSources {
+    gather_sound_sources_filtered(games, map, |_| true)
+}
+
+pub fn gather_sound_sources_filtered(
+    games: &GamesRoot,
+    map: &Path,
+    mut enabled: impl FnMut(AssetNamespace) -> bool,
+) -> SoundSources {
     let (before, after) = sound_sources(games, map);
     let mut sources = SoundSources {
         before_map: SoundCatalog::default(),
         after_map: Vec::new(),
         gaps: Vec::new(),
     };
-    for source in before {
+    for source in before
+        .into_iter()
+        .filter(|source| enabled(source.namespace))
+    {
         if let Some(catalog) = sources.take(&source) {
             sources.before_map.absorb_unresolved((*catalog).clone());
         }
     }
-    for source in after {
+    for source in after.into_iter().filter(|source| enabled(source.namespace)) {
         if let Some(catalog) = sources.take(&source) {
             sources.after_map.push((source, catalog));
         }

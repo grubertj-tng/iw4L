@@ -112,13 +112,17 @@ pub(crate) fn route_debug_feature_commands(
                         continue;
                     }
                     let (camo, attachments) = crate::weapon_dispatch::split_camo(&attachments);
-                    match crate::weapon_dispatch::resolve_give_id(&weapons.0, &weapon, &attachments)
-                        .and_then(|weapon_id| {
-                            let model = camo.map_or(Ok(0), |camo| {
-                                crate::weapon_dispatch::camo_slot(&weapons.0, weapon_id, camo)
-                            })?;
-                            Ok((weapon_id, model))
-                        }) {
+                    match crate::weapon_dispatch::resolve_give_id(
+                        weapons.registry(),
+                        &weapon,
+                        &attachments,
+                    )
+                    .and_then(|weapon_id| {
+                        let model = camo.map_or(Ok(0), |camo| {
+                            crate::weapon_dispatch::camo_slot(weapons.registry(), weapon_id, camo)
+                        })?;
+                        Ok((weapon_id, model))
+                    }) {
                         Ok((weapon_id, model)) => {
                             let request_id = give_seq.allocate();
                             if let Err(error) = inbox.push(
@@ -135,7 +139,7 @@ pub(crate) fn route_debug_feature_commands(
                             echo(
                                 format!(
                                     "bot give: queued {} id={weapon_id} on {} request_id={request_id}",
-                                    weapons.0.configuration_label(weapon_id),
+                                    weapons.registry().configuration_label(weapon_id),
                                     id.0
                                 ),
                                 console,
@@ -210,6 +214,10 @@ pub fn register_feature_commands(registry: &mut crate::ConsoleRegistry, maps: &[
     }
     for (name, usage) in [
         ("help", "help — list registered commands"),
+        ("say", "say <message> — public chat"),
+        ("say_team", "say_team <message> — team chat"),
+        ("chatmodepublic", "chatmodepublic — open public chat"),
+        ("chatmodeteam", "chatmodeteam — open team chat"),
         ("clear", "clear — clear console scrollback"),
         ("screenshot", "screenshot [name] — capture the backbuffer"),
         (
@@ -220,6 +228,10 @@ pub fn register_feature_commands(registry: &mut crate::ConsoleRegistry, maps: &[
         (
             "clip",
             "clip — save last ≤45s available to this client as iw4l-artifacts/clips/<ULID>/{clip.iw4ldemo, dump.txt} (always-on ring)",
+        ),
+        (
+            "round_restart",
+            "round_restart — restart the host's script round and retain match content (needs cheats)",
         ),
         (
             "map_restart",
@@ -295,7 +307,7 @@ pub fn register_feature_commands(registry: &mut crate::ConsoleRegistry, maps: &[
         ),
         (
             "wait",
-            "wait [seconds|<n>t|world|spawn|torn|ambient] — pause the console FIFO; <n>t = n authority ticks; world = scene.spawned; spawn = AppScreen::InGame; torn = HasWorld false and scene.spawned false (hold after MatchTornDown); ambient = MapAmbientBooted (overlay finished, CreateFX sources published)",
+            "wait [seconds|<n>t|world|spawn|torn|ambient|progression] — pause the console FIFO; <n>t = n authority ticks; world = scene.spawned; spawn = AppScreen::InGame; torn = match scope absent and scene.spawned false (after match retirement); ambient = MapAmbientBooted; progression = native account content ready",
         ),
     ] {
         if registry.resolve(name).is_none() {

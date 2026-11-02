@@ -3,16 +3,16 @@ use crate::cue::CueHandle;
 use crate::cue_execution::CueTrigger;
 use crate::{SoundBank, SoundClass};
 use bevy::prelude::*;
+use frame::ScopeApp;
 
 #[derive(Resource, Default)]
 pub(crate) struct ScriptMusicPlayback {
-    epoch: u64,
     pending: Option<String>,
     active: Option<CueHandle>,
 }
 
 pub(crate) fn update_script_music(
-    epoch: Res<crate::backend::MatchEpoch>,
+    epoch: Option<Res<net::EntityEventCursor>>,
     ready: Res<crate::AudioReady>,
     generation: Res<frame::WorldGeneration>,
     runtime: Res<crate::AudioRuntime>,
@@ -23,12 +23,7 @@ pub(crate) fn update_script_music(
     mut mix: ResMut<crate::script_mix::ScriptAudioMix>,
     mut feedback: ResMut<crate::clip_store::CueFeedback>,
 ) {
-    mix.reset_epoch(epoch.0);
-    if playback.epoch != epoch.0 {
-        playback.epoch = epoch.0;
-        playback.pending = None;
-        playback.active = None;
-    }
+    mix.reset_epoch(crate::backend::presentation_epoch(epoch.as_deref()));
     if playback
         .active
         .as_ref()
@@ -68,7 +63,8 @@ pub(crate) fn update_script_music(
             }
         }
     }
-    if !ready.0.ready_for(*generation) || loading.is_some_and(|screen| !screen.is_complete()) {
+    if !ready.0.ready_for(generation.stamp()) || loading.is_some_and(|screen| !screen.is_complete())
+    {
         return;
     }
     let Some(bank) = bank else { return };
@@ -85,8 +81,9 @@ pub(crate) fn update_script_music(
         origin_inches: None,
         emitter: None,
         class: SoundClass::Music,
-        epoch: epoch.0,
+        epoch: crate::backend::presentation_epoch(epoch.as_deref()),
         pitch_scale: 1.0,
+        volume_scale: 1.0,
         fallbacks: Vec::new(),
     });
     feedback.push(CueHandle(handle.0.clone()));
@@ -94,6 +91,11 @@ pub(crate) fn update_script_music(
 }
 
 pub(crate) fn register(app: &mut App) {
-    app.init_resource::<ScriptMusicPlayback>()
-        .add_systems(Update, update_script_music.in_set(net::ClientSet::Effects));
+    app.scoped::<ScriptMusicPlayback>(frame::MatchScope::Live)
+        .add_systems(
+            Update,
+            update_script_music
+                .in_set(frame::InMatch)
+                .in_set(net::ClientSet::Effects),
+        );
 }

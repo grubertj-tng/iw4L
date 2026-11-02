@@ -60,6 +60,12 @@ pub enum MenuEvent {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+pub struct ExpressionId {
+    pub source: u64,
+    pub statement: (u8, u32),
+}
+
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MenuHandlers {
@@ -113,6 +119,7 @@ pub struct MenuSlider {
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MenuItem {
+    pub authored_id: String,
     pub name: String,
     pub handlers: ItemHandlers,
 
@@ -149,6 +156,8 @@ pub struct MenuItem {
     pub vis_ptr: u8,
     pub mat_ptr: u8,
     pub vis_exp: String,
+    pub visibility_expression: Option<ExpressionId>,
+    pub expression_ids: std::collections::BTreeMap<String, ExpressionId>,
     pub text_exp: String,
     pub material_exp: String,
     pub disabled_exp: String,
@@ -162,6 +171,7 @@ pub struct MenuItem {
     pub action: Vec<String>,
     pub mouse_enter: Vec<String>,
     pub on_focus: Vec<String>,
+    pub cover: bool,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -333,8 +343,12 @@ impl CapturedStringTable {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageProductRevision(pub u64);
+
 #[derive(Clone, Debug, Default, Resource)]
 pub struct MenuCatalog {
+    image_revision: std::sync::OnceLock<ImageProductRevision>,
     pub menus: BTreeMap<String, MenuDef>,
     pub fonts: BTreeMap<String, FontDef>,
 
@@ -342,21 +356,21 @@ pub struct MenuCatalog {
 
     pub rawfiles: BTreeMap<String, String>,
 
-    pub zone_images: BTreeMap<String, ZoneUiImage>,
+    pub(crate) zone_images: BTreeMap<String, ZoneUiImage>,
 
-    pub material_state_bits: BTreeMap<String, asset_iw4::ColorPassAgreement<[u32; 2]>>,
+    pub(crate) material_state_bits: BTreeMap<String, asset_iw4::ColorPassAgreement<[u32; 2]>>,
 
-    pub material_2d_plans: BTreeMap<String, HudMaterialPlan>,
+    pub(crate) material_2d_plans: BTreeMap<String, HudMaterialPlan>,
 
-    pub material_images: BTreeMap<String, String>,
-    pub material_srgb_reads: BTreeMap<String, bool>,
+    pub(crate) material_images: BTreeMap<String, String>,
+    pub(crate) material_srgb_reads: BTreeMap<String, bool>,
     pub lists: Vec<(String, i32)>,
     pub walked: usize,
 
     pub font_headers: usize,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct HudMaterialPlan {
     pub texture_atlas: [u8; 2],
     pub technique_slots: Option<u64>,
@@ -367,7 +381,7 @@ pub struct HudMaterialPlan {
     pub textures: Vec<HudMaterialTextureBinding>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HudMaterialTextureBinding {
     pub name_hash: u32,
     pub name_start: u8,
@@ -379,7 +393,63 @@ pub struct HudMaterialTextureBinding {
 
 impl MenuCatalog {
     pub fn load_definitions(&mut self, source: &str) -> Result<(), String> {
-        let definitions = crate::menu_source::load(source, self)?;
+        let mut definitions = crate::menu_source::load(source, self)?;
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hash);
+        let source = hash.finish();
+        let mut next = 0_u32;
+        for definition in &mut definitions {
+            let mut ids = std::collections::BTreeSet::new();
+            for item in &definition.items {
+                if !item.authored_id.is_empty()
+                    && !ids.insert(item.authored_id.to_ascii_lowercase())
+                {
+                    return Err(format!(
+                        "Duplicate authored item identity in {}",
+                        definition.name
+                    ));
+                }
+            }
+            for item in &mut definition.items {
+                item.expression_ids.clear();
+                for (field, dump) in [
+                    ("Visible", &item.vis_exp),
+                    ("Disabled", &item.disabled_exp),
+                    ("Text", &item.text_exp),
+                    ("Material", &item.material_exp),
+                ] {
+                    if !dump.is_empty() {
+                        item.expression_ids.insert(
+                            field.to_owned(),
+                            ExpressionId {
+                                source,
+                                statement: (u8::MAX, next),
+                            },
+                        );
+                        next = next
+                            .checked_add(1)
+                            .ok_or("authored expression identity exhausted")?;
+                    }
+                }
+                for (key, dump) in &item.float_exp {
+                    if !dump.is_empty() {
+                        item.expression_ids.insert(
+                            format!("Float({key})"),
+                            ExpressionId {
+                                source,
+                                statement: (u8::MAX, next),
+                            },
+                        );
+                        next = next
+                            .checked_add(1)
+                            .ok_or("authored expression identity exhausted")?;
+                    }
+                }
+                item.visibility_expression = item.expression_ids.get("Visible").copied();
+            }
+        }
+
         self.menus
             .extend(definitions.into_iter().map(|def| (def.name.clone(), def)));
         Ok(())
@@ -455,12 +525,64 @@ impl MenuCatalog {
             .get(&AssetRef::bare_name(name).to_ascii_lowercase())
     }
 
+    pub fn image_revision(&self) -> Option<ImageProductRevision> {
+        self.image_revision.get().copied()
+    }
+
+    pub fn publish_image_products(&self) -> ImageProductRevision {
+        *self
+            .image_revision
+            .get_or_init(|| ImageProductRevision(self.image_identity()))
+    }
+
+    pub fn zone_images(&self) -> &BTreeMap<String, ZoneUiImage> {
+        &self.zone_images
+    }
+    pub fn material_images(&self) -> &BTreeMap<String, String> {
+        &self.material_images
+    }
+    pub fn material_srgb_reads(&self) -> &BTreeMap<String, bool> {
+        &self.material_srgb_reads
+    }
+    pub fn material_2d_plans(&self) -> &BTreeMap<String, HudMaterialPlan> {
+        &self.material_2d_plans
+    }
+    pub fn material_state_bits(
+        &self,
+    ) -> &BTreeMap<String, asset_iw4::ColorPassAgreement<[u32; 2]>> {
+        &self.material_state_bits
+    }
+
+    pub fn image_identity(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (key, image) in &self.zone_images {
+            key.hash(&mut hasher);
+            image.material.hash(&mut hasher);
+            image.image.hash(&mut hasher);
+            (image.width, image.height).hash(&mut hasher);
+            image.rgba.as_slice().hash(&mut hasher);
+        }
+        self.material_images.hash(&mut hasher);
+        self.material_srgb_reads.hash(&mut hasher);
+        self.material_2d_plans.hash(&mut hasher);
+        self.material_state_bits.hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub fn zone_image_n(&self) -> usize {
         let mut seen = BTreeMap::new();
         for atlas in self.zone_images.values() {
             seen.insert((atlas.material.as_str(), atlas.image.as_str()), ());
         }
         seen.len()
+    }
+
+    pub fn insert_string_table(&mut self, table: CapturedStringTable) {
+        self.string_tables
+            .retain(|name, _| !name.eq_ignore_ascii_case(&table.name));
+        self.string_tables
+            .insert(table.name.to_ascii_lowercase(), table);
     }
 
     pub fn string_table(&self, name: &str) -> Option<&CapturedStringTable> {
@@ -485,6 +607,14 @@ impl MenuCatalog {
     }
 
     pub fn absorb(&mut self, other: MenuCatalog) {
+        let images_changed = !other.zone_images.is_empty()
+            || !other.material_images.is_empty()
+            || !other.material_srgb_reads.is_empty()
+            || !other.material_2d_plans.is_empty()
+            || !other.material_state_bits.is_empty();
+        if images_changed {
+            self.image_revision = std::sync::OnceLock::new();
+        }
         self.walked += other.walked;
         self.font_headers += other.font_headers;
         self.lists.extend(other.lists);
@@ -508,6 +638,9 @@ impl MenuCatalog {
         }
         for (name, image) in other.zone_images {
             self.zone_images.insert(name, image);
+        }
+        if images_changed {
+            self.publish_image_products();
         }
     }
 }
@@ -543,6 +676,23 @@ pub const HUD_CHROME_MENUS: &[&str] = &[
     "playercard_killedby_hd",
     "perks_info_hd",
 ];
+
+fn cover_wide_hud_overlays(catalog: &mut MenuCatalog) {
+    for name in HUD_CHROME_MENUS {
+        let Some(menu) = catalog.menus.get_mut(*name) else {
+            continue;
+        };
+        for item in &mut menu.items {
+            let rect = &item.rect;
+            if !item.background.is_empty()
+                && (rect.x, rect.y, rect.w, rect.h) == (-427.0, -240.0, 854.0, 480.0)
+                && (rect.horz_align, rect.vert_align) == (2, 2)
+            {
+                item.cover = true;
+            }
+        }
+    }
+}
 
 pub fn ui_games_root(games: &GamesRoot) -> Result<GamesRoot, String> {
     let anchor = find_zone_file(games, "iw4:common_mp")?;
@@ -599,7 +749,11 @@ fn load_menu_catalog_with_iwd(path: &Path, games: Option<&Path>) -> Result<MenuC
     let header = image.header().map_err(|e| e.to_string())?;
     let mut memory = ZoneMemory::for_header(&header);
     let mut stream = memory.stream(&image.bytes).map_err(|e| e.to_string())?;
+    use std::hash::{Hash, Hasher};
+    let mut source_hash = std::collections::hash_map::DefaultHasher::new();
+    image.bytes.hash(&mut source_hash);
     let mut sink = MenuSink {
+        expression_source: source_hash.finish(),
         catalog: MenuCatalog::default(),
         russian_fonts: path
             .parent()
@@ -619,7 +773,9 @@ fn load_menu_catalog_with_iwd(path: &Path, games: Option<&Path>) -> Result<MenuC
         Some((index, ty, slot)) => format!("asset #{index} {} at {slot:?}: {error:?}", ty.name()),
         None => format!("asset table: {error:?}"),
     })?;
-    Ok(sink.finish_and_take(games))
+    let catalog = sink.finish_and_take(games);
+    catalog.publish_image_products();
+    Ok(catalog)
 }
 
 #[derive(Clone, Copy)]
@@ -652,6 +808,7 @@ enum RecordedEvent {
 }
 
 struct MenuSink {
+    expression_source: u64,
     russian_fonts: bool,
     catalog: MenuCatalog,
     names: HashMap<(u8, u32), String>,
@@ -1017,6 +1174,7 @@ impl MenuSink {
 
     fn finish_and_take(mut self, games: Option<&Path>) -> MenuCatalog {
         self.finish_ui_images(games);
+        cover_wide_hud_overlays(&mut self.catalog);
         self.catalog
     }
 
@@ -1048,7 +1206,7 @@ impl MenuSink {
                 );
                 return;
             };
-            match crate::decode_ui_image(root, &image.name) {
+            match asset_material::decode_ui_archive_image(root, &image.name) {
                 Ok(Some(rgba)) => Some((rgba, "iwd")),
                 Ok(None) => {
                     diag::warn!(
@@ -1311,6 +1469,52 @@ impl AssetLinkSink for MenuSink {
             item.on_focus_ptr = rec.on_focus_ptr;
             item.static_flags = rec.static_flags;
             item.dvar_flags = rec.dvar_flags;
+        }
+        Ok(())
+    }
+
+    fn capture_item_expression_reference(
+        &mut self,
+        menu: &str,
+        _item: &str,
+        field: fastfile_iw4::ItemExpressionField,
+        source: Ptr,
+    ) -> fastfile_iw4::Result<()> {
+        if let Some(item) = self
+            .catalog
+            .menus
+            .get_mut(menu)
+            .and_then(|menu| menu.items.last_mut())
+        {
+            item.expression_ids.insert(
+                format!("{field:?}"),
+                ExpressionId {
+                    source: self.expression_source,
+                    statement: ptr_key(source),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn capture_item_visible_reference(
+        &mut self,
+        menu: &str,
+        item: &str,
+        source: Ptr,
+        dump: &str,
+    ) -> fastfile_iw4::Result<()> {
+        self.capture_item_visible_exp(menu, item, dump)?;
+        if let Some(item) = self
+            .catalog
+            .menus
+            .get_mut(menu)
+            .and_then(|menu| menu.items.last_mut())
+        {
+            item.visibility_expression = Some(ExpressionId {
+                source: self.expression_source,
+                statement: ptr_key(source),
+            });
         }
         Ok(())
     }
@@ -1721,5 +1925,14 @@ impl AssetLinkSink for MenuSink {
             },
         );
         Ok(())
+    }
+}
+
+impl gamemode_iw4::progression::ProgressionTable for CapturedStringTable {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+    fn cell(&self, row: usize, column: usize) -> &str {
+        self.cell(row as i32, column as i32)
     }
 }

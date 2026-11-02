@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use frame::ScopeApp;
 use frame::{AppScreen, ClientSet, RuntimeRole};
 use net::SignonState;
 
@@ -138,14 +139,11 @@ pub fn commit_class_equip(
     if let Some(request_id) = phase.pending_request_id() {
         return Err(ClassEquipRefusal::AlreadyPending { request_id });
     }
-    let Some(slot) = store.slots.get(index) else {
+    if store.slots.get(index).is_none() {
         return Err(ClassEquipRefusal::UnknownClass(index.to_string()));
-    };
-    if let Some(reason) = slot.lock_reason.as_deref() {
-        let refusal = ClassEquipRefusal::LockedContent {
-            index,
-            reason: reason.to_owned(),
-        };
+    }
+    if let Some(reason) = store.lock_reason(index) {
+        let refusal = ClassEquipRefusal::LockedContent { index, reason };
         status.0 = Some(refusal.to_string());
         return Err(refusal);
     }
@@ -165,7 +163,7 @@ pub fn commit_class_equip(
 }
 
 pub fn accept_class_equip(
-    store: &mut SessionClassStore,
+    equipped: &mut crate::classes::store::EquippedClass,
     phase: &mut ClassSelectPhase,
     overlay: &mut ClassSelectOverlayOpen,
     request_id: u32,
@@ -175,7 +173,7 @@ pub fn accept_class_equip(
             request_id: pending,
             class_index,
         } if pending == request_id => {
-            store.equipped = Some(class_index);
+            equipped.0 = Some(class_index);
             *phase = ClassSelectPhase::Interactive;
             overlay.0 = false;
             true
@@ -210,9 +208,9 @@ impl Plugin for ClassSelectPlugin {
         app.init_resource::<ClassSelectOverlayOpen>()
             .init_resource::<ClassChangeAllowed>()
             .init_resource::<ClassChangeBlockReason>()
-            .init_resource::<PendingClassEquip>()
-            .init_resource::<ClassSelectPhase>()
-            .init_resource::<ClassSelectStatus>()
+            .scoped::<PendingClassEquip>(frame::MatchScope::Live)
+            .scoped::<ClassSelectPhase>(frame::MatchScope::Live)
+            .scoped::<ClassSelectStatus>(frame::MatchScope::Live)
             .init_resource::<ClassSelectHighlight>()
             .init_resource::<ClassSelectIconCache>()
             .init_resource::<UiAssetRoot>()

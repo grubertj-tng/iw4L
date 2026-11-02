@@ -1,8 +1,8 @@
-use crate::backend::MatchEpoch;
 use crate::media::LiveGain;
 use asset_audio::ChannelKey;
 use asset_core::AssetNamespace;
 use bevy::prelude::*;
+use frame::ScopeApp;
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Resource, Default)]
@@ -165,11 +165,11 @@ fn update_channel_mix(
     bank: Option<Res<crate::SoundBank>>,
     namespace: Option<Res<crate::ambient::SoundBankNamespace>>,
     local: Option<Res<net::LocalPresentClient>>,
-    epoch: Res<MatchEpoch>,
+    epoch: Option<Res<net::EntityEventCursor>>,
     runtime: Res<crate::AudioRuntime>,
 ) {
     let now = runtime.audio_frame();
-    mix.reset_epoch(epoch.0);
+    mix.reset_epoch(crate::backend::presentation_epoch(epoch.as_deref()));
     for event in events.read() {
         if event.0.target().is_some() {
             mix.pending.push_back(event.0.clone());
@@ -203,7 +203,7 @@ fn update_channel_mix(
                 let Some(bank) = bank.as_ref() else {
                     continue;
                 };
-                let Some(channels) = bank.0.ent_channels.get(&namespace) else {
+                let Some(channels) = bank.0.channels_in(namespace) else {
                     diag::warn!(
                         Audio,
                         "audio: no channel volume policy for namespace={namespace:?}"
@@ -236,7 +236,12 @@ fn update_channel_mix(
 }
 
 pub(crate) fn register(app: &mut App) {
-    app.init_resource::<ScriptAudioMix>()
-        .init_resource::<ChannelAudioMix>()
-        .add_systems(Update, update_channel_mix.in_set(net::ClientSet::Effects));
+    app.scoped::<ScriptAudioMix>(frame::MatchScope::Live)
+        .scoped::<ChannelAudioMix>(frame::MatchScope::Live)
+        .add_systems(
+            Update,
+            update_channel_mix
+                .in_set(frame::InMatch)
+                .in_set(net::ClientSet::Effects),
+        );
 }

@@ -1,3 +1,4 @@
+use frame::ScopeApp;
 use std::collections::{BTreeSet, HashSet};
 
 use asset_audio::SoundCatalog;
@@ -6,10 +7,10 @@ use asset_game::WeaponRegistry;
 use assets::{MapLoadProcess, MatchType10SoundHints, PreparedWeapons};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use frame::{ClientSet, LaunchIdentity, MatchTornDown, ReturnedToMenu};
+use frame::{ClientSet, LaunchIdentity};
 
 use crate::aliases::movement_prepare_names;
-use crate::ambient::{SoundBankCompose, SoundBankLoadAttempted, SoundBankNamespace};
+use crate::ambient::{SoundBankCompose, SoundBankNamespace};
 use crate::clip_store::{ClipKey, ClipStore, clip_keys_for_alias};
 use crate::playback::SoundBank;
 
@@ -46,7 +47,7 @@ struct MatchRequests {
 
 #[derive(Resource, Default)]
 struct MatchClipPrep {
-    generation: frame::WorldGeneration,
+    generation: frame::WorldStamp,
     submitted: bool,
     capacity_failure: bool,
     required: HashSet<ClipKey>,
@@ -67,13 +68,13 @@ struct AudioLoadScope<'w> {
 }
 
 impl AudioLoadScope<'_> {
-    fn generation(&self) -> frame::WorldGeneration {
+    fn generation(&self) -> frame::WorldStamp {
         self.accepted
             .as_ref()
             .map(|accepted| accepted.load_key)
             .or_else(|| self.incoming.as_ref().map(|incoming| incoming.load_key))
-            .map(|key| frame::WorldGeneration::from_install(key.local_load_request_id))
-            .unwrap_or(*self.installed)
+            .map(|key| frame::WorldStamp::from_install(key.local_load_request_id))
+            .unwrap_or(self.installed.stamp())
     }
 }
 
@@ -90,46 +91,24 @@ pub(crate) fn register(app: &mut App) {
         diag::info!(Audio, "audio: Silent (IW4L_SOUND=off)");
         app.insert_resource(AudioSilent);
     }
-    app.init_resource::<AudioReady>()
-        .init_resource::<MatchClipPrep>()
-        .init_resource::<crate::match_voices::AnnouncerRoutes>()
+    app.scoped::<AudioReady>(frame::MatchScope::Live)
+        .scoped::<MatchClipPrep>(frame::MatchScope::Live)
+        .scoped::<crate::match_voices::AnnouncerRoutes>(frame::MatchScope::Live)
         .add_systems(
             Update,
             (
-                queue_match_clips.after(crate::ambient::install_sound_bank),
-                poll_match_audio_ready.after(queue_match_clips),
-                reset_match_audio_on_match_end,
+                queue_match_clips
+                    .in_set(frame::InMatch)
+                    .after(crate::ambient::install_sound_bank),
+                poll_match_audio_ready
+                    .in_set(frame::InMatch)
+                    .after(queue_match_clips),
             )
                 .in_set(ClientSet::Load),
         );
 }
 
-fn reset_match_audio_on_match_end(
-    mut torn: MessageReader<MatchTornDown>,
-    mut returned: MessageReader<ReturnedToMenu>,
-    mut ready: ResMut<AudioReady>,
-    mut prep: ResMut<MatchClipPrep>,
-    mut announcer: ResMut<crate::match_voices::AnnouncerRoutes>,
-) {
-    let retired = torn.read().fold(false, |retired, event| {
-        retired || event.world_generation == prep.generation
-    });
-    let menu = returned.read().fold(false, |menu, event| {
-        menu || (event.had_world && prep.generation.0.is_none())
-    });
-    if !retired && !menu {
-        return;
-    }
-    *ready = AudioReady::default();
-    if let Some(stage) = prep.stage.take() {
-        stage.cancel();
-    }
-    *prep = MatchClipPrep::default();
-    *announcer = Default::default();
-}
-
 fn queue_match_clips(
-    attempted: Res<SoundBankLoadAttempted>,
     walk: Option<Res<SoundBankCompose>>,
     mut clips: Option<ResMut<ClipStore>>,
     weapons: Option<Res<PreparedWeapons>>,
@@ -173,9 +152,6 @@ fn queue_match_clips(
         diag::info!(Audio, "audio: AudioReady — Silent, no clips prepared");
         return;
     }
-    if !attempted.0 {
-        return;
-    }
     if walk.is_some() {
         return;
     }
@@ -193,7 +169,7 @@ fn queue_match_clips(
         );
         return;
     };
-    if *load_scope.installed != scope {
+    if load_scope.installed.stamp() != scope {
         return;
     }
     let Some(weapons) = weapons else {
@@ -216,8 +192,8 @@ fn queue_match_clips(
     }
     let mut set = MatchRequests::default();
     let mut aliases = 0usize;
-    for weapon in 1..=weapons.0.len() as u32 {
-        aliases += request_weapon_aliases(clips, &bank.0, &weapons.0, weapon, &mut set);
+    for weapon in 1..=weapons.registry().len() as u32 {
+        aliases += request_weapon_aliases(clips, &bank.0, &weapons.registry(), weapon, &mut set);
     }
     for alias in movement_prepare_names() {
         aliases += 1;
@@ -281,15 +257,18 @@ fn queue_match_clips(
         .chain(MATCH_CLOCK)
     {
         aliases += 1;
-        request_named(clips, &bank.0, AssetNamespace::Iw4, alias, &mut set);
+        let (ns, alias) = crate::aliases::match_ui_alias(namespace.namespace, alias);
+        request_named(clips, &bank.0, ns, alias, &mut set);
     }
     let mut breath_policies = HashSet::new();
-    for weapon in 1..=weapons.0.len() as u32 {
+    for weapon in 1..=weapons.registry().len() as u32 {
         if weapons
-            .0
-            .hud_facts_of(weapon)
+            .registry()
+            .bind_published_row(weapon)
+            .ok()
+            .and_then(|weapon| weapon.hud_facts())
             .is_some_and(|facts| facts.can_hold_breath)
-            && let Some(policy) = weapons.0.semantic_policy_of(weapon)
+            && let Some(policy) = weapons.registry().semantic_policy_of(weapon)
             && breath_policies.insert((policy.cue_namespace.namespace(), policy.breath_cues))
         {
             let ns = policy.cue_namespace.namespace();
@@ -305,9 +284,9 @@ fn queue_match_clips(
     }
     if !set.missing.is_empty() {
         let names: Vec<&str> = set.missing.iter().map(String::as_str).collect();
-        diag::warn!(
+        diag::info!(
             Audio,
-            "audio: match-set gap: {} aliases name no loaded sound: {}",
+            "audio: prefetch catalog gaps: {} aliases name no loaded sound: {}",
             names.len(),
             names.join(" ")
         );
@@ -452,10 +431,7 @@ fn request_named(
     } else {
         set.resolved_aliases += 1;
     }
-    for key in keys
-        .into_iter()
-        .filter(|key| matches!(key, ClipKey::Loaded(_)))
-    {
+    for key in keys.into_iter().filter(|key| key.is_loaded()) {
         match clips.ready(&key) {
             Some(Err(
                 crate::clip_store::ClipError::RequestLimit
@@ -481,11 +457,12 @@ fn request_fx_type10(
     alias: &str,
     set: &mut MatchRequests,
 ) {
-    let ns = bank
-        .index_in(AssetNamespace::Iw4, alias)
-        .or_else(|| bank.index_unique(alias))
-        .map(|index| bank.namespace_of_alias(index))
-        .unwrap_or(AssetNamespace::Iw4);
+    let Some(ns) = bank
+        .index_unique(alias)
+        .and_then(|index| bank.namespace_of_alias(index))
+    else {
+        return;
+    };
     request_named(clips, bank, ns, alias, set);
 }
 
@@ -497,19 +474,22 @@ fn request_weapon_aliases(
     set: &mut MatchRequests,
 ) -> usize {
     let sounds = registry.sounds_of(weapon);
-    let ns = registry.namespace_of(weapon).unwrap_or(AssetNamespace::Iw4);
     let mut n = 0usize;
     if let Some(aliases) = sounds {
         for alias in aliases.reachable_aliases() {
             n += 1;
-            request_named(clips, bank, ns, alias, set);
+            if let Some(ns) = registry.sound_namespace_for(weapon, alias) {
+                request_named(clips, bank, ns, alias, set);
+            }
         }
     }
     let mut seen = HashSet::new();
     for alias in registry.notetrack_sound_aliases_of(weapon) {
         if seen.insert(alias) {
             n += 1;
-            request_named(clips, bank, ns, alias, set);
+            if let Some(ns) = registry.sound_namespace_for(weapon, alias) {
+                request_named(clips, bank, ns, alias, set);
+            }
         }
     }
     n

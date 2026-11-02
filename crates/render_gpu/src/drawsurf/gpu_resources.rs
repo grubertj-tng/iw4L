@@ -6,7 +6,7 @@ use bevy::render::render_resource::{
     AddressMode, Buffer, FilterMode, MipmapFilterMode, SamplerDescriptor, TextureView,
     TextureViewDimension, TextureViewId,
 };
-use bevy::render::renderer::RenderQueue;
+use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::texture::GpuImage;
 use d3d9_state::{
     AddressMode as D3dAddressMode, DecodedSamplerState, SamplerDecodeError, TextureFilter,
@@ -35,7 +35,7 @@ pub struct ColourWorkingSet {
 
 #[derive(Resource, Debug, Default, Clone, Copy)]
 pub struct WorldPipelineWarmup {
-    pub generation: frame::WorldGeneration,
+    pub generation: frame::WorldStamp,
     pub initialized: bool,
     pub total: u32,
     pub ready: u32,
@@ -43,7 +43,7 @@ pub struct WorldPipelineWarmup {
 
 #[derive(Resource, Clone, Debug, Default)]
 pub struct GpuSubmitReady {
-    pub world_generation: frame::WorldGeneration,
+    pub world_generation: frame::WorldStamp,
 
     pub warm_pipelines: bool,
 
@@ -130,9 +130,11 @@ pub struct UploadedTextureView {
     pub dimension: TextureViewDimension,
 }
 
-#[derive(Resource, Clone, Debug, Default)]
+#[derive(Resource, Clone, Default)]
 pub struct RuntimeUploadedImageRegistry {
     source_handles: Option<RuntimeImageHandles>,
+    device: Option<RenderDevice>,
+    pub device_generation: u64,
     slot_index: UploadedSlotIndex,
     pending: UploadedPending,
     pub generation_id: MaterialGenerationId,
@@ -269,17 +271,44 @@ struct UploadedRefreshSlots {
 }
 
 pub(crate) fn prepare_uploaded_image_registry(
+    device: Res<RenderDevice>,
     handles: Option<Res<ExtractedRuntimeImageHandles>>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     extracted: Option<Res<ExtractedAssets<GpuImage>>>,
     mut registry: ResMut<RuntimeUploadedImageRegistry>,
 ) {
+    if registry
+        .device
+        .as_ref()
+        .is_none_or(|previous| previous.wgpu_device() != device.wgpu_device())
+    {
+        let generation = registry
+            .device_generation
+            .checked_add(1)
+            .expect("image device generation exhausted");
+        let views = registry
+            .views_revision
+            .checked_add(1)
+            .expect("image view revision exhausted");
+        let replaced = registry
+            .replaced_revision
+            .checked_add(1)
+            .expect("image allocation revision exhausted");
+        *registry = RuntimeUploadedImageRegistry::default();
+        registry.device = Some(device.clone());
+        registry.device_generation = generation;
+        registry.views_revision = views;
+        registry.replaced_revision = replaced;
+    }
     let Some(handles) = handles else {
         if registry.source_handles.is_none() {
             return;
         }
         let (views, replaced) = (registry.views_revision, registry.replaced_revision);
+        let generation = registry.device_generation;
         *registry = RuntimeUploadedImageRegistry::default();
+        registry.device = Some(device.clone());
+        registry.device_generation = generation;
         registry.views_revision = views.wrapping_add(1);
         registry.replaced_revision = replaced.wrapping_add(1);
         return;
@@ -846,7 +875,7 @@ fn log_uploaded_probe_once(
     let Some(gpu) = gpu_images.get(handle) else {
         return;
     };
-    diag::warn!(
+    diag::info!(
         World,
         "probe cube[{index}] uploaded {}x{} layers={} mips={} format={:?} had_data={} view_dim={:?} view_mips={:?}",
         gpu.texture_descriptor.size.width,

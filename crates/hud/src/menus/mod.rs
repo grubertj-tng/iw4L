@@ -7,22 +7,55 @@ use runtime::Runner;
 use state::OpenMenu;
 pub use state::ScriptMenus;
 
+#[derive(bevy::prelude::Resource, Default)]
+pub struct FrontendMenus {
+    menus: ScriptMenus,
+    restore_lobby: bool,
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct MenuState<'w> {
+    scoped: Option<bevy::prelude::Res<'w, ScriptMenus>>,
+    frontend: Option<bevy::prelude::Res<'w, FrontendMenus>>,
+}
+impl MenuState<'_> {
+    pub fn as_ref(&self) -> Option<&ScriptMenus> {
+        self.scoped
+            .as_deref()
+            .or_else(|| self.frontend.as_deref().map(|menus| &menus.menus))
+    }
+    pub fn as_deref(&self) -> Option<&ScriptMenus> {
+        self.as_ref()
+    }
+    pub fn is_some(&self) -> bool {
+        self.as_ref().is_some()
+    }
+    pub fn is_some_and(&self, predicate: impl FnOnce(&ScriptMenus) -> bool) -> bool {
+        self.as_ref().is_some_and(predicate)
+    }
+    pub fn open_names(&self) -> Vec<String> {
+        self.as_ref().map_or_else(Vec::new, ScriptMenus::open_names)
+    }
+    pub fn focused_item(&self) -> Option<(&str, usize)> {
+        self.as_ref().and_then(ScriptMenus::focused_item)
+    }
+}
+
 use std::collections::HashMap;
 
 use asset_game::{MenuCatalog, MenuDef, SessionTeamSettings};
 use assets::PreparedLocalizedStrings;
 use bevy::prelude::*;
 use bevy::ui::FocusPolicy;
-use frame::{
-    AppScreen, MatchTornDown, RuntimeRole, UiExecCommand, UiMenuKey, UiMenuRequest, UiPlaySound,
-};
+use frame::{AppScreen, RuntimeRole, UiExecCommand, UiMenuKey, UiMenuRequest, UiPlaySound};
 use net::{
     ActionRequestIds, ClientActionInbox, ClientActionInput, LocalPresentClient, PresentedSnapshot,
 };
 
 use crate::chrome::{
-    ChromeAssets, ChromeFrame, ChromeGapKind, ChromeMenuAnim, MenuVisOnError, OwnerDrawArgs,
-    OwnerDrawPaint, execute_chrome_menu_ex, item_screen_rects, push_owner_pic,
+    ChromeAssets, ChromeFrame, ChromeGapKind, ChromeItemOverride, ChromeMenuAnim,
+    ChromeMenuOverrides, MenuVisOnError, OwnerDrawArgs, OwnerDrawPaint,
+    execute_chrome_menu_overrides, item_screen_rects, push_owner_pic,
 };
 use crate::draw2d::{Draw2dList, Draw2dOp, tessellate_fonts};
 use crate::expr_cache::MenuExprCache;
@@ -60,26 +93,76 @@ pub(super) fn choice_index(choices: &[(String, String)], value: &str) -> Option<
     })
 }
 
-fn painted_def(def: &MenuDef, open: &OpenMenu) -> MenuDef {
-    let (mut out, _) = crate::killcam_skip::inherit_shared_vis(def);
-    for (item, state) in out.items.iter_mut().zip(&open.items) {
-        if state.hidden {
-            item.vis_exp = String::from("0");
-        }
-        if let Some(color) = state.fore {
-            item.fore_color = color;
-        }
-        if let Some(color) = state.back {
-            item.back_color = color;
-        }
+fn item_overrides(def: &MenuDef, open: &OpenMenu) -> Vec<ChromeItemOverride> {
+    def.items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let state = open.items.get(index);
+            ChromeItemOverride {
+                hidden: state.is_some_and(|state| state.hidden),
+                fore: if open.focus == Some(index)
+                    && (!item.text_key.is_empty() || !item.text_exp.is_empty())
+                {
+                    def.focus_color
+                        .filter(|color| color[3] > 0.0)
+                        .or(state.and_then(|state| state.fore))
+                } else {
+                    state.and_then(|state| state.fore)
+                },
+                back: state.and_then(|state| state.back),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+fn custom_class_slot(item: &asset_game::MenuItem) -> Option<usize> {
+    fn response(events: &[asset_game::MenuEvent]) -> Option<usize> {
+        events.iter().find_map(|event| match event {
+            asset_game::MenuEvent::Script(text) => {
+                script::parse(text).into_iter().find_map(|cmd| {
+                    let script::Command::ScriptMenuResponse(value) = cmd else {
+                        return None;
+                    };
+                    value
+                        .strip_prefix("custom")?
+                        .parse::<usize>()
+                        .ok()?
+                        .checked_sub(1)
+                        .filter(|&slot| slot < sim::match_state::PERSONAL_CLASS_SLOTS)
+                })
+            }
+            asset_game::MenuEvent::If { then, .. } | asset_game::MenuEvent::Else(then) => {
+                response(then)
+            }
+            _ => None,
+        })
     }
-    if let Some(color) = def.focus_color.filter(|color| color[3] > 0.0)
-        && let Some(item) = open.focus.and_then(|index| out.items.get_mut(index))
-        && (!item.text_key.is_empty() || !item.text_exp.is_empty())
+    response(&item.handlers.action).or_else(|| response(&item.handlers.accept))
+}
+
+fn class_unavailable<'a>(
+    menu: &str,
+    item: &asset_game::MenuItem,
+    dvars: &'a frame::UiMenuDvars,
+) -> Option<&'a str> {
+    let key = if menu.eq_ignore_ascii_case("class_picker") || menu.eq_ignore_ascii_case("class_samples_picker") {
+        let slot = item.name.strip_prefix("choice_")?.parse::<usize>().ok()?;
+        format!("ui_class_choice_unavailable_{slot}")
+    } else if menu.eq_ignore_ascii_case("iw4l_main") && item.name == "classes"
+        || menu.eq_ignore_ascii_case("game_lobby") && item.handlers.action.iter().any(|event| {
+            matches!(event, asset_game::MenuEvent::Script(text) if text.contains("ui_class_setup"))
+        })
     {
-        item.fore_color = color;
-    }
-    out
+        "ui_class_feature_lock".to_owned()
+    } else if menu.to_ascii_lowercase().starts_with("changeclass") {
+        let slot = custom_class_slot(item)?;
+        format!("ui_class_unavailable_{slot}")
+    } else {
+        return None;
+    };
+    dvars.get(&key).filter(|reason| !reason.is_empty())
 }
 
 #[derive(Component)]
@@ -103,6 +186,7 @@ pub(crate) fn spawn_script_menus(root: &mut ChildSpawnerCommands) {
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct MenuInputs<'w, 's> {
     keys: Res<'w, ButtonInput<KeyCode>>,
+    overlay: Res<'w, frame::UiOverlayInput>,
     keyboard: MessageReader<'w, 's, bevy::input::keyboard::KeyboardInput>,
     mouse: Res<'w, ButtonInput<MouseButton>>,
     windows: Query<'w, 's, &'static Window, With<bevy::window::PrimaryWindow>>,
@@ -115,6 +199,7 @@ pub(crate) struct MenuInputs<'w, 's> {
     compass: Option<Res<'w, assets::SessionCompass>>,
     party: Res<'w, frame::UiPartyState>,
     frontend_strings: Option<Res<'w, asset_game::LocalizeCatalog>>,
+    player_data: Option<Res<'w, sim::LocalPlayerData>>,
 }
 
 #[derive(Default)]
@@ -155,21 +240,43 @@ pub(crate) fn update_script_menus(
     local: Res<LocalPresentClient>,
     role: Option<Res<RuntimeRole>>,
     mut input: MenuInputs,
-    mut torn: MessageReader<MatchTornDown>,
-    mut menus: ResMut<ScriptMenus>,
-    mut locals: ResMut<UiLocalVars>,
+    mut transitions: MessageReader<StateTransitionEvent<frame::MatchScope>>,
+    mut menu_states: (Option<ResMut<ScriptMenus>>, ResMut<FrontendMenus>),
+    mut local_states: (
+        Option<ResMut<UiLocalVars>>,
+        ResMut<crate::playercard::FrontendLocalVars>,
+    ),
     mut exprs: ResMut<MenuExprCache>,
     mut out: MenuOutputs,
     mut hud_images: ResMut<HudImages>,
     mut images: ResMut<Assets<Image>>,
     mut pass: ResMut<HudTessPass>,
 ) {
+    let requests: Vec<UiMenuRequest> = input.requests.read().cloned().collect();
+    let FrontendMenus {
+        menus: frontend_menus,
+        restore_lobby,
+    } = &mut *menu_states.1;
+    for request in &requests {
+        match request {
+            UiMenuRequest::RestoreLobby => *restore_lobby = true,
+            UiMenuRequest::Close(name) if name == "game_lobby" => *restore_lobby = false,
+            _ => {}
+        }
+    }
+    let mut menus = menu_states.0.as_deref_mut().unwrap_or(frontend_menus);
+    let mut locals = local_states
+        .0
+        .as_deref_mut()
+        .unwrap_or(&mut local_states.1.0);
     pass.script_menus = TessJob::Hide;
-    if torn.read().count() > 0 {
+    if transitions
+        .read()
+        .any(|event| event.exited == Some(frame::MatchScope::Live))
+    {
         out.binding.command = None;
         *menus = ScriptMenus::default();
     }
-    let requests: Vec<UiMenuRequest> = input.requests.read().cloned().collect();
     let Some(catalog) = catalog.as_deref() else {
         return;
     };
@@ -190,6 +297,7 @@ pub(crate) fn update_script_menus(
         }
         return;
     }
+    menus.reconcile(catalog);
     let screen_changed = menus.screen.map(|s| s == AppScreen::MainMenu) != Some(frontend);
     if screen_changed {
         out.binding.command = None;
@@ -205,6 +313,7 @@ pub(crate) fn update_script_menus(
         input.frontend_strings.as_deref()
     };
     let world = MenuWorld {
+        player_data: input.player_data.as_deref(),
         ms: crate::scorebar::milliseconds() as i32,
         in_game,
         party: &input.party,
@@ -229,7 +338,7 @@ pub(crate) fn update_script_menus(
                 .as_ref()
                 .is_some_and(|a| a.client.kb.scores.active),
         classes: input.classes.as_deref(),
-        weapons: input.weapons.as_ref().map(|w| w.0.as_ref()),
+        weapons: input.weapons.as_ref().map(|w| w.registry().as_ref()),
         emp_jammed: in_game
             && presented
                 .player(local.0)
@@ -252,14 +361,23 @@ pub(crate) fn update_script_menus(
         binding: &mut out.binding,
     };
 
+    let main_menu = "iw4l_main";
     if frontend && screen_changed {
-        runner.open("iw4l_main");
+        runner.open(main_menu);
         if let Some(def) = catalog.get("main")
             && !def.sound_name.is_empty()
         {
             out.music.write(frame::UiPlayMusic {
                 alias: def.sound_name.clone(),
             });
+        }
+    }
+
+    if frontend && *restore_lobby {
+        *restore_lobby = false;
+        if input.party.in_lobby && input.party.is_host {
+            runner.open("game_lobby");
+            diag::info!(Ui, "frontend: private lobby reopened");
         }
     }
 
@@ -288,6 +406,7 @@ pub(crate) fn update_script_menus(
     for request in requests {
         match request {
             UiMenuRequest::Toggle => pressed.escape = true,
+            UiMenuRequest::RestoreLobby => {}
             UiMenuRequest::Open(name) => runner.open(&name),
             UiMenuRequest::Close(name) => runner.close(&name),
             UiMenuRequest::Focus { menu, item } => {
@@ -321,7 +440,7 @@ pub(crate) fn update_script_menus(
     if frontend && runner.dvars.get("ui_map_error") == Some("1") {
         runner.open("iw4l_map_error");
     }
-    let pointer = !console_open;
+    let pointer = !console_open && !input.overlay.0;
     if pointer {
         let keys = &input.keys;
         pressed.escape |= keys.just_pressed(KeyCode::Escape);
@@ -363,20 +482,25 @@ pub(crate) fn update_script_menus(
         }
     }
 
+    if input.overlay.0 && in_game {
+        return;
+    }
+
     let scoreboard = snapshot
         .filter(|s| in_game && crate::scoreboard::displayed(world.scores_open, s, local.0))
         .and_then(|_| catalog.get(SCOREBOARD_MENU));
     if (menus.stack.is_empty() && scoreboard.is_none()) || !surface.is_ready() {
         return;
     }
-    let open_names = menus.open_names();
     let mut list = Draw2dList::default();
     let mut reported = std::mem::take(&mut menus.reported);
-    let mut layers: Vec<(String, std::borrow::Cow<MenuDef>, Option<[f32; 4]>)> = Vec::new();
+    let mut layers = Vec::new();
     if let Some(def) = scoreboard {
         layers.push((
             SCOREBOARD_MENU.to_owned(),
-            std::borrow::Cow::Borrowed(def),
+            def,
+            Vec::new(),
+            Vec::new(),
             None,
         ));
     }
@@ -393,31 +517,41 @@ pub(crate) fn update_script_menus(
         let Some(def) = catalog.get(&open.name) else {
             continue;
         };
-        let mut painted = painted_def(def, open);
+        let mut overrides = item_overrides(def, open);
         let mut slider_parts = Vec::new();
-        for item in &mut painted.items {
-            if item.item_type == 14 && !item.dvar.is_empty() {
-                item.text_key = out
-                    .dvars
-                    .get(&format!("ui_bind_{}", item.dvar))
-                    .unwrap_or("UNBOUND")
-                    .to_owned();
-                if out.binding.command.as_deref() == Some(item.dvar.as_str()) {
-                    item.text_key = "... (ESC)".to_owned();
+        for (index, (item, state)) in def.items.iter().zip(&mut overrides).enumerate() {
+            if let Some(reason) = class_unavailable(&open.name, item, &out.dvars) {
+                if let Some(slot) = custom_class_slot(item) {
+                    let name = world
+                        .classes
+                        .and_then(|classes| classes.slots.get(slot))
+                        .map_or("Class", |class| class.name.as_str());
+                    state.text = Some(format!("{name} — {reason}"));
+                    state.text_literal = Some(true);
                 }
-                item.text_literal = true;
-                item.text_exp.clear();
-                item.text_align_mode = 10;
-                item.text_align_x = -8.0;
-                item.text_align_y = 0.0;
+                state.fore = Some([0.5, 0.5, 0.5, 1.0]);
+            }
+            if item.item_type == 14 && !item.dvar.is_empty() {
+                state.text = Some(
+                    out.dvars
+                        .get(&format!("ui_bind_{}", item.dvar))
+                        .unwrap_or("UNBOUND")
+                        .to_owned(),
+                );
+                if out.binding.command.as_deref() == Some(item.dvar.as_str()) {
+                    state.text = Some("... (ESC)".to_owned());
+                }
+                state.text_literal = Some(true);
+
+                state.text_align = Some((10, -8.0, 0.0));
             }
             if item.item_type == 4 && !item.dvar.is_empty() {
-                item.text_key = out.dvars.get(&item.dvar).unwrap_or("").to_owned();
+                state.text = Some(out.dvars.get(&item.dvar).unwrap_or("").to_owned());
                 if item.edit_field.as_ref().is_some_and(|field| field.masked) {
-                    item.text_key = "*".repeat(item.text_key.chars().count());
+                    state.text =
+                        Some("*".repeat(state.text.as_deref().unwrap_or("").chars().count()));
                 }
-                item.text_literal = true;
-                item.text_exp.clear();
+                state.text_literal = Some(true);
             }
             if let Some(slider) = &item.slider {
                 let value = out
@@ -436,55 +570,62 @@ pub(crate) fn update_script_menus(
                         [1.0, 1.0, 1.0, 1.0],
                     ),
                 ] {
-                    let mut part = item.clone();
-                    part.slider = None;
-                    part.dvar.clear();
-                    part.text_key.clear();
-                    part.text_exp.clear();
-                    part.item_type = 0;
-                    part.static_flags |= WINDOW_DECORATION;
-                    part.style = 1;
-                    part.background = "white".into();
-                    part.back_color = color;
-                    part.rect.x += x;
-                    part.rect.y += y;
-                    part.rect.w = w;
-                    part.rect.h = h;
-                    slider_parts.push(part);
+                    let mut rect = item.rect;
+                    rect.x += x;
+                    rect.y += y;
+                    rect.w = w;
+                    rect.h = h;
+                    slider_parts.push((
+                        index,
+                        ChromeItemOverride {
+                            hidden: state.hidden,
+                            fore: state.fore,
+                            back: Some(color),
+                            text: Some(String::new()),
+                            rect: Some(rect),
+                            style: Some(1),
+                            background: Some("white"),
+                            ..Default::default()
+                        },
+                    ));
                 }
-                let mut label = item.clone();
-                label.slider = None;
-                label.dvar.clear();
-                label.item_type = 0;
-                label.static_flags |= WINDOW_DECORATION;
-                label.background.clear();
-                label.back_color = [0.0; 4];
-                label.text_exp.clear();
-                label.text_literal = true;
                 let displayed = slider
                     .display_range
                     .map_or(value, |[min, max]| min + fraction * (max - min));
                 let decimals = usize::from(slider.decimals.min(6));
-                label.text_key = format!("{displayed:.decimals$}{}", slider.suffix);
-                label.rect.x += item.rect.w + 8.0;
-                label.rect.w = 36.0;
-                slider_parts.push(label);
-                item.background.clear();
-                item.text_key.clear();
-                item.text_exp.clear();
+                let mut rect = item.rect;
+                rect.x += item.rect.w + 8.0;
+                rect.w = 36.0;
+                slider_parts.push((
+                    index,
+                    ChromeItemOverride {
+                        hidden: state.hidden,
+                        fore: state.fore,
+                        back: Some([0.0; 4]),
+                        text: Some(format!("{displayed:.decimals$}{}", slider.suffix)),
+                        text_literal: Some(true),
+                        rect: Some(rect),
+                        background: Some(""),
+                        ..Default::default()
+                    },
+                ));
+                state.background = Some("");
+                state.text = Some(String::new());
             }
-            if !item.choices.is_empty() {
+            let choices = out.dvars.choices(&item.dvar).unwrap_or(&item.choices);
+            if !choices.is_empty() {
                 let value = out.dvars.get(&item.dvar).unwrap_or_default();
-                item.text_key = choice_index(&item.choices, value)
-                    .map(|at| item.choices[at].0.clone())
-                    .unwrap_or_else(|| value.to_owned());
-                item.text_exp.clear();
+                state.text = Some(
+                    choice_index(choices, value)
+                        .map(|at| choices[at].0.clone())
+                        .unwrap_or_else(|| value.to_owned()),
+                );
             }
         }
-        painted.items.extend(slider_parts);
         if let Some(edit) = &menus.editing
             && edit.menu == open.name
-            && let Some(item) = painted.items.get_mut(edit.item)
+            && let Some(item) = def.items.get(edit.item)
+            && let Some(state) = overrides.get_mut(edit.item)
         {
             let mut text = if item.edit_field.as_ref().is_some_and(|field| field.masked) {
                 vec!['*'; edit.buffer.len()]
@@ -492,36 +633,32 @@ pub(crate) fn update_script_menus(
                 edit.buffer.clone()
             };
             text.insert(edit.cursor.min(text.len()), '|');
-            item.text_key = text.into_iter().collect();
-            item.text_exp.clear();
+            state.text = Some(text.into_iter().collect());
         }
-        let focus_rect = open.focus.and_then(|i| painted.items.get(i)).map(item_rect);
-        layers.push((
-            open.name.clone(),
-            std::borrow::Cow::Owned(painted),
-            focus_rect,
-        ));
+        let focus_rect = open.focus.and_then(|i| def.items.get(i)).map(item_rect);
+        layers.push((open.name.clone(), def, overrides, slider_parts, focus_rect));
     }
-    for (name, painted, focus_rect) in &layers {
+    for (name, def, overrides, extra_items, focus_rect) in &layers {
         let host = MenuHost {
             world: &world,
             dvars: &out.dvars,
-            menu: painted,
+            menu: def,
             locals: &locals,
-            open: &open_names,
+            open: &menus.stack,
             focus_rect: *focus_rect,
         };
         let mut owner_draw = |args: OwnerDrawArgs<'_>, frame: &mut ChromeFrame| {
             if args.item.owner_draw == 181 {
-                if let Some(image) = input
-                    .compass
-                    .as_ref()
-                    .and_then(|c| c.declaration.image.as_ref())
+                if let Some(map_namespace) = hud_images.map_namespace()
+                    && let Some(image) = input
+                        .compass
+                        .as_ref()
+                        .and_then(|c| c.declaration.image.as_ref())
                 {
                     push_owner_pic(
                         &args,
                         image.clone(),
-                        hud_images.map_namespace(),
+                        map_namespace,
                         args.color,
                         Draw2dOp::StretchPic,
                         frame,
@@ -531,8 +668,8 @@ pub(crate) fn update_script_menus(
             }
             OwnerDrawPaint::Gap(ChromeGapKind::OwnerDraw)
         };
-        let frame = execute_chrome_menu_ex(
-            painted,
+        let frame = execute_chrome_menu_overrides(
+            def,
             &host,
             &surface,
             ChromeAssets {
@@ -543,6 +680,11 @@ pub(crate) fn update_script_menus(
             &mut exprs,
             MenuVisOnError::PaintAnyway,
             Some(&mut owner_draw),
+            ChromeMenuOverrides {
+                items: overrides,
+                extra_items,
+                skip: None,
+            },
         );
         if frame.coverage.typed_gap > 0 && !reported.contains(name) {
             reported.insert(name.clone());
@@ -551,7 +693,12 @@ pub(crate) fn update_script_menus(
                 .gap_ids
                 .iter()
                 .map(|(index, kind)| {
-                    let item = &painted.items[*index];
+                    let source = if *index < def.items.len() {
+                        *index
+                    } else {
+                        extra_items[*index - def.items.len()].0
+                    };
+                    let item = &def.items[source];
                     let error = frame
                         .vis_errors
                         .iter()
@@ -570,7 +717,7 @@ pub(crate) fn update_script_menus(
                 "menu {}: {} of {} items not painted: {}",
                 name,
                 gaps.len(),
-                painted.items.len(),
+                def.items.len() + extra_items.len(),
                 gaps.join(" ")
             );
         }
@@ -734,20 +881,15 @@ fn handle_input(
     let Some(def) = runner.catalog.get(&top) else {
         return;
     };
-    let Some(open) = runner.menus.input_menu() else {
-        return;
-    };
-    let painted = painted_def(def, open);
-    let names = runner.menus.open_names();
     let host = MenuHost {
         world: runner.world,
         dvars: runner.dvars,
-        menu: &painted,
+        menu: def,
         locals: runner.locals,
-        open: &names,
+        open: &runner.menus.stack,
         focus_rect: None,
     };
-    let rects = item_screen_rects(&painted, &host, surface, runner.exprs);
+    let rects = item_screen_rects(def, &host, surface, runner.exprs);
     let visible = runner.visible_items(&top);
     if let Some((menu, index)) = runner.menus.slider_drag.clone() {
         if menu == top && input.mouse.pressed(MouseButton::Left) {
@@ -788,6 +930,20 @@ fn flush_outputs(menus: &mut ScriptMenus, out: &mut MenuOutputs, local: sim::Cli
         diag::info!(Ui, "menu exec: {text}");
         out.exec.write(UiExecCommand { text });
     }
+    let private_host = out.dvars.get("ui_lobby_host") == Some("1")
+        && out.dvars.get("ui_lobby_public") != Some("1");
+    menus.responses.retain(|(menu, response)| {
+        let end_game = menu.eq_ignore_ascii_case("popup_endgame")
+            || menu.eq_ignore_ascii_case("popup_endgame_ranked");
+        if !end_game || !response.eq_ignore_ascii_case("endround") || private_host {
+            return true;
+        }
+        diag::info!(Ui, "menu exec: disconnect");
+        out.exec.write(UiExecCommand {
+            text: "disconnect".into(),
+        });
+        false
+    });
     let (Some(inbox), Some(ids)) = (out.inbox.as_mut(), out.ids.as_mut()) else {
         menus.responses.clear();
         return;

@@ -98,6 +98,9 @@ fn leak(rel: &str) -> Option<&'static str> {
     {
         return Some("key or certificate material");
     }
+    if ext == "iw4l-server" {
+        return Some("operator server descriptor");
+    }
     // A piece of somebody's game install. IW4L reads these; it never ships one.
     if matches!(
         ext,
@@ -406,6 +409,43 @@ fn scan_line(line: &str) -> Option<String> {
     None
 }
 
+fn public_ipv4(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() {
+        if !bytes[start].is_ascii_digit()
+            || (start > 0 && (bytes[start - 1].is_ascii_digit() || bytes[start - 1] == b'.'))
+        {
+            start += 1;
+            continue;
+        }
+        let end = bytes[start..]
+            .iter()
+            .position(|b| !b.is_ascii_digit() && *b != b'.')
+            .map_or(bytes.len(), |n| start + n);
+        let token = &line[start..end];
+        start = end;
+        let octets: Vec<u8> = token
+            .split('.')
+            .filter_map(|part| (part.len() <= 3).then(|| part.parse().ok()).flatten())
+            .collect();
+        if token.split('.').count() != 4 || octets.len() != 4 {
+            continue;
+        }
+        let private = match octets[..] {
+            [0 | 10 | 127, ..] => true,
+            [169, 254, ..] | [192, 168, ..] => true,
+            [172, b, ..] => (16..32).contains(&b),
+            [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _] => true,
+            _ => false,
+        };
+        if !private {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
 /// Git's own rule: a NUL in the head of the file means binary. Such a file has
 /// no lines to scan — the offset scan skips it, and what a binary could be
 /// hiding is caught by `leak` on its path instead.
@@ -413,12 +453,79 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8000).any(|b| *b == 0)
 }
 
+fn scoped_contracts(root: &Path, paths: &[PathBuf]) -> Res<Vec<String>> {
+    let mut sources = Vec::new();
+    let mut types = std::collections::BTreeSet::new();
+    for path in paths.iter().filter(|path| {
+        path.extension().is_some_and(|ext| ext == "rs") && path.starts_with("crates")
+    }) {
+        let text = std::fs::read_to_string(root.join(path))
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        for spelling in [".scoped::<", ".staged::<"] {
+            for tail in text.split(spelling).skip(1) {
+                if let Some((name, _)) = tail.split_once('>') {
+                    types.insert(name.rsplit("::").next().unwrap_or(name).trim().to_owned());
+                }
+            }
+        }
+        sources.push((path, text));
+    }
+    let mut findings = Vec::new();
+    for (path, text) in sources {
+        if path == Path::new("crates/frame/src/scope.rs")
+            || path == Path::new("crates/net/src/role_matrix.rs")
+        {
+            continue;
+        }
+        for (index, line) in text.lines().enumerate() {
+            let compact = line.split_whitespace().collect::<String>();
+            let legacy = [
+                "MatchTornDown",
+                "ReturnedToMenu",
+                "HasWorld",
+                "frame::lifetime",
+            ]
+            .iter()
+            .any(|name| compact.contains(name));
+            let bypass = types.iter().any(|name| {
+                compact.contains(&format!(".init_resource::<{name}>"))
+                    || compact.contains(&format!(".insert_resource({name}{{"))
+                    || compact.contains(&format!(".insert_resource({name}::"))
+                    || compact.contains(&format!("If<Res<{name}>"))
+                    || compact.contains(&format!("If<ResMut<{name}>"))
+            });
+            let state_writer = path != Path::new("crates/session/src/scope_control.rs")
+                && [
+                    "NextState<MatchScope>",
+                    "NextState<frame::MatchScope>",
+                    "NextState<RoundPhase>",
+                    "NextState<frame::RoundPhase>",
+                ]
+                .iter()
+                .any(|name| compact.contains(name));
+            if legacy || bypass || state_writer {
+                findings.push(format!(
+                    "{}:{}: scoped lifetime bypass",
+                    path.display(),
+                    index + 1
+                ));
+            }
+        }
+    }
+    Ok(findings)
+}
+
 pub fn run_cli(root: &Path) -> Res<()> {
     let mut leaks = Vec::new();
     let mut offsets = Vec::new();
     let mut tests = Vec::new();
+    let paths: Vec<_> = tracked(root)?
+        .into_iter()
+        .filter(|path| root.join(path).exists())
+        .collect();
+    let mut contracts = scoped_contracts(root, &paths)?;
     let mut scanned = 0usize;
-    for path in tracked(root)? {
+    for path in paths {
         let rel = path.to_string_lossy().replace('\\', "/");
         // The leak scan runs on every tracked path, exemptions included: a file
         // is exempt from being read for offsets, never from being here at all.
@@ -439,6 +546,16 @@ pub fn run_cli(root: &Path) -> Res<()> {
         }
         // Not every text file is valid UTF-8; what is in one still counts.
         let text = String::from_utf8_lossy(&bytes);
+        if rel.starts_with("crates/render_anim/src/") {
+            for (line, source) in text.lines().enumerate() {
+                if source.contains(".init_resource::<") {
+                    contracts.push(format!(
+                        "{rel}:{}: animation resource must declare its lifetime",
+                        line + 1
+                    ));
+                }
+            }
+        }
         if let Some((line, what)) = stray_test(&rel, &text) {
             tests.push(Finding {
                 path: path.clone(),
@@ -464,6 +581,14 @@ pub fn run_cli(root: &Path) -> Res<()> {
         }
         scanned += 1;
         for (n, line) in text.lines().enumerate() {
+            if let Some(address) = public_ipv4(line) {
+                leaks.push(Finding {
+                    path: path.clone(),
+                    line: n + 1,
+                    what: format!("public IPv4 address {address}"),
+                    text: "(address)".to_string(),
+                });
+            }
             if let Some(what) = scan_line(line) {
                 offsets.push(Finding {
                     path: path.clone(),
@@ -482,6 +607,9 @@ pub fn run_cli(root: &Path) -> Res<()> {
             finding.what,
             finding.text
         );
+    }
+    if !contracts.is_empty() {
+        return Err(contracts.join("\n"));
     }
     if !leaks.is_empty() {
         return Err(format!(

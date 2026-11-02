@@ -5,9 +5,8 @@ pub use render_frame::code_math::{
     float4_bits,
 };
 
-use super::frame_products::MaterialFrameInputs;
+use super::frame_products::{MaterialFrameInputs, MaterialGeneration};
 use super::material_runtime::{RuntimeCodeSources, RuntimeImageId};
-use crate::prepare::scene::camera::FpvLens;
 use crate::prepare::scene::model_lighting_atlas::WorldModelLightingAtlas;
 use crate::prepare::scene::view_parms::PreparedSceneView;
 use hud_iw4::{GfxCmdBufSource2d, begin_view, gfx_scene_def_float_time};
@@ -101,6 +100,8 @@ pub const CODE_TEXTURE_OUTDOOR: u32 = 0x0e;
 pub const CODE_TEXTURE_OUTDOOR_SAMPLER: u8 = 0x62;
 
 pub const CODE_DEPTH_FROM_CLIP: u16 = 0x49;
+
+pub const CODE_ZNEAR: u16 = 0x21;
 
 pub const R_ZNEAR_DEPTHHACK: f32 = hud_iw4::R_ZNEAR_DEPTHHACK_DEFAULT;
 
@@ -454,6 +455,7 @@ pub fn produce_game_time(sources: &mut RuntimeCodeSources, game_time: f32) {
 
 pub(crate) fn update_command_context_code_sources(
     mut runtime: ResMut<MaterialFrameInputs>,
+    generation: Res<MaterialGeneration>,
     fog: Option<Res<MapFrameFog>>,
     fog_dvars: Res<super::fog::FogDvars>,
     mut dfog: ResMut<super::DrawMethodDfog>,
@@ -464,7 +466,7 @@ pub(crate) fn update_command_context_code_sources(
     lighting: Option<Res<WorldModelLightingAtlas>>,
     cg_clock: Option<Res<FrameClock>>,
     prepared: Res<PreparedSceneView>,
-    cameras: Query<&Camera, With<FpvLens>>,
+    sun_shadow: Res<render_scene::PreparedSunShadowFrame>,
     scene: Option<Res<crate::prepare::scene::world::WorldScene>>,
 ) {
     if !prepared.ready {
@@ -530,47 +532,35 @@ pub(crate) fn update_command_context_code_sources(
         Err(CommandContextRefusal::PrimaryLightNotDir) => {}
         Err(CommandContextRefusal::ViewportHasZeroRenderTarget) => {}
     }
-    if let Ok(camera) = cameras.single()
-        && let (Some(rt), Some(vp)) = (
-            camera.physical_target_size(),
-            camera.physical_viewport_rect(),
-        )
-    {
-        let size = vp.size();
-        if let (Ok(rt_w), Ok(rt_h), Ok(x), Ok(y), Ok(w), Ok(h)) = (
-            i32::try_from(rt.x),
-            i32::try_from(rt.y),
-            i32::try_from(vp.min.x),
-            i32::try_from(vp.min.y),
-            i32::try_from(size.x),
-            i32::try_from(size.y),
-        ) {
-            let _ = produce_update_viewport(
-                &mut mat_frame.code_sources,
-                rt_w,
-                rt_h,
-                GfxViewport {
-                    x,
-                    y,
-                    width: w,
-                    height: h,
-                },
-            );
-        }
-    }
+    // Use the same prepared viewport as the draw commands. Bevy's camera target
+    // metadata may not be available yet on the first frame after a map change.
+    let vp = prepared.scene_viewport;
+    let _ = produce_update_viewport(
+        &mut mat_frame.code_sources,
+        prepared.rt_w,
+        prepared.rt_h,
+        GfxViewport {
+            x: vp.x,
+            y: vp.y,
+            width: vp.width,
+            height: vp.height,
+        },
+    );
+    mat_frame
+        .code_sources
+        .set_constant_rows(CODE_ZNEAR, &[float4_bits([prepared.near, 0.0, 0.0, 0.0])]);
     if let Some(light) = dir_light.as_deref() {
         let _ = produce_dir_primary_light(&mut mat_frame.code_sources, light);
     }
     if let Some(scene) = scene.as_deref() {
-        let generation = scene.runtime_material_catalog.generation_id;
+        let catalog = &generation.catalog;
+        let generation = catalog.generation_id();
         if mat_frame
             .material_bindings
             .as_ref()
             .is_none_or(|bindings| bindings.generation_id() != generation)
         {
-            mat_frame.material_bindings = Some(asset_material::compile_material_bindings(
-                &scene.runtime_material_catalog,
-            ));
+            mat_frame.material_bindings = Some(asset_material::compile_material_bindings(catalog));
         }
         let fog = sampled_fog.as_ref().unwrap_or(&NO_FRAME_FOG);
         let inputs = asset_material::MaterialFrameBindingInputs {
@@ -580,55 +570,20 @@ pub(crate) fn update_command_context_code_sources(
             target_size: [prepared.rt_w, prepared.rt_h],
             time: float_time,
             exposure: t5_exposure.as_deref().map(|e| e.exposure),
-            exposure_stops: scene.t6_exposure,
-            model_lighting_decode_scale: asset_model::model_lighting_texel_decode_scale(
-                scene
-                    .light_grid
-                    .as_ref()
-                    .map_or(asset_model::LightGridColorEncoding::Rgb8, |grid| {
-                        grid.color_encoding
-                    }),
-            ),
-            reflection_probe_alpha_weight: f32::from(scene.light_grid.as_ref().is_some_and(
-                |grid| grid.color_encoding == asset_model::LightGridColorEncoding::T6Coefficients,
-            )),
-            sky_intensity: scene.sky_dynamic_intensity,
+            world: scene.material_world,
             tree_scatter: t5_tree_scatter.as_deref().map(|s| [s.intensity, s.amount]),
-            fog: asset_material::MaterialFogInputs {
-                color_rgb: fog.color_rgb,
-                max_opacity: fog.max_opacity,
-                halfway_dist: fog.halfway_dist,
-                start_dist: fog.start_dist,
-                volumetric: fog
-                    .volumetric
-                    .map(|v| asset_material::MaterialFogVolumeInputs {
-                        halfway_height: v.halfway_height,
-                        base_height: v.base_height,
-                        color_scale: v.color_scale,
-                    }),
-                sun: fog.sun.map(|s| asset_material::MaterialFogSunInputs {
-                    color_rgb: s.color_rgb,
-                    sun_dir: s.sun_dir,
-                    begin_angle_deg: s.begin_angle_deg,
-                    end_angle_deg: s.end_angle_deg,
-                }),
-            },
+            fog: crate::prepare::scene::world_bindings::fog(fog),
             fog_enabled: sampled_fog.is_some() && fog_dvars.enabled,
             sun: dir_light
                 .as_deref()
                 .filter(|l| l.light_type == lighting_iw4::GFX_LIGHT_TYPE_DIR)
-                .map(|l| asset_material::MaterialSunInputs {
-                    direction: l.direction,
-                    color: l.color,
-                    diffuse_color: l.t5_diffuse_color,
-                    specular_color: l.t5_specular_color,
-                }),
+                .map(crate::prepare::scene::world_bindings::sun),
         };
         mat_frame
             .material_bindings
             .as_ref()
             .expect("material bindings compiled")
-            .bind_frame(generation, &mut mat_frame.code_sources, &inputs)
+            .bind_frame(catalog, &mut mat_frame.code_sources, &inputs)
             .expect("material binding generation correlated");
     } else {
         mat_frame.material_bindings = None;
@@ -647,34 +602,9 @@ pub(crate) fn update_command_context_code_sources(
     let _ = mat_frame
         .code_sources
         .set_texture(CODE_TEXTURE_RESOLVED_POST_SUN, 0x62);
-    if let Some(light) = dir_light.as_deref() {
+    if let Some(frame) = sun_shadow.0 {
         let _ = produce_sun_shadow_code_texture(&mut mat_frame.code_sources);
-
-        if let Some(bounds) = scene.as_deref().and_then(|scene| scene.world_bounds) {
-            let world_mid = [bounds[0], bounds[1], bounds[2]];
-            let world_half = [bounds[3], bounds[4], bounds[5]];
-            let shadow_forward = super::sun_shadow_forward_from_light_dir(light.direction);
-            let world = prepared.view_from_world.inverse();
-            let forward = world.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
-            let right = world.transform_vector3(Vec3::X).normalize_or_zero();
-            let up = world.transform_vector3(Vec3::Y).normalize_or_zero();
-            let (tx, ty) = super::tan_half_fov_from_clip(clip_from_view);
-            let frame = super::forced_fallback_frame(
-                shadow_forward,
-                super::SunShadowCamera {
-                    origin: eye.to_array(),
-                    forward: forward.to_array(),
-                    right: right.to_array(),
-                    up: up.to_array(),
-                    tan_half_fov_x: tx,
-                    tan_half_fov_y: ty,
-                    z_near: prepared.near,
-                },
-                world_mid,
-                world_half,
-            );
-            produce_sun_shadow_receiver_constants(&mut mat_frame.code_sources, frame);
-            mat_frame.sun_shadow = Some(frame);
-        }
+        produce_sun_shadow_receiver_constants(&mut mat_frame.code_sources, frame);
+        mat_frame.sun_shadow = Some(frame);
     }
 }

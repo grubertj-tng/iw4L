@@ -144,6 +144,8 @@ struct Cursor {
 
 struct RenderState {
     cursors: [Cursor; PHYSICAL_VOICES],
+    buses: crate::mix_bus::MixBuses,
+    limiter: crate::mix_bus::MasterLimiter,
 }
 
 pub(crate) struct RenderShared {
@@ -151,7 +153,7 @@ pub(crate) struct RenderShared {
     rendering: AtomicBool,
     state: UnsafeCell<RenderState>,
     pub frame: AtomicU64,
-    pub match_epoch: AtomicU64,
+    pub presentation_epoch: AtomicU64,
     pub master: AtomicU32,
     pub busy_blocks: AtomicU64,
     pub device_active: AtomicBool,
@@ -187,9 +189,11 @@ impl RenderShared {
                     position: 0.0,
                     gains: [crate::media::GainEnvelope::default(); 3],
                 }; PHYSICAL_VOICES],
+                buses: Default::default(),
+                limiter: Default::default(),
             }),
             frame: AtomicU64::new(0),
-            match_epoch: AtomicU64::new(0),
+            presentation_epoch: AtomicU64::new(0),
             master: AtomicU32::new(1.0f32.to_bits()),
             busy_blocks: AtomicU64::new(0),
             device_active: AtomicBool::new(false),
@@ -224,7 +228,7 @@ impl RenderShared {
         // The lease is held until every reference to this state has expired.
         let state = unsafe { &mut *self.state.get() };
         let frame = self.frame.load(Ordering::Relaxed);
-        let epoch = self.match_epoch.load(Ordering::Acquire);
+        let epoch = self.presentation_epoch.load(Ordering::Acquire);
         let cancelled = self.cancelled.load(Ordering::Acquire);
         let hold_one_shots = device == Some(false) && self.device_required.load(Ordering::Relaxed);
         for (index, slot) in self.slots.iter().enumerate() {
@@ -241,7 +245,7 @@ impl RenderShared {
                     epoch,
                     cancelled,
                     hold_one_shots,
-                    output,
+                    state.buses.bus(assignment.media.bus),
                 );
                 match device {
                     Some(true) => {
@@ -277,15 +281,16 @@ impl RenderShared {
                 slot.phase.store(RETIRED, Ordering::Release);
             }
         }
+        state.buses.mix_into(output);
         let master = f32::from_bits(self.master.load(Ordering::Relaxed));
-        let mut peak = f32::from_bits(self.peak.load(Ordering::Relaxed));
         for sample in output.iter_mut().flatten() {
             let value = *sample * master;
-            *sample = if value.is_finite() {
-                value.clamp(-1.0, 1.0)
-            } else {
-                0.0
-            };
+            *sample = if value.is_finite() { value } else { 0.0 };
+        }
+        state.limiter.apply(output);
+        let mut peak = f32::from_bits(self.peak.load(Ordering::Relaxed));
+        for sample in output.iter_mut().flatten() {
+            *sample = sample.clamp(-1.0, 1.0);
             peak = peak.max(sample.abs());
         }
         self.peak.store(peak.to_bits(), Ordering::Relaxed);

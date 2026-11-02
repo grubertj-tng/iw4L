@@ -25,7 +25,6 @@ impl Runner<'_, '_> {
 
     pub(crate) fn eval(&mut self, menu: &str, dump: &str) -> Option<hud_iw4::Operand> {
         let def = self.catalog.get(menu)?;
-        let open = self.menus.open_names();
         let focus_rect = self
             .menus
             .stack
@@ -39,7 +38,7 @@ impl Runner<'_, '_> {
             dvars: self.dvars,
             menu: def,
             locals: self.locals,
-            open: &open,
+            open: &self.menus.stack,
             focus_rect,
         };
         match self.exprs.evaluate(dump, &host) {
@@ -356,6 +355,7 @@ impl Runner<'_, '_> {
             focus: None,
             hover: None,
             items: vec![ItemState::default(); def.items.len()],
+            item_ids: super::state::item_ids(def),
         });
         diag::info!(Ui, "menu open: {}", def.name);
         let name = def.name.clone();
@@ -572,14 +572,12 @@ impl Runner<'_, '_> {
             .find(|m| m.name.eq_ignore_ascii_case(menu))
             .map(|m| m.items.iter().map(|s| s.hidden).collect())
             .unwrap_or_default();
-        let (def, _) = crate::killcam_skip::inherit_shared_vis(def);
-        let open = self.menus.open_names();
         let host = MenuHost {
             world: self.world,
             dvars: self.dvars,
-            menu: &def,
+            menu: def,
             locals: self.locals,
-            open: &open,
+            open: &self.menus.stack,
             focus_rect: None,
         };
         let mut out = Vec::new();
@@ -589,7 +587,13 @@ impl Runner<'_, '_> {
             }
             let enabled = item.disabled_exp.is_empty()
                 || matches!(self.exprs.is_true(&item.disabled_exp, &host), Ok(false));
-            if enabled && matches!(self.exprs.is_true(&item.vis_exp, &host), Ok(true)) {
+            if enabled
+                && matches!(
+                    self.exprs
+                        .is_true_source(item.visibility_expression, &item.vis_exp, &host),
+                    Ok(true)
+                )
+            {
                 out.push(index);
             }
         }
@@ -607,15 +611,16 @@ impl Runner<'_, '_> {
             return false;
         }
         let current = self.dvar(&item.dvar).unwrap_or_default();
+        let choices = self.dvars.choices(&item.dvar).unwrap_or(&item.choices);
         let value = if let Some(slider) = &item.slider {
             let current = current.parse::<f32>().unwrap_or(slider.min);
             (current + step as f32 * slider.step)
                 .clamp(slider.min, slider.max)
                 .to_string()
-        } else if !item.choices.is_empty() {
-            let at = choice_index(&item.choices, current).unwrap_or(0);
-            let next = (at as i32 + step).rem_euclid(item.choices.len() as i32) as usize;
-            item.choices[next].1.clone()
+        } else if !choices.is_empty() {
+            let at = choice_index(choices, current).unwrap_or(0);
+            let next = (at as i32 + step).rem_euclid(choices.len() as i32) as usize;
+            choices[next].1.clone()
         } else {
             return false;
         };
@@ -649,6 +654,14 @@ impl Runner<'_, '_> {
     }
 
     pub(crate) fn activate(&mut self, menu: &str, index: usize, accept: bool) {
+        if self
+            .catalog
+            .get(menu)
+            .and_then(|def| def.items.get(index))
+            .is_some_and(|item| super::class_unavailable(menu, item, self.dvars).is_some())
+        {
+            return;
+        }
         if self.adjust(menu, index, 1) {
             return;
         }

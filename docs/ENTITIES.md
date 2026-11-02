@@ -38,12 +38,16 @@ and leaves transport to `net`.
 * `sim/` — `gentity spawn world snapshot damage bullet* missile item corpse
   match_state score rules world_objects identities` (`ScriptModelId` is the one
   identity of a script model; a raw `u32` is not a second one);
-* `frame` — `AppScreen`, `HasWorld`, `RuntimeRole`, `LaunchIdentity`; no
-  plugins, no systems;
-* `session` — standing the match up and tearing it down (`MatchInstalled` /
-  `MatchTornDown`); `net` — wire, deltas, prediction; `bots` — host-only
+* `frame` — `AppScreen`, `RuntimeRole`, `LaunchIdentity` and `ScopePlugin`: match/round states, scoped resource registration and entity retirement;
+* `session` — standing the match up and tearing it down through `ScopeControl`; `net` — wire, deltas, prediction; `bots` — host-only
   controllers that observe through a sensor adapter, walk a ClipMap-baked graph
   and enter the same `TickInput`.
+
+`net/transport/meta_wire.rs` encodes and parses metadata messages. The pure
+`world_object_wire.rs` codec validates complete world-object updates;
+`world_sync.rs` owns mutable baselines and periodic full synchronization.
+Frame decoding commits its prepared world update after reliable and service
+sections succeed, so a refused frame leaves the world baseline intact.
 
 Snapshots publish the **semantics** of DObj composition, never runtime trees or
 posed vertices ([`ANIM.md`](ANIM.md)).

@@ -24,6 +24,15 @@ nowhere else: maps, seed rule, scenes, positions, angles, weapons, durations
 and input. To pin a scene to an owner-chosen position, replace its `Place`
 there; the runner does not change.
 
+The heavy scenario uses a 2560×1440 window with vsync off, recorded alongside the observed render target in `run.json`.
+
+The heavy scenario also plants a claymore, drops a weapon through player death,
+restarts the script round in place, and captures entity and resource ownership at gameplay and teardown boundaries.
+Both scenarios use isolated accounts and wait for native progression content and run `unlock all` from the menu before
+loading their map, so random showcase classes are admitted without altering a
+user account. Dumps record slot, payload, script-object and remote-animation counts; the runner
+checks entity consistency and complete teardown of these match owners.
+
 The final `quit` phase sends `finish_run`, which uses the normal process-exit
 boundary after the scenario's pending screenshots finish writing. Interactive
 `quit` intentionally has only a short write grace period and can leave a
@@ -51,7 +60,11 @@ it is a symlink to the repository's cache.
 A seed resolves to maps and spawn picks once. `run.json` keeps the resolved
 set — the positions and angles the game actually used — and `--replay` runs
 that set again rather than the seed, so a change in catalog order or spawn
-selection cannot move a replayed scene.
+selection cannot move a replayed scene. Replay also restores the source run’s
+`iw4l-artifacts/profile/classes.txt` so class indices keep the same loadouts.
+The source profile must exist; its contents and path are recorded under
+`class_profile` in the new report. Combat outcomes and frame timing can still
+vary between runs.
 
 ## What a run leaves
 
@@ -95,8 +108,8 @@ never a quit.
 ## Two clients through the dev master
 
 ```sh
-cargo xtask master install user@vps --channel dev --ca ~/.iw4l/dev-vpn-ca
-cp ~/.iw4l/dev-vpn-ca/community-dev.iw4l-server context/simulated-iw4l-folder/
+cargo xtask master install root@vps --name dev --port 4434 --ca ~/.iw4l/dev-vpn-ca
+cp "$IW4L_GAMES/dev.iw4l-server" context/simulated-iw4l-folder/community-dev.iw4l-server
 make approved SCENARIO=master_duo_chaos
 ```
 

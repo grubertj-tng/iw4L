@@ -14,7 +14,13 @@ use crate::media_queue::{ClipJob, MediaJobQueue, MediaPriority, QueueRefusal};
 use crate::pcm::decode_audio_bytes;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ClipKey {
+pub(crate) struct ClipKey {
+    revision: u64,
+    locator: ClipLocator,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ClipLocator {
     Loaded(usize),
     Streamed {
         ns: AssetNamespace,
@@ -22,6 +28,15 @@ pub(crate) enum ClipKey {
         name: String,
         decode: asset_audio::StreamedDecodePolicy,
     },
+}
+
+impl ClipKey {
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub(crate) fn is_loaded(&self) -> bool {
+        matches!(&self.locator, ClipLocator::Loaded(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +84,7 @@ pub(crate) enum ClipError {
     Decode,
     UnsupportedCodec(asset_audio::SabCodec),
     MetadataMismatch,
+    ForeignOwner,
     Xwma(asset_audio::XwmaDecodeError),
     InvalidPcm(crate::media::PcmError),
     Read,
@@ -113,7 +129,10 @@ struct LoadedClipKey {
 }
 
 fn resident_clip_key(bank: &SoundCatalog, key: &ClipKey) -> Option<(LoadedClipKey, bool)> {
-    let ClipKey::Loaded(index) = key else {
+    if key.revision() != bank.revision() {
+        return None;
+    }
+    let ClipLocator::Loaded(index) = &key.locator else {
         return None;
     };
     let sound = bank.pcm_at(*index)?;
@@ -282,8 +301,8 @@ fn evict_idle_streamed(requests: &Mutex<MediaRequests>, outcomes: &Mutex<Outcome
     let mut outcomes = outcomes.lock().unwrap_or_else(|poison| poison.into_inner());
     let mut idle: Vec<(u64, ClipKey, usize)> = outcomes
         .iter()
-        .filter_map(|(key, (result, used))| match (key, result) {
-            (ClipKey::Streamed { .. }, Ok(pcm)) if !pcm.shared() => {
+        .filter_map(|(key, (result, used))| match (&key.locator, result) {
+            (ClipLocator::Streamed { .. }, Ok(pcm)) if !pcm.shared() => {
                 Some((*used, key.clone(), pcm.resident_bytes()))
             }
             _ => None,
@@ -529,6 +548,9 @@ impl MediaService {
     }
 
     fn submit_request(&self, key: ClipKey, priority: MediaPriority) -> MediaRequest {
+        if key.revision() != self.bank_revision() {
+            return MediaRequest::Refused;
+        }
         REQUESTS.fetch_add(1, Ordering::Relaxed);
         let lock_at = Instant::now();
         let mut requests = self
@@ -561,7 +583,7 @@ impl MediaService {
                 .insert(key, (Ok(pcm), USE_TICK.fetch_add(1, Ordering::Relaxed)));
             return MediaRequest::Resident;
         }
-        if requests.match_live && matches!(key, ClipKey::Loaded(_)) {
+        if requests.match_live && key.is_loaded() {
             requests.late_prepares = requests.late_prepares.saturating_add(1);
             LATE.fetch_add(1, Ordering::Relaxed);
         }
@@ -594,6 +616,9 @@ impl MediaService {
     }
 
     pub(crate) fn ready(&self, key: &ClipKey) -> Option<Result<PcmBuffer, ClipError>> {
+        if key.revision() != self.bank_revision() {
+            return Some(Err(ClipError::ForeignOwner));
+        }
         let lock_at = Instant::now();
         let at_limit = {
             let requests = self
@@ -637,9 +662,6 @@ impl CueFeedback {
         }
         self.cues.push(CueFeedbackEntry { handle });
     }
-    pub fn clear(&mut self) {
-        self.cues.clear();
-    }
 }
 
 pub(crate) fn clip_keys_for_alias(
@@ -672,22 +694,11 @@ fn collect_clip_keys(
     let Some(sound) = bank.sound_at(index) else {
         return;
     };
-    for (vi, row) in sound.aliases.iter().enumerate() {
-        if let Some(idx) = row.loaded.bound_index() {
-            let key = ClipKey::Loaded(idx);
-            if seen_key.insert(key.clone()) {
-                out.push(key);
-            }
-        } else if let Some((sns, dir, name)) = bank.streamed_for_variant(ns, alias, vi) {
-            let Some(policy) = bank.playback_policy(index, vi) else {
-                continue;
-            };
-            let key = ClipKey::Streamed {
-                ns: sns,
-                dir,
-                name,
-                decode: policy.streamed_decode(),
-            };
+    for vi in 0..sound.aliases.len() {
+        let Ok(bound) = bank.bind_published_alias(index, vi) else {
+            continue;
+        };
+        if let Ok(Some(key)) = clip_key_for_sound(bound) {
             if seen_key.insert(key.clone()) {
                 out.push(key);
             }
@@ -709,26 +720,27 @@ fn collect_clip_keys(
     }
 }
 
-pub(crate) fn clip_key_for_variant(
-    bank: &SoundCatalog,
-    ns: AssetNamespace,
-    alias: &str,
-    bound: Option<usize>,
-    variant: usize,
-) -> Option<ClipKey> {
-    let index = bound.or_else(|| bank.index_in(ns, alias))?;
-    let sound = bank.sound_at(index)?;
-    if let Some(idx) = sound.aliases.get(variant)?.loaded.bound_index() {
-        return Some(ClipKey::Loaded(idx));
-    }
-    let policy = bank.playback_policy(index, variant)?;
-    bank.streamed_for_variant_at(index, variant)
-        .map(|(sns, dir, name)| ClipKey::Streamed {
-            ns: sns,
-            dir,
-            name,
-            decode: policy.streamed_decode(),
-        })
+pub(crate) fn clip_key_for_sound(
+    bound: asset_audio::BoundSound<'_>,
+) -> Result<Option<ClipKey>, asset_audio::SoundBindingRefusal> {
+    let revision = bound.revision();
+    Ok(bound.media()?.map(|media| ClipKey {
+        revision,
+        locator: match media {
+            asset_audio::BoundSoundMedia::Loaded { index, .. } => ClipLocator::Loaded(index),
+            asset_audio::BoundSoundMedia::Streamed {
+                namespace,
+                dir,
+                name,
+                decode,
+            } => ClipLocator::Streamed {
+                ns: namespace,
+                dir,
+                name,
+                decode,
+            },
+        },
+    }))
 }
 
 static WORKERS: AtomicU64 = AtomicU64::new(0);
@@ -834,8 +846,11 @@ fn prepare_clip_now(
     iwd: Option<&NamespaceSoundIwd>,
     key: &ClipKey,
 ) -> (ClipPath, Result<PcmBuffer, ClipError>) {
-    match key {
-        ClipKey::Loaded(index) => {
+    if key.revision() != bank.revision() {
+        return (ClipPath::Unresolved, Err(ClipError::ForeignOwner));
+    }
+    match &key.locator {
+        ClipLocator::Loaded(index) => {
             let Some(sound) = bank.pcm_at(*index) else {
                 return (ClipPath::Unresolved, Err(ClipError::Decode));
             };
@@ -844,11 +859,12 @@ fn prepare_clip_now(
             };
             (path, prepare_loaded(sound))
         }
-        ClipKey::Streamed {
+        ClipLocator::Streamed {
             ns,
             dir,
             name,
             decode,
+            ..
         } => (
             ClipPath::Streamed,
             prepare_streamed(iwd, *ns, dir, name, *decode),

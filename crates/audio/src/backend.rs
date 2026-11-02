@@ -4,43 +4,46 @@ use frame::ClientSet;
 pub(crate) use crate::render_core::AudioScope;
 use crate::runtime::AudioRuntime;
 
-#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MatchEpoch(pub u64);
-
-impl MatchEpoch {
-    pub fn bump(&mut self) {
-        self.0 = self.0.wrapping_add(1);
-    }
-}
+use frame::MatchScope;
 
 pub(crate) fn register(app: &mut App) {
+    app.add_systems(
+        StateTransition,
+        sync_presentation_epoch
+            .in_set(bevy::state::state::StateTransitionSystems::TransitionSchedules)
+            .after(frame::scope::ScopeRetired),
+    );
+    app.add_systems(
+        OnExit(MatchScope::Live),
+        release_audio.in_set(frame::ScopeSet::Release),
+    );
     app.init_resource::<net::FireVerdictState>();
     let verdicts = app.world().resource::<net::FireVerdictState>().clone();
     app.init_resource::<AudioRuntime>();
     app.world()
         .resource::<AudioRuntime>()
         .set_fire_verdicts(verdicts);
-    app.init_resource::<MatchEpoch>()
-        .add_systems(
-            Update,
-            publish_audio_context
-                .in_set(ClientSet::Predict)
-                .after(frame::OwnerEventsPublished),
-        )
-        .add_systems(
-            PostUpdate,
-            (
-                submit_presented_audio,
-                cancel_audio_on_exit.after(submit_presented_audio),
-            ),
-        );
+    app.add_systems(
+        Update,
+        publish_audio_context
+            .in_set(ClientSet::Predict)
+            .after(frame::OwnerEventsPublished),
+    )
+    .add_systems(
+        PostUpdate,
+        (
+            submit_presented_audio,
+            cancel_audio_on_exit.after(submit_presented_audio),
+        ),
+    );
 }
 
 pub(crate) fn publish_audio_context(
-    epoch: Res<MatchEpoch>,
+    epoch: Option<Res<net::EntityEventCursor>>,
     runtime: Res<AudioRuntime>,
     verdicts: Option<Res<net::FireVerdictState>>,
     clips: Option<Res<crate::ClipStore>>,
+    frontend: Option<Res<crate::frontend::FrontendAudio>>,
     mut mix: Option<ResMut<crate::script_mix::ScriptAudioMix>>,
     mut channels: Option<ResMut<crate::script_mix::ChannelAudioMix>>,
     listeners: Query<&Transform, With<crate::AmbientListener>>,
@@ -55,14 +58,17 @@ pub(crate) fn publish_audio_context(
     if let Some(verdicts) = verdicts {
         runtime.set_fire_verdicts(verdicts.clone());
     }
-    runtime.set_match_epoch(epoch.0);
+    runtime.set_presentation_epoch(crate::backend::presentation_epoch(epoch.as_deref()));
     runtime.set_event_context(
         generation
             .and_then(|generation| generation.0)
             .zip(presented.as_ref().and_then(|presented| {
                 presented.snapshot().map(|snapshot| {
                     if view.as_ref().is_some_and(|view| view.in_killcam()) {
-                        snapshot.tick.0
+                        local
+                            .as_ref()
+                            .map_or(snapshot.tick, |local| snapshot.view_tick(local.0))
+                            .0
                     } else {
                         adopted
                             .as_ref()
@@ -95,17 +101,22 @@ pub(crate) fn publish_audio_context(
                     .map(|latest| latest.tick.0),
             }),
     );
-    runtime.set_media_service(clips.as_ref().map(|clips| clips.service()));
+    runtime.set_media_service(
+        clips
+            .as_ref()
+            .map(|clips| clips.service())
+            .or_else(|| frontend.as_ref().map(|frontend| frontend.clips.service())),
+    );
     if let Some(mix) = mix.as_mut() {
-        mix.reset_epoch(epoch.0);
+        mix.reset_epoch(crate::backend::presentation_epoch(epoch.as_deref()));
     }
     if let Some(channels) = channels.as_mut() {
-        channels.reset_epoch(epoch.0);
+        channels.reset_epoch(crate::backend::presentation_epoch(epoch.as_deref()));
     }
     runtime.set_cue_mix(
         mix.zip(channels)
             .map(|(mix, channels)| crate::cue_execution::CueMix {
-                epoch: epoch.0,
+                epoch: crate::backend::presentation_epoch(epoch.as_deref()),
                 gain: mix.gain.clone(),
                 channels: channels.bindings(),
             }),
@@ -156,16 +167,18 @@ fn cancel_audio_on_exit(mut exit: MessageReader<AppExit>, runtime: Res<AudioRunt
 
 fn submit_presented_audio(
     mut runtime: ResMut<AudioRuntime>,
-    epoch: Res<MatchEpoch>,
+    epoch: Option<Res<net::EntityEventCursor>>,
     settings: Option<Res<frame::GameSettings>>,
     listeners: Query<&Transform, With<crate::AmbientListener>>,
     destructibles: Option<Res<crate::destructible_loops::DestructibleSources>>,
+    projectiles: Option<Res<crate::projectile_loops::ProjectileSources>>,
+    flames: Option<Res<crate::flame_loops::FlameSources>>,
     map: Option<Res<crate::ambient::MapSources>>,
     menu: Option<Res<crate::frontend::MenuSources>>,
     shellshock: Option<Res<crate::shellshock::ShellshockSources>>,
     breath: Option<Res<crate::breath::BreathSources>>,
 ) {
-    runtime.set_match_epoch(epoch.0);
+    runtime.set_presentation_epoch(crate::backend::presentation_epoch(epoch.as_deref()));
     let mut listener = listeners.iter();
     let pose = listener.next();
     assert!(listener.next().is_none(), "more than one ambient listener");
@@ -180,6 +193,12 @@ fn submit_presented_audio(
     if let Some(destructibles) = destructibles {
         desired.extend(destructibles.desired.iter().cloned());
     }
+    if let Some(projectiles) = projectiles {
+        desired.extend(projectiles.desired.iter().cloned());
+    }
+    if let Some(flames) = flames {
+        desired.extend(flames.desired.iter().cloned());
+    }
     if let Some(map) = map {
         desired.extend(map.desired.iter().cloned());
     }
@@ -193,4 +212,19 @@ fn submit_presented_audio(
         desired.extend(breath.source.iter().cloned());
     }
     runtime.set_sources(desired);
+}
+
+pub(crate) fn presentation_epoch(cursor: Option<&net::EntityEventCursor>) -> u64 {
+    cursor.map_or(0, net::EntityEventCursor::timeline)
+}
+
+fn sync_presentation_epoch(epoch: Option<Res<net::EntityEventCursor>>, runtime: Res<AudioRuntime>) {
+    runtime.set_presentation_epoch(crate::backend::presentation_epoch(epoch.as_deref()));
+}
+
+fn release_audio(mut runtime: ResMut<AudioRuntime>) {
+    runtime.set_media_service(None);
+    runtime.set_event_context(None);
+    runtime.set_cue_mix(None);
+    runtime.set_sources(Vec::new());
 }

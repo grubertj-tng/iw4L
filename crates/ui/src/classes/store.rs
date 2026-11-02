@@ -8,19 +8,17 @@ use sim::match_state::PERSONAL_CLASS_SLOTS;
 pub struct SessionClassStore {
     pub slots: Vec<ClassSlotState>,
 
-    pub equipped: Option<usize>,
     pub selected: usize,
+
+    server_families: Option<frame::AssetFamilies>,
 }
 
 impl SessionClassStore {
-    pub fn from_showcase(seed: u64, registry: &asset_game::WeaponRegistry) -> Self {
-        let combat = session::combat_table::from_registry(registry, None);
-        let equipment = session::combat_table::equipment_from_registry(registry);
+    pub fn from_showcase(seed: u64, registry: &asset_game::EditorWeaponCatalog) -> Self {
+        let admission = session::ClassWeaponAdmission::prepare(registry);
         let available = |slot: &HostClassSlot| {
             let row = session::ClassRow::from(slot);
-            !session::project_class(0, &row, registry, &combat, &equipment)
-                .def
-                .locked
+            admission.allows(&row)
         };
         let mut slots: Vec<HostClassSlot> =
             frame::pick_showcase(seed, frame::showcase_classes().len())
@@ -118,13 +116,34 @@ impl SessionClassStore {
         }
         Self {
             slots: slots.iter().map(ClassSlotState::from_host_slot).collect(),
-            equipped: None,
             selected: 0,
+            server_families: None,
         }
     }
 
-    pub fn equipped_slot(&self) -> Option<&ClassSlotState> {
-        self.equipped.and_then(|i| self.slots.get(i))
+    pub fn set_server_families(&mut self, families: Option<frame::AssetFamilies>) {
+        self.server_families = families;
+    }
+
+    pub fn server_families(&self) -> Option<frame::AssetFamilies> {
+        self.server_families
+    }
+
+    pub fn lock_reason(&self, index: usize) -> Option<String> {
+        let slot = self.slots.get(index)?;
+        if let Some(families) = self.server_families {
+            for reference in [&slot.primary, &slot.secondary, &slot.lethal, &slot.tactical] {
+                if let Some(key) = asset_game::FamilyKey::parse(reference)
+                    && !families.enabled(key.namespace.as_str())
+                {
+                    return Some(format!(
+                        "{} assets are disabled on this server",
+                        key.namespace.as_str().to_ascii_uppercase()
+                    ));
+                }
+            }
+        }
+        slot.lock_reason.clone()
     }
 
     pub fn apply_coverage_locks(&mut self, reasons: impl IntoIterator<Item = Option<String>>) {
@@ -303,6 +322,11 @@ pub(crate) fn load_class_store(
                 diag::info!(Ui, "classes: {} read from {}", slots.len(), path.display());
                 file.written = Some(encode_slots(&slots));
                 store.slots = slots;
+                let mut defaults = generate().slots;
+                let start = store.slots.len();
+                store
+                    .slots
+                    .extend(defaults.drain(start.min(defaults.len())..));
                 for slot in &mut store.slots {
                     slot.lock_reason = catalog.validate_class(slot).err();
                 }
@@ -319,7 +343,12 @@ pub(crate) fn load_class_store(
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            *store = generate();
+            let generated = generate();
+            if generated.slots.is_empty() {
+                file.loaded = false;
+                return;
+            }
+            *store = generated;
         }
         Err(error) => {
             *store = generate();
@@ -402,3 +431,6 @@ pub(crate) fn save_class_store(
         }
     }
 }
+
+#[derive(Resource, Default)]
+pub struct EquippedClass(pub Option<usize>);

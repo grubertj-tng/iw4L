@@ -44,8 +44,17 @@ pub enum FxPackedLightingSrc {
     Missing = 2,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FxSpawnProducts {
+    #[default]
+    All,
+    Transient,
+    Marks,
+}
+
 #[derive(Clone, Debug)]
 pub struct FxEffectSlot {
+    pub products: FxSpawnProducts,
     pub def_name: String,
 
     pub catalog_index: u16,
@@ -103,6 +112,7 @@ pub struct FxEffectSlot {
 impl Default for FxEffectSlot {
     fn default() -> Self {
         Self {
+            products: FxSpawnProducts::All,
             def_name: String::new(),
             catalog_index: FX_CATALOG_INDEX_NONE,
             status: 0,
@@ -171,6 +181,7 @@ pub enum SpawnFail {
 
 #[derive(Clone, Debug)]
 pub struct PendingRunnerSpawn {
+    pub products: FxSpawnProducts,
     pub mark_entity: Option<u16>,
     pub parent_name: String,
     pub catalog_index: u16,
@@ -211,6 +222,8 @@ pub struct PendingDecalSpawn {
 
 #[derive(Clone, Debug)]
 pub struct PendingTrailImpact {
+    pub mark_entity: Option<u16>,
+    pub products: FxSpawnProducts,
     pub parent_def_name: String,
     pub catalog_index: u16,
     pub def_index: u8,
@@ -221,6 +234,7 @@ pub struct PendingTrailImpact {
 
 pub struct FxSystemHost {
     pub spawn_mark_entity: Option<u16>,
+    pub spawn_products: FxSpawnProducts,
     pub last_decal_mark_entity: Option<u16>,
     effects: Vec<FxEffectSlot>,
 
@@ -567,6 +581,7 @@ impl FxSystemHost {
             last_decal_axis: None,
             last_decal_bolt: None,
             spawn_mark_entity: None,
+            spawn_products: FxSpawnProducts::All,
             last_decal_mark_entity: None,
             last_decal_against_world: None,
             last_decal_against_models: None,
@@ -845,6 +860,14 @@ impl FxSystemHost {
         Some(idx as u8)
     }
 
+    fn free_bolt_record(&mut self, index: u8) {
+        let Some(next) = self.bolt_next.get_mut(usize::from(index)) else {
+            return;
+        };
+        *next = self.bolt_first_free;
+        self.bolt_first_free = i32::from(index);
+    }
+
     pub fn spawn_effect(
         &mut self,
         def_name: &str,
@@ -858,6 +881,9 @@ impl FxSystemHost {
         if wants_spotlight && self.spotlight_count >= FX_SPOT_LIGHT_LIMIT {
             return Err(SpawnFail::TooManySpotlights);
         }
+        if self.ring_occupancy() >= FX_EFFECT_HANDLE_RING_SIZE as i32 {
+            return Err(SpawnFail::RingFull);
+        }
         let bolt_index = if bolt == FX_SPAWN_BOLT_NONE {
             0xff
         } else {
@@ -868,9 +894,6 @@ impl FxSystemHost {
         };
 
         let alloc = self.first_free_effect;
-        if self.ring_occupancy() >= FX_EFFECT_HANDLE_RING_SIZE as i32 {
-            return Err(SpawnFail::RingFull);
-        }
         self.first_free_effect = alloc.wrapping_add(1);
 
         let ring_i = (alloc as u32 & (FX_EFFECT_HANDLE_RING_SIZE - 1)) as usize;
@@ -880,6 +903,7 @@ impl FxSystemHost {
         let effect = &mut self.effects[slot];
         let (bolt_parent_quat, bolt_parent_origin) = fx_iw4::bolt_init_parent_orientation();
         *effect = FxEffectSlot {
+            products: self.spawn_products,
             def_name: def_name.to_owned(),
             catalog_index,
 
@@ -970,6 +994,10 @@ impl FxSystemHost {
             self.set_handle_at_ring(active_index as u32, handle);
             active_index = active_index.wrapping_add(1);
             if let Some(slot) = handle_to_slot(handle) {
+                let bolt = self.effects[slot].bolt;
+                if bolt != 0xff {
+                    self.free_bolt_record(bolt);
+                }
                 self.effects[slot] = FxEffectSlot::default();
             }
         }

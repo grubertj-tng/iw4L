@@ -1,7 +1,7 @@
 use crate::ScriptModelId;
 use crate::frame::FrameWorld;
 use crate::script::runtime::raise;
-use crate::script::{Runtime, Value};
+use crate::script::{RoundScript, Value};
 use crate::world::ClientId;
 use bevy_ecs::prelude::World;
 
@@ -85,7 +85,7 @@ pub(crate) enum HitTarget {
 }
 
 pub(crate) fn apply_script_blasts(world: &mut World, tick: crate::Tick) {
-    let (blasts, hits) = match world.get_resource_mut::<Runtime>() {
+    let (blasts, hits) = match world.get_resource_mut::<RoundScript>() {
         Some(mut runtime) => (
             std::mem::take(&mut runtime.blasts),
             std::mem::take(&mut runtime.hits),
@@ -109,7 +109,7 @@ pub(crate) fn apply_script_blasts(world: &mut World, tick: crate::Tick) {
                     );
                     continue;
                 }
-                let mut runtime = world.resource_mut::<Runtime>();
+                let mut runtime = world.resource_mut::<RoundScript>();
                 let at = match runtime
                     .presented_by(target)
                     .map(|o| runtime.object_field(o, "origin"))
@@ -170,7 +170,7 @@ pub(crate) fn radius_targets(
     origin: [f32; 3],
     radius: f32,
 ) -> Vec<(ScriptModelId, [f32; 3], f32)> {
-    let Some(mut runtime) = world.get_resource_mut::<Runtime>() else {
+    let Some(mut runtime) = world.get_resource_mut::<RoundScript>() else {
         return Vec::new();
     };
     let candidates: Vec<(u64, ScriptModelId)> = runtime
@@ -220,14 +220,16 @@ pub(crate) fn radius_targets(
 
 pub(crate) fn damage_entity(world: &mut World, hit: &EntityHit) -> bool {
     let Some(object) = world
-        .get_resource::<Runtime>()
+        .get_resource::<RoundScript>()
         .and_then(|runtime| runtime.presented_by(hit.target))
-        .filter(|object| world.resource::<Runtime>().entities[object].accepts_damage(hit.flags))
+        .filter(|object| {
+            world.resource::<RoundScript>().entities[object].accepts_damage(hit.flags)
+        })
     else {
         return false;
     };
     let frame = FrameWorld::from_world(world);
-    let tag = hit
+    let part = hit
         .bone
         .and_then(|bone| {
             frame
@@ -243,11 +245,13 @@ pub(crate) fn damage_entity(world: &mut World, hit: &EntityHit) -> bool {
     let attacker = hit.attacker.map_or(Value::Undefined, |a| {
         super::players::player_object(world, a.0)
     });
-    if world.resource::<Runtime>().entities[&object].kind == super::entities::EntityKind::Vehicle {
-        super::vehicles::damage(world, object, hit, attacker, &weapon, &tag);
+    if world.resource::<RoundScript>().entities[&object].kind
+        == super::entities::EntityKind::Vehicle
+    {
+        super::vehicles::damage(world, object, hit, attacker, &weapon, &part);
         return true;
     }
-    let mut runtime = world.resource_mut::<Runtime>();
+    let mut runtime = world.resource_mut::<RoundScript>();
     let model = match runtime.object_field(object, "model") {
         Value::String(model) => model,
         _ => "".into(),
@@ -272,8 +276,8 @@ pub(crate) fn damage_entity(world: &mut World, hit: &EntityHit) -> bool {
             Value::Vector(hit.point),
             Value::string(hit.means),
             Value::String(model),
-            Value::String(tag.as_str().into()),
             Value::string(""),
+            Value::String(part.as_str().into()),
             Value::Int(hit.flags),
             Value::String(weapon.into()),
         ],
@@ -292,7 +296,7 @@ pub(crate) fn destructible_callback(
 ) {
     let Some(object) = owner
         .script_model()
-        .and_then(|id| world.get_resource::<Runtime>()?.presented_by(id))
+        .and_then(|id| world.get_resource::<RoundScript>()?.presented_by(id))
     else {
         return;
     };
@@ -316,13 +320,14 @@ pub(crate) fn destructible_effect(
     name: String,
     origin: [f32; 3],
     direction: [f32; 3],
-) {
+    up: [f32; 3],
+) -> Option<u64> {
     let now = super::players::now_ms(world);
-    let Some(mut runtime) = world.get_resource_mut::<Runtime>() else {
-        return;
+    let Some(mut runtime) = world.get_resource_mut::<RoundScript>() else {
+        return None;
     };
     let Ok(id) = runtime.create_entity(super::entities::EntityKind::Spawned, "script_model") else {
-        return;
+        return None;
     };
     let forward = glam::Vec3::from_array(direction)
         .try_normalize()
@@ -333,12 +338,19 @@ pub(crate) fn destructible_effect(
             name,
             origin,
             forward: forward.to_array(),
-            up: forward.any_orthonormal_vector().to_array(),
+            up,
             start_ms: Some(now as i32),
             repeat_ms: 0,
             cull_distance: 0.0,
         },
     );
+    Some(id)
+}
+
+pub(crate) fn stop_destructible_effect(world: &mut World, id: u64) {
+    if let Some(mut runtime) = world.get_resource_mut::<RoundScript>() {
+        runtime.delete_entity(id);
+    }
 }
 
 pub(crate) fn set_destructible_model(
@@ -347,7 +359,7 @@ pub(crate) fn set_destructible_model(
     model: Option<&str>,
     sound: Option<&str>,
 ) {
-    let Some(mut runtime) = world.get_resource_mut::<Runtime>() else {
+    let Some(mut runtime) = world.get_resource_mut::<RoundScript>() else {
         return;
     };
     let Some(object) = owner.script_model().and_then(|id| runtime.presented_by(id)) else {
@@ -375,7 +387,7 @@ pub(crate) fn destructible_debris(
         0.0,
     ];
     let Ok(object) = world
-        .resource_mut::<Runtime>()
+        .resource_mut::<RoundScript>()
         .create_entity(super::entities::EntityKind::Spawned, "script_model")
     else {
         return;
@@ -383,7 +395,15 @@ pub(crate) fn destructible_debris(
     let presence = match super::presence::spawn_presence(world, origin) {
         Ok(presence) => presence,
         Err(_) => {
-            world.resource_mut::<Runtime>().delete_entity(object);
+            let number = world
+                .resource::<RoundScript>()
+                .entities
+                .get(&object)
+                .map(|entity| entity.number);
+            if let Some(number) = number {
+                crate::frame::FrameWorld::from_world(world).despawn_dynamic_entity(number);
+            }
+            world.resource_mut::<RoundScript>().delete_entity(object);
             return;
         }
     };
@@ -393,7 +413,7 @@ pub(crate) fn destructible_debris(
         row.dobj = Some(dobj);
         row.solid = false;
     }
-    let mut runtime = world.resource_mut::<Runtime>();
+    let mut runtime = world.resource_mut::<RoundScript>();
     runtime.set_object_field(object, "origin", Value::Vector(origin));
     runtime.set_object_field(object, "angles", Value::Vector(angles));
     runtime.set_object_field(object, "model", Value::string(&model));
@@ -403,7 +423,7 @@ pub(crate) fn destructible_debris(
     drop(runtime);
     let now = super::players::now_ms(world);
     world
-        .resource_mut::<Runtime>()
+        .resource_mut::<RoundScript>()
         .lingering
         .push((now + 30000, object));
     world

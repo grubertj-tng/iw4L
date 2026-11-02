@@ -34,7 +34,6 @@ pub struct LaneGap {
     pub addr: Option<&'static str>,
 }
 
-#[derive(Default)]
 pub struct LoadedWorld {
     pub scripts: crate::ScriptSources,
     pub world: PreparedWorld,
@@ -66,7 +65,7 @@ impl LoadedWorld {
         Self {
             world: PreparedWorld {
                 policy,
-                ..Default::default()
+                ..PreparedWorld::empty(policy)
             },
             report: vec![reason.clone()],
             gaps: vec![LaneGap {
@@ -74,7 +73,7 @@ impl LoadedWorld {
                 reason,
                 addr,
             }],
-            ..Default::default()
+            ..LoadedWorld::empty(policy)
         }
     }
 
@@ -94,6 +93,7 @@ impl LoadedWorld {
 
 #[derive(Default)]
 pub struct CommonCensus {
+    pub ui_images: Vec<(String, asset_material::material_images::ZoneUiImage)>,
     pub scripts: crate::ScriptSources,
     pub scene_models: asset_world::MapXModelSceneCatalog,
     pub shared_surfaces: asset_model::SharedXModelSurfaces,
@@ -148,17 +148,17 @@ pub(crate) struct CommonPreparationProducts {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CommonDependencyRefusal {
-    ModelDonor {
-        model: String,
-        stand_in: &'static str,
+    NativeMaterial {
+        family: asset_core::FamilyId,
+        name: String,
+        reason: String,
     },
-    EffectDonor {
-        effect: &'static str,
-    },
+    WeaponPreparation(asset_game::WeaponPreparationRefusal),
 }
 
 pub(crate) struct CommonPreparationResult {
     pub products: CommonPreparationProducts,
+    pub impact_fx: Option<asset_game::OwnedFxImpactTable>,
     pub refusals: Vec<CommonDependencyRefusal>,
 }
 
@@ -247,3 +247,23 @@ pub const LANE_GAPS: &[&str] = &[
     "assets::lane::t6::load_world/no_decoder",
     "assets::session_load::load_prepared_match/zone_open",
 ];
+
+impl LoadedWorld {
+    pub fn empty(policy: WorldDrawPolicy) -> Self {
+        Self {
+            scripts: Default::default(),
+            world: PreparedWorld::empty(policy),
+            materials: Default::default(),
+            collision: Default::default(),
+            spawns: Default::default(),
+            bodies: Default::default(),
+            fpv_meshes: Default::default(),
+            xanims: Default::default(),
+            facts: Default::default(),
+            arena_bytes: Default::default(),
+            sound: Default::default(),
+            report: Default::default(),
+            gaps: Default::default(),
+        }
+    }
+}

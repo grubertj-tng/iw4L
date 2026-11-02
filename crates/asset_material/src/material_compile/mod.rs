@@ -1,22 +1,16 @@
 mod sort;
+mod state;
+pub use state::compile_material_state;
 mod technique;
 
 use render_material::{
-    MaterialAssetId, MaterialGenerationId, RemapResolution, RuntimeImageId, RuntimeMaterial,
+    MaterialAssetId, RemapResolution, RuntimeImageId, RuntimeMaterial, RuntimeMaterialBuild,
     RuntimeMaterialCatalog, RuntimeShaderProgram, RuntimeShaderProgramId, RuntimeShaderStage,
     RuntimeSortedMaterialTable, RuntimeTechniqueSet, RuntimeTechniqueSetId, RuntimeTextureBinding,
     RuntimeVertexDecl, TECHNIQUE_SLOT_COUNT,
 };
 use sort::build_sorted_material_table;
 use std::collections::BTreeMap;
-
-fn mint_material_generation_id() -> MaterialGenerationId {
-    // The generation is a runtime identity, not a content checksum. Material
-    // names and draw-surf keys can stay equal while shaders, images or map
-    // overrides change, so every captured table needs a distinct ID.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    MaterialGenerationId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-}
 
 fn program_hash(program: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -39,7 +33,8 @@ pub fn compile_material_catalog(source: &crate::MaterialDefinitions) -> RuntimeM
                 let Some(technique) = technique else {
                     continue;
                 };
-                slots[slot_index] = Some(compiler.compile_technique(
+                slots[slot_index] = Some(technique::compile_technique(
+                    compiler,
                     source,
                     slot_index as u8,
                     technique,
@@ -142,6 +137,7 @@ pub fn compile_material_catalog(source: &crate::MaterialDefinitions) -> RuntimeM
                     .draw_rules(material, source.is_unlit(material).unwrap_or(false)),
                 sort_key: material.sort_key,
                 info_game_flags: material.info_game_flags,
+                texture_atlas: material.texture_atlas.unwrap_or([1, 1]),
                 state_flags: material.state_flags,
                 surface_type_bits: material.surface_type_bits,
                 unlit: source.is_unlit(material).unwrap_or(false),
@@ -255,8 +251,7 @@ pub fn compile_material_catalog(source: &crate::MaterialDefinitions) -> RuntimeM
         })
         .collect();
 
-    RuntimeMaterialCatalog {
-        generation_id: mint_material_generation_id(),
+    RuntimeMaterialBuild {
         materials,
         material_indices_by_name,
         material_indices_by_key,
@@ -313,6 +308,7 @@ pub fn compile_material_catalog(source: &crate::MaterialDefinitions) -> RuntimeM
         leftover_t5_dest27: source.leftover_t5_arg_dest(27),
         leftover_unknown_n: remaining_unknown_arg_n(source),
     }
+    .publish()
 }
 
 fn remaining_unknown_arg_n(source: &crate::MaterialDefinitions) -> u32 {

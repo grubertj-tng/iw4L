@@ -3,6 +3,7 @@ use entity_iw4::{
     EntityEventAction, EntityEventKind, UnsupportedEntityEvent, consume_entity_events,
     entity_event_action, packet_entity_uses_event_ring,
 };
+use frame::ScopeApp;
 use sim::{EntityEventPayload, EventSequence, Tick};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -29,7 +30,7 @@ pub enum EntityEventDomain {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DispatchedEntityEvent {
-    pub world: frame::WorldGeneration,
+    pub world: frame::WorldStamp,
     pub domain: EntityEventDomain,
     pub timeline: u64,
     pub sequence: EventSequence,
@@ -144,7 +145,7 @@ const TARGET_RETRY_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug)]
 struct DeferredTarget {
-    world: frame::WorldGeneration,
+    world: frame::WorldStamp,
     timeline: u64,
     client: sim::ClientId,
     life: sim::LifeSequence,
@@ -157,16 +158,44 @@ struct DeferredEntityEvent {
     target: DeferredTarget,
 }
 
-#[derive(Resource, Default, Debug)]
+#[derive(Resource, Debug)]
 pub struct EntityEventCursor {
     seen_through: u32,
 
     archived_through: Option<(EventSequence, Tick)>,
+    archive_tick: Option<Tick>,
+    archive_start_tick: Option<Tick>,
     in_killcam: bool,
     timeline: u64,
     predicted_shots: u32,
     authority_shots: u32,
     deferred: VecDeque<DeferredEntityEvent>,
+}
+
+fn fresh_timeline() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |next| next.checked_add(1),
+    )
+    .expect("presentation timeline exhausted")
+}
+
+impl Default for EntityEventCursor {
+    fn default() -> Self {
+        Self {
+            seen_through: 0,
+            archived_through: None,
+            archive_tick: None,
+            archive_start_tick: None,
+            in_killcam: false,
+            timeline: fresh_timeline(),
+            predicted_shots: 0,
+            authority_shots: 0,
+            deferred: VecDeque::new(),
+        }
+    }
 }
 
 #[derive(Resource, Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,25 +281,10 @@ impl EntityEventCursor {
         if !record.audience.projects_to(local) {
             return false;
         }
-        // Each snapshot re-carries the records of the last temp-event lifetime,
-        // so only a tick further back than that window marks a rewind.
-        if let Some((sequence, tick)) = self.archived_through
-            && tick
-                .0
-                .saturating_sub(record.tick.0)
-                .saturating_mul(sim::MATCH_TICK_MS)
-                <= sim::GENTITY_TEMP_EVENT_LIFETIME_MS as u32
+        if let Some((sequence, _)) = self.archived_through
             && !record.sequence.is_newer_than(sequence)
         {
             return false;
-        }
-        if self.archived_through.is_some_and(|(_, tick)| {
-            tick.0
-                .saturating_sub(record.tick.0)
-                .saturating_mul(sim::MATCH_TICK_MS)
-                > sim::GENTITY_TEMP_EVENT_LIFETIME_MS as u32
-        }) {
-            self.timeline = self.timeline.wrapping_add(1);
         }
         self.archived_through = Some((record.sequence, record.tick));
         true
@@ -310,14 +324,21 @@ fn dispatch_entity_events(
     }
     let tick = adopted
         .next()
-        .map(|snapshot| snapshot.tick)
+        .map(|snapshot| snapshot.view_tick(local.0))
         .unwrap_or(Tick(0));
     let local_number = i32::try_from(local.0.0).unwrap_or(-1);
-    let killcam_transition = pending.in_killcam != cursor.in_killcam;
+    let killcam_transition = pending.in_killcam != cursor.in_killcam
+        || pending
+            .archive_tick
+            .zip(cursor.archive_tick)
+            .is_some_and(|(next, old)| next.0 < old.0);
+    cursor.archive_tick = pending.archive_tick;
     if killcam_transition {
-        cursor.timeline = cursor.timeline.wrapping_add(1);
+        cursor.timeline = fresh_timeline();
         cursor.in_killcam = pending.in_killcam;
         cursor.archived_through = None;
+        cursor.archive_start_tick = pending.archive_tick;
+        cursor.deferred.clear();
         commands.trigger(KillcamFxTransition {
             entering: pending.in_killcam,
         });
@@ -346,7 +367,7 @@ fn dispatch_entity_events(
                 number,
                 entity,
                 DispatchedEntityEvent {
-                    world: *generation,
+                    world: generation.stamp(),
                     domain: EntityEventDomain::Ring,
                     timeline,
                     sequence: EventSequence(u32::try_from(ev.sequence).unwrap_or(0)),
@@ -370,6 +391,7 @@ fn dispatch_entity_events(
         });
         runtime.previous_event_sequence = cursor;
     }
+    let in_killcam = pending.in_killcam;
     let pending = &mut *pending;
     let count = cursor.deferred.len().min(TARGET_RETRY_WORK);
     let remaining = cursor.deferred.split_off(count);
@@ -386,13 +408,21 @@ fn dispatch_entity_events(
         );
     let now = Instant::now();
     for (archived, record, retry) in records {
+        if archived != in_killcam
+            || archived
+                && cursor
+                    .archive_start_tick
+                    .is_some_and(|start| record.tick.0 < start.0)
+        {
+            continue;
+        }
         walk.walked = walk.walked.saturating_add(1);
         if let Some(target) = retry {
             if !record.audience.projects_to(local.0) {
                 continue;
             }
             let number = record.payload.number;
-            if target.world != *generation || target.timeline != cursor.timeline {
+            if target.world != generation.stamp() || target.timeline != cursor.timeline {
                 target_gaps.raise(NetGapCause::EventRetryScopeChanged {
                     number,
                     sequence: record.sequence,
@@ -441,7 +471,7 @@ fn dispatch_entity_events(
         walk.last_number = record.payload.number;
 
         let dispatched = DispatchedEntityEvent {
-            world: *generation,
+            world: generation.stamp(),
             domain: EntityEventDomain::Snapshot,
             timeline: cursor.timeline,
             sequence: record.sequence,
@@ -484,7 +514,7 @@ fn dispatch_entity_events(
                         let client = sim::ClientId(u32::try_from(number).ok()?);
                         let life = adopted.next()?.meta.for_client(client)?.life_sequence;
                         Some(DeferredTarget {
-                            world: *generation,
+                            world: generation.stamp(),
                             timeline: cursor.timeline,
                             client,
                             life,
@@ -524,6 +554,7 @@ fn dispatch_entity_events(
 fn dispatch_owner_events(
     mut commands: Commands,
     mut prediction: ResMut<ClientPredictionState>,
+    mut pellet_fx: ResMut<crate::PendingPelletFx>,
     (local, generation): (Res<LocalPresentClient>, Res<frame::WorldGeneration>),
     slots: Res<CEntitySlots>,
     verdicts: Res<crate::FireVerdictState>,
@@ -534,6 +565,7 @@ fn dispatch_owner_events(
     let local_number = i32::try_from(local.0.0).unwrap_or(-1);
     if cursor.in_killcam {
         prediction.0.take_owner_events();
+        prediction.0.take_owner_pellet_fx();
         return;
     }
     let Some(entity) = u16::try_from(local_number)
@@ -543,11 +575,26 @@ fn dispatch_owner_events(
         return;
     };
     let life = prediction.0.local_life();
+    pellet_fx.0.extend(
+        prediction
+            .0
+            .take_owner_pellet_fx()
+            .into_iter()
+            .filter(|record| {
+                record.fire_cause.is_some_and(|cause| {
+                    cause.client == local.0
+                        && Some(cause.life) == life
+                        && verdicts.status(generation.stamp(), cause)
+                            != crate::PredictedFireStatus::Refused
+                })
+            })
+            .map(|record| (generation.stamp(), EntityEventDomain::Predicted, record)),
+    );
     for record in prediction.0.take_owner_events() {
         if record.payload.fire_cause.is_some_and(|cause| {
             cause.client != local.0
                 || Some(cause.life) != life
-                || verdicts.status(*generation, cause) == crate::PredictedFireStatus::Refused
+                || verdicts.status(generation.stamp(), cause) == crate::PredictedFireStatus::Refused
         }) {
             continue;
         }
@@ -561,7 +608,7 @@ fn dispatch_owner_events(
             local_number,
             entity,
             DispatchedEntityEvent {
-                world: *generation,
+                world: generation.stamp(),
                 domain: EntityEventDomain::Predicted,
                 timeline: cursor.timeline,
                 sequence: record.sequence,
@@ -710,8 +757,7 @@ fn set_ads_from_reset(
 }
 
 pub fn register_entity_event_dispatch(app: &mut App) {
-    app.init_resource::<EntityEventCursor>()
-        .init_resource::<frame::WorldGeneration>()
+    app.scoped::<EntityEventCursor>(frame::Timeline::Running)
         .init_resource::<AppliedEntityEventWalk>()
         .init_resource::<UnsupportedEntityEvents>()
         .init_resource::<NetIdentityGaps>()
@@ -721,9 +767,15 @@ pub fn register_entity_event_dispatch(app: &mut App) {
             Update,
             (
                 dispatch_entity_events
+                    .in_set(frame::InMatch)
                     .in_set(ClientSet::Reconcile)
                     .after(crate::sync_client_entities),
+                crate::client::runtime::publish_accepted_impacts
+                    .in_set(frame::InMatch)
+                    .in_set(frame::OwnerEventsPublished)
+                    .after(dispatch_owner_events),
                 dispatch_owner_events
+                    .in_set(frame::InMatch)
                     .in_set(frame::OwnerEventsPublished)
                     .after(crate::predict_local_move),
             ),

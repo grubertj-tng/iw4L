@@ -141,10 +141,59 @@ impl Default for ClassLoadoutCatalog {
 }
 
 impl ClassLoadoutCatalog {
-    pub fn from_weapon_registry(registry: std::sync::Arc<asset_game::WeaponRegistry>) -> Self {
+    pub fn progression_lock(&self, value: &str, data: &sim::LocalPlayerData) -> Option<String> {
+        if value.is_empty() || value == "specialty_null" {
+            return None;
+        }
+        let Some(registry) = self.resolver.0.as_deref() else {
+            return Some("Content is loading".into());
+        };
+        let (namespace, name) = asset_game::FamilyKey::parse(value)
+            .map(|family| (family.namespace, family.base))
+            .unwrap_or_else(|| {
+                (
+                    asset_core::AssetNamespace::Iw4,
+                    value.trim_end_matches("_mp").to_owned(),
+                )
+            });
+        let requirement = match registry.item_unlock_requirement(namespace, &name) {
+            Ok(requirement) => requirement,
+            Err(reason) => return Some(format!("{value}: {reason}")),
+        };
+        let Some(progression) = data.progression.as_ref() else {
+            return Some("Progression is loading".into());
+        };
+        if progression.rank < requirement.rank {
+            return Some(format!("Unlocks at level {}", requirement.rank + 1));
+        }
+        (!progression.unlocked(&requirement)).then(|| "Complete the required challenge".into())
+    }
+
+    pub fn validate_progression(
+        &self,
+        slot: &ClassSlotState,
+        data: &sim::LocalPlayerData,
+    ) -> Result<(), String> {
+        for row in ClassEditRow::ALL {
+            if let Some(reason) = self.progression_lock(slot.row_value(row), data) {
+                return Err(reason);
+            }
+        }
+        if slot.perk1 == "specialty_bling"
+            && slot.secondary_attachments.len() > 1
+            && let Some(reason) = self.progression_lock("specialty_secondarybling", data)
+        {
+            return Err(reason);
+        }
+        Ok(())
+    }
+
+    pub fn from_editor_catalog(registry: std::sync::Arc<asset_game::EditorWeaponCatalog>) -> Self {
         let families = registry.weapon_families();
+        let offered: std::collections::HashSet<_> =
+            families.offered().map(|family| &family.key).collect();
         let mut catalog = Self::default();
-        for family in families.offered() {
+        for family in families.families() {
             let key = family.key.asset_key();
             catalog
                 .presentation
@@ -182,6 +231,9 @@ impl ClassLoadoutCatalog {
                         },
                     ),
                 );
+            }
+            if !offered.contains(&family.key) {
+                continue;
             }
             let offer = frame::CacWeaponOffer {
                 key,
@@ -364,7 +416,17 @@ impl ClassLoadoutCatalog {
             .as_deref()
             .ok_or("Weapon catalog is not ready")?;
         let row = session::ClassRow::from(&frame::HostClassSlot::from(slot));
-        session::loadout::resolve_personal_class(&row, registry).map(|_| ())
+        let loadout = session::loadout::resolve_editor_class(&row, registry)?;
+        if loadout
+            .weapons
+            .iter()
+            .enumerate()
+            .all(|(slot, &id)| registry.class_slot_admission(id, slot))
+        {
+            Ok(())
+        } else {
+            Err("Weapon is unavailable for this class slot".into())
+        }
     }
 
     pub fn validate_edit(&self, slot: &ClassSlotState, row: ClassEditRow) -> Result<(), String> {
@@ -379,7 +441,7 @@ impl ClassLoadoutCatalog {
             _ => &[],
         };
         if Self::uses_categories(row) {
-            session::resolve_class_weapon(
+            session::resolve_editor_class_weapon(
                 registry,
                 slot.row_value(row),
                 attachments,
@@ -420,7 +482,7 @@ pub fn attachment_preview_key(weapon: &str, attachment: &str) -> String {
 }
 
 #[derive(Clone, Default)]
-pub struct CatalogResolver(pub Option<std::sync::Arc<asset_game::WeaponRegistry>>);
+pub struct CatalogResolver(pub Option<std::sync::Arc<asset_game::EditorWeaponCatalog>>);
 
 impl PartialEq for CatalogResolver {
     fn eq(&self, other: &Self) -> bool {

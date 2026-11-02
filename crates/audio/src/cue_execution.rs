@@ -113,6 +113,7 @@ pub(crate) struct CueTrigger {
     pub class: SoundClass,
     pub epoch: u64,
     pub pitch_scale: f32,
+    pub volume_scale: f32,
     pub fallbacks: Vec<String>,
 }
 
@@ -365,6 +366,7 @@ impl CueWork {
             }
             _ => (None, volume),
         };
+        media.bus = self.request.namespace;
         let start = CueStart {
             looping: self.source.is_some()
                 || (matches!(intent.class, SoundClass::Music | SoundClass::Ambience)
@@ -444,6 +446,7 @@ impl CueWork {
             scope: self.request.scope,
             epoch: self.request.epoch,
             pitch_scale: 1.0,
+            volume_scale: self.request.volume_scale,
             execution: CueIntent {
                 event: intent.event,
                 origin_inches: intent.origin_inches,

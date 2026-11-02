@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod limits;
+
 mod updates;
 
 use std::collections::HashMap;
@@ -12,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use master_protocol::{
-    ALPN, AdmissionFailure, Advert, AdvertId, Channel, ControlFrame, ControlHello, ControlRequest,
+    ALPN, AdmissionFailure, Advert, AdvertId, ControlFrame, ControlHello, ControlRequest,
     ControlResponse, EndpointRole, MAX_BOOTSTRAP_STREAM_BYTES, MAX_CONCURRENT_BOOTSTRAP,
     MAX_LIST_ADVERTS, MAX_RELAY_UNI_STREAMS, MemberId, PeerEvent, RelayDatagram, RequestBody,
     ResponseBody, RoomPhase, RoomView, SESSION_IDLE, SESSION_KEEP_ALIVE, ServiceError,
@@ -22,20 +24,53 @@ use master_protocol::{
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_platform_verifier::ConfigVerifierExt;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, Semaphore};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
 const MAX_ROOMS: usize = 10_000;
-const CONTROL_CAP: usize = 32;
 const CONTROL_PRIORITY: i32 = 0;
+
+struct QueuedControl {
+    frame: ControlFrame,
+    deadline: tokio::time::Instant,
+    _bytes: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+struct ControlSender {
+    tx: tokio::sync::mpsc::Sender<QueuedControl>,
+    bytes: Arc<Semaphore>,
+}
+
+impl ControlSender {
+    fn try_send(&self, frame: ControlFrame) -> Result<()> {
+        let len = encode_stream_frame(&frame)?.len();
+        let bytes = self
+            .bytes
+            .clone()
+            .try_acquire_many_owned(len as u32)
+            .map_err(|_| "control byte budget exhausted")?;
+        self.tx
+            .try_send(QueuedControl::new(frame, bytes))
+            .map_err(|_| "control queue exhausted")?;
+        Ok(())
+    }
+}
+
+impl QueuedControl {
+    fn new(frame: ControlFrame, bytes: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            frame,
+            deadline: tokio::time::Instant::now() + limits::values().queue_age,
+            _bytes: bytes,
+        }
+    }
+}
 
 const BOOTSTRAP_PRIORITY: i32 = -32;
 const CLI_DEADLINE: Duration = Duration::from_secs(8);
-const BOOTSTRAP_FORWARD: Duration = Duration::from_secs(8);
-const HELLO_DEADLINE: Duration = Duration::from_secs(8);
 const MAX_CONNECTIONS: usize = 256;
 /// A household or a LAN party shares one address.
 const MAX_CONNECTIONS_PER_ADDRESS: usize = 32;
@@ -44,6 +79,9 @@ const CLOSE_SERVICE_ERROR: u32 = 1;
 const CLOSE_SERVICE_DONE: u32 = 0;
 
 const MAX_CLOSE_REASON_BYTES: usize = 120;
+
+const DATAGRAM_SEND_BUFFER: usize = 128 * 1024;
+const RELAY_BACKLOG_BYTES: usize = 16 * 1024;
 
 struct AddressSlot {
     counts: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
@@ -100,7 +138,8 @@ enum Command {
 /// a new flag cannot reach one without the other.
 struct UnitSpec {
     updates: PathBuf,
-    channel: Channel,
+    name: String,
+    port: u16,
     exec: PathBuf,
     cert: PathBuf,
     key: PathBuf,
@@ -115,9 +154,10 @@ struct ClientTarget {
 }
 
 struct Peer {
+    online: Option<Instant>,
     player_name: String,
     connection: quinn::Connection,
-    control_tx: tokio::sync::mpsc::Sender<ControlFrame>,
+    control_tx: ControlSender,
 }
 
 struct PasswordVerifier {
@@ -179,11 +219,12 @@ impl ServiceState {
         connection_id: u64,
         player_name: String,
         connection: quinn::Connection,
-        control_tx: tokio::sync::mpsc::Sender<ControlFrame>,
+        control_tx: ControlSender,
     ) {
         self.peers.insert(
             connection_id,
             Peer {
+                online: None,
                 player_name,
                 connection,
                 control_tx,
@@ -389,6 +430,7 @@ impl ServiceState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    limits::configured()?;
     match parse_args()? {
         Command::Serve {
             bind,
@@ -423,7 +465,8 @@ fn parse_args() -> Result<Command> {
     let mut connect = None;
     let mut server_name = None;
     let mut ca_cert = None;
-    let mut channel = None;
+    let mut name = None;
+    let mut port = None;
     let mut exec = None;
     let mut user = None;
     let mut group = None;
@@ -439,7 +482,8 @@ fn parse_args() -> Result<Command> {
             "--connect" => connect = Some(value.parse()?),
             "--server-name" => server_name = Some(value),
             "--ca-cert" => ca_cert = Some(PathBuf::from(value)),
-            "--channel" => channel = Some(value.parse()?),
+            "--name" => name = Some(value),
+            "--port" => port = Some(value.parse()?),
             "--exec" => exec = Some(PathBuf::from(value)),
             "--user" => user = Some(value),
             "--group" => group = Some(value),
@@ -467,7 +511,8 @@ fn parse_args() -> Result<Command> {
         }
         "print-unit" => Ok(Command::PrintUnit(UnitSpec {
             updates,
-            channel: channel.ok_or("print-unit requires --channel prod|dev")?,
+            name: name.ok_or("print-unit requires --name NAME")?,
+            port: port.ok_or("print-unit requires --port PORT")?,
             exec: exec.ok_or("print-unit requires --exec PATH")?,
             cert: cert.ok_or("print-unit requires --cert PATH")?,
             key: key.ok_or("print-unit requires --key PATH")?,
@@ -478,21 +523,17 @@ fn parse_args() -> Result<Command> {
     }
 }
 
-/// The systemd unit for `spec`, on stdout. The binary that parses `serve`
-/// writes the `ExecStart` that invokes it: `cargo xtask master install` pipes
-/// this straight into `/etc/systemd/system/`, so the two cannot disagree about
-/// a flag, and `Channel` alone decides the port.
 fn print_unit(spec: &UnitSpec) -> Result<()> {
     let UnitSpec {
         updates,
-        channel,
+        name,
+        port,
         exec,
         cert,
         key,
         user,
         group,
     } = spec;
-    let port = channel.port();
     let updates = updates.display();
     let exec = exec.display();
     let cert = cert.display();
@@ -500,7 +541,7 @@ fn print_unit(spec: &UnitSpec) -> Result<()> {
     write!(
         std::io::stdout(),
         "[Unit]
-Description=IW4L {channel} master and relay
+Description=IW4L {name} master and relay
 After=network-online.target
 Wants=network-online.target
 
@@ -543,7 +584,7 @@ async fn serve(bind: SocketAddr, cert_path: &Path, key_path: &Path) -> Result<()
     ));
     transport.keep_alive_interval(Some(SESSION_KEEP_ALIVE));
     transport.datagram_receive_buffer_size(Some(128 * 1024));
-    transport.datagram_send_buffer_size(128 * 1024);
+    transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
 
     let endpoint = quinn::Endpoint::server(config, bind)?;
     let state = Arc::new(Mutex::new(ServiceState::default()));
@@ -652,11 +693,11 @@ async fn run_connection(
     connection_id: u64,
     connection: quinn::Connection,
 ) -> Result<()> {
-    let (mut send, recv) = tokio::time::timeout(HELLO_DEADLINE, connection.accept_bi())
+    let (mut send, recv) = tokio::time::timeout(limits::values().response, connection.accept_bi())
         .await
         .map_err(|_| "hello deadline (accept_bi)")??;
     send.set_priority(CONTROL_PRIORITY)?;
-    let (recv, hello) = tokio::time::timeout(HELLO_DEADLINE, read_owned_frame(recv))
+    let (recv, hello) = tokio::time::timeout(limits::values().response, read_owned_frame(recv))
         .await
         .map_err(|_| "hello deadline (first frame)")?;
     let hello = hello?;
@@ -671,18 +712,26 @@ async fn run_connection(
         hello.game_protocol,
         hello.build
     );
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ControlFrame>(CONTROL_CAP);
+    let (tx, mut control_rx) =
+        tokio::sync::mpsc::channel::<QueuedControl>(limits::values().queue_items);
+    let control_tx = ControlSender {
+        tx,
+        bytes: Arc::new(Semaphore::new(limits::values().queue_bytes)),
+    };
     state.lock().await.attach_peer(
         connection_id,
         normalize_player_name(&hello.player_name),
         connection.clone(),
         control_tx,
     );
+    let mut relay_gate = RelayGate::default();
     let mut children = tokio::task::JoinSet::new();
     children.spawn(async move {
         let result = async {
             while let Some(frame) = control_rx.recv().await {
-                write_frame(&mut send, &frame).await?;
+                tokio::time::timeout_at(frame.deadline, write_frame(&mut send, &frame.frame))
+                    .await
+                    .map_err(|_| "control queue/write deadline")??;
             }
             Result::<()>::Ok(())
         }
@@ -739,7 +788,7 @@ async fn run_connection(
             }
             datagram = connection.read_datagram() => {
                 let bytes = datagram?;
-                if let Err(error) = relay_datagram(state, connection_id, &bytes).await {
+                if let Err(error) = relay_datagram(state, connection_id, &bytes, &mut relay_gate).await {
                     let _ = writeln!(std::io::stderr(), "relay datagram: {error}");
                 }
             }
@@ -773,7 +822,7 @@ async fn dispatch_publishes(state: &Mutex<ServiceState>, publishes: Vec<(u64, Co
             };
             match peer.control_tx.try_send(frame) {
                 Ok(()) => {}
-                Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                Err(_) => {
                     failed.push(connection_id);
                     peer.connection
                         .close(0_u8.into(), b"control delivery failed");
@@ -796,6 +845,27 @@ async fn handle_request(
     let mut state = state.lock().await;
     let (body, publishes) = match request.body {
         RequestBody::Status => (ResponseBody::Status(StatusResponse::CURRENT), Vec::new()),
+        RequestBody::Population { online } => {
+            if let Some(peer) = state.peers.get_mut(&connection_id) {
+                peer.online = online.then(Instant::now);
+            }
+            let players = state.membership.len()
+                + state
+                    .peers
+                    .iter()
+                    .filter(|(id, peer)| {
+                        peer.online
+                            .is_some_and(|seen| seen.elapsed() < Duration::from_secs(10))
+                            && !state.membership.contains_key(id)
+                    })
+                    .count();
+            (
+                ResponseBody::Population {
+                    players: u32::try_from(players).unwrap_or(u32::MAX),
+                },
+                Vec::new(),
+            )
+        }
         RequestBody::CreateRoom {
             name,
             map,
@@ -950,6 +1020,13 @@ fn create_room(
     available: master_protocol::ContentFlags,
     password: String,
 ) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    if !master_protocol::ContentFlags::KNOWN.contains(requires)
+        || !requires.contains(master_protocol::ContentFlags::IW4)
+        || !requires.missing_from(available).is_empty()
+        || !map_content_allowed(&map, requires)
+    {
+        return (ResponseBody::Error(ServiceError::InvalidAdvert), Vec::new());
+    }
     if state.membership.contains_key(&connection_id) {
         return (
             ResponseBody::Error(ServiceError::AlreadyHosting),
@@ -1098,6 +1175,10 @@ fn leave_room(
     (ResponseBody::RoomLeft, publishes)
 }
 
+fn map_content_allowed(map: &str, families: master_protocol::ContentFlags) -> bool {
+    master_protocol::ContentFlags::for_map(map).is_some_and(|family| families.contains(family))
+}
+
 fn set_options(
     state: &mut ServiceState,
     connection_id: u64,
@@ -1108,7 +1189,9 @@ fn set_options(
     match state.host_of(connection_id) {
         Ok(room_id) => {
             let room = state.rooms.get_mut(&room_id).expect("host room");
-            if room.view.phase.in_match() && (room.view.map != map || room.view.mode != mode) {
+            if !map_content_allowed(&map, room.view.requires)
+                || (room.view.phase.in_match() && (room.view.map != map || room.view.mode != mode))
+            {
                 return (ResponseBody::Error(ServiceError::InvalidAdvert), Vec::new());
             }
             room.view.map = map;
@@ -1134,7 +1217,9 @@ fn start_match(
     match state.host_of(connection_id) {
         Ok(room_id) => {
             let room = state.rooms.get_mut(&room_id).expect("host room");
-            if room.view.phase.in_match() && (room.view.map != map || room.view.mode != mode) {
+            if !map_content_allowed(&map, room.view.requires)
+                || (room.view.phase.in_match() && (room.view.map != map || room.view.mode != mode))
+            {
                 return (ResponseBody::Error(ServiceError::InvalidAdvert), Vec::new());
             }
             room.view.map = map;
@@ -1318,8 +1403,8 @@ async fn bootstrap_forward(
     mut recv: quinn::RecvStream,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> ConnTask {
-    let result = tokio::time::timeout(BOOTSTRAP_FORWARD, async {
-        let bytes = recv.read_to_end(MAX_BOOTSTRAP_STREAM_BYTES).await?;
+    let result = tokio::time::timeout(limits::values().transfer, async {
+        let bytes = read_transfer(&mut recv).await?;
         let relay = decode_relay_stream(&bytes)?;
         let (target, outgoing) = {
             let current = state.lock().await;
@@ -1327,11 +1412,17 @@ async fn bootstrap_forward(
         };
         let mut send = target.open_uni().await?;
         send.set_priority(BOOTSTRAP_PRIORITY)?;
-        send.write_all(&outgoing).await?;
-        send.finish()?;
+        let result = write_transfer(&mut send, &outgoing).await;
+        if result.is_err() {
+            let _ = send.reset(0_u8.into());
+        }
+        result?;
         Result::<()>::Ok(())
     })
     .await;
+    if !matches!(result, Ok(Ok(()))) {
+        let _ = recv.stop(0_u8.into());
+    }
     match result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -1344,17 +1435,63 @@ async fn bootstrap_forward(
     ConnTask::Bootstrap
 }
 
+// Gameplay packets arrive split into fragments, and one lost fragment loses
+// the packet. Quinn sheds the oldest datagrams of a full buffer one at a time,
+// which on a slow target leaves almost no packet whole.
+#[derive(Default)]
+struct RelayGate {
+    shedding: Option<u32>,
+}
+
+impl RelayGate {
+    fn admit(&mut self, payload: &[u8], target: &quinn::Connection, wire_bytes: usize) -> bool {
+        let Some((index, count, packet_id)) = fragment_header(payload) else {
+            return true;
+        };
+        if index != 0 {
+            return self.shedding != Some(packet_id);
+        }
+        let queued = DATAGRAM_SEND_BUFFER.saturating_sub(target.datagram_send_buffer_space());
+        let admitted =
+            queued < wire_bytes || queued + wire_bytes * usize::from(count) <= RELAY_BACKLOG_BYTES;
+        self.shedding = (!admitted).then_some(packet_id);
+        admitted
+    }
+}
+
+fn fragment_header(payload: &[u8]) -> Option<(u16, u16, u32)> {
+    let header = payload.get(..12)?;
+    if header[..3] != *b"RF\x02" {
+        return None;
+    }
+    let index = u16::from_le_bytes([header[4], header[5]]);
+    let count = u16::from_le_bytes([header[6], header[7]]);
+    let packet_id = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    Some((index, count, packet_id))
+}
+
 async fn relay_datagram(
     state: &Mutex<ServiceState>,
     connection_id: u64,
     bytes: &[u8],
+    gate: &mut RelayGate,
 ) -> Result<()> {
     let relay = decode_relay(bytes)?;
     let (target, outgoing) = {
         let current = state.lock().await;
         current.route_target(connection_id, &relay)?
     };
-    target.send_datagram(outgoing.into())?;
+    let payload = match relay {
+        RelayDatagram::ClientToHost(payload) | RelayDatagram::HostToMember { payload, .. } => {
+            payload
+        }
+        RelayDatagram::ServiceToHost { payload, .. } | RelayDatagram::ServiceToMember(payload) => {
+            payload
+        }
+    };
+    if gate.admit(payload, &target, outgoing.len()) {
+        target.send_datagram(outgoing.into())?;
+    }
     Ok(())
 }
 
@@ -1492,6 +1629,46 @@ async fn rpc(
             }
         }
     }
+}
+
+async fn read_transfer(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk =
+            tokio::time::timeout(limits::values().progress, recv.read_chunk(16 * 1024, true))
+                .await
+                .map_err(|_| "transfer progress deadline")??;
+        let Some(chunk) = chunk else {
+            return Ok(bytes);
+        };
+        if chunk.bytes.is_empty() || bytes.len() + chunk.bytes.len() > MAX_BOOTSTRAP_STREAM_BYTES {
+            return Err("transfer byte budget exceeded".into());
+        }
+        bytes.extend_from_slice(&chunk.bytes);
+    }
+}
+
+async fn write_transfer(send: &mut quinn::SendStream, bytes: &[u8]) -> Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + 16 * 1024).min(bytes.len());
+        let written =
+            tokio::time::timeout(limits::values().progress, send.write(&bytes[offset..end]))
+                .await
+                .map_err(|_| "transfer progress deadline")??;
+        if written == 0 {
+            return Err("transfer made no progress".into());
+        }
+        offset += written;
+    }
+    send.finish()?;
+    if let Some(code) = tokio::time::timeout(limits::values().progress, send.stopped())
+        .await
+        .map_err(|_| "transfer acknowledgement deadline")??
+    {
+        return Err(format!("transfer refused with code {code}").into());
+    }
+    Ok(())
 }
 
 async fn read_owned_frame(

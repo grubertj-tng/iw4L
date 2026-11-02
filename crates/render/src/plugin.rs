@@ -29,8 +29,8 @@ impl Plugin for RenderPlugin {
         .add_systems(
             Update,
             (
-                publish_overhead_posed_players,
-                publish_overhead_posed_models,
+                publish_overhead_posed_players.in_set(frame::InMatch),
+                publish_overhead_posed_models.in_set(frame::InMatch),
             )
                 .after(frame::WorkerCmdSet::SkinModel)
                 .in_set(hud::OverheadPosedPlayerFramePublished)
@@ -39,6 +39,7 @@ impl Plugin for RenderPlugin {
 
         crate::diag::acceptance::register_acceptance_systems(app);
         register_render_frame_diag(app);
+        crate::resolution::register(app);
         app.add_systems(Update, sample_render_frame_diag.in_set(ClientSet::Diag));
         register_frame_spans(app);
         app.init_resource::<CaptureQueue>().add_systems(

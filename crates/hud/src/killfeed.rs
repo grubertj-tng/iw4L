@@ -112,7 +112,7 @@ fn hide(pass: &mut HudTessPass) {
 
 fn pick_kill_icon(
     payload: &sim::EntityEventPayload,
-    weapons: Option<&PreparedWeapons>,
+    weapons: Option<&assets::BoundWeapons<'_>>,
 ) -> KillIconPick {
     let chrome = crate::images::HUD_CHROME_NAMESPACE;
 
@@ -133,25 +133,32 @@ fn pick_kill_icon(
         };
     }
     let weapon = payload.event_parm as u32;
-    let (ratio, flip) = match weapons.and_then(|reg| reg.0.hud_facts_of(weapon)) {
+    let fallback = KillIconPick {
+        stem: KILLICON_DIED.to_owned(),
+        namespace: chrome,
+        ratio: 0,
+        flip: false,
+    };
+    let Some(reg) = weapons else {
+        return fallback;
+    };
+    let Some(stem) = reg
+        .registry()
+        .kill_icon_image_of(weapon)
+        .or_else(|| reg.registry().kill_icon_of(weapon))
+    else {
+        return fallback;
+    };
+    let (ratio, flip) = match reg.row(weapon).and_then(|weapon| weapon.hud_facts()) {
         Some(facts) => (facts.kill_icon_ratio, facts.flip_kill_icon),
         None => (0, false),
     };
-    let (stem, namespace) = if let Some(reg) = weapons {
-        let ns = reg.0.namespace_of(weapon).unwrap_or(chrome);
-        if let Some(image) = reg.0.kill_icon_image_of(weapon) {
-            (image.to_owned(), ns)
-        } else if let Some(name) = reg.0.kill_icon_of(weapon) {
-            (name.to_owned(), ns)
-        } else {
-            (KILLICON_DIED.to_owned(), chrome)
-        }
-    } else {
-        (KILLICON_DIED.to_owned(), chrome)
-    };
     KillIconPick {
-        stem,
-        namespace,
+        stem: stem.to_owned(),
+        namespace: reg
+            .registry()
+            .component_namespace_of(weapon, asset_game::WeaponComponent::Material)
+            .unwrap_or(chrome),
         ratio,
         flip,
     }
@@ -167,20 +174,45 @@ fn snapshot_client_team(presented: &net::PresentedSnapshot, client: i32) -> i32 
         .map_or(0, |meta| meta.client_state_team)
 }
 
-fn obituary_name_color(local_team: i32, team: i32) -> [f32; 4] {
+pub fn team_name_color(local_team: i32, team: i32, dvars: sim::ScriptDvars<'_>) -> [f32; 4] {
     if !matches!(local_team, 1 | 2) || !matches!(team, 1 | 2) {
         return [1.0, 1.0, 1.0, 1.0];
     }
-    let rgb = if team == local_team {
-        gamemode_iw4::TEAM_COLOR_MY_TEAM
+    let (name, default) = if dvars
+        .int("useRelativeTeamColors")
+        .is_some_and(|value| value != 0)
+    {
+        if team == local_team {
+            ("g_TeamColor_MyTeam", gamemode_iw4::TEAM_COLOR_MY_TEAM)
+        } else {
+            ("g_TeamColor_EnemyTeam", gamemode_iw4::TEAM_COLOR_ENEMY_TEAM)
+        }
+    } else if team == 1 {
+        ("g_TeamColor_Axis", gamemode_iw4::TEAM_COLOR_AXIS)
     } else {
-        gamemode_iw4::TEAM_COLOR_ENEMY_TEAM
+        ("g_TeamColor_Allies", gamemode_iw4::TEAM_COLOR_ALLIES)
     };
-    let mut color = [1.0; 4];
-    for (slot, value) in color.iter_mut().zip(rgb.split_whitespace()) {
-        *slot = value.parse().unwrap_or(1.0);
-    }
-    color
+    let parse = |rgb: &str| {
+        let mut values = rgb.split_whitespace().map(str::parse::<f32>);
+        let rgb = [
+            values.next()?.ok()?,
+            values.next()?.ok()?,
+            values.next()?.ok()?,
+        ];
+        (values.next().is_none() && rgb.iter().all(|value| value.is_finite())).then(|| {
+            [
+                rgb[0].clamp(0.0, 1.0),
+                rgb[1].clamp(0.0, 1.0),
+                rgb[2].clamp(0.0, 1.0),
+                1.0,
+            ]
+        })
+    };
+    dvars
+        .string(name)
+        .and_then(parse)
+        .or_else(|| parse(default))
+        .unwrap_or([1.0; 4])
 }
 
 fn snapshot_client_name(presented: &net::PresentedSnapshot, client: i32) -> String {
@@ -210,7 +242,10 @@ pub(crate) fn obituary(
         return;
     }
     let payload = obituary.event.payload;
-    let pick = pick_kill_icon(&payload, weapons.as_deref());
+    let bound = weapons
+        .as_deref()
+        .and_then(|weapons| weapons.for_event(obituary.event.world).ok());
+    let pick = pick_kill_icon(&payload, bound.as_ref());
     let attacker = snapshot_client_name(&presented, payload.attacker_entity_num);
     let victim = snapshot_client_name(&presented, payload.other_entity_num);
     let attacker_team = snapshot_client_team(&presented, payload.attacker_entity_num);
@@ -306,6 +341,9 @@ pub(crate) fn update_killfeed(
 
     let now = clock.time();
     for cmd in notifies.read() {
+        if cmd.tag == net::SVC_CHAT {
+            continue;
+        }
         if !window.seen.insert(cmd.id) {
             continue;
         }
@@ -395,6 +433,11 @@ pub(crate) fn update_killfeed(
     }
 
     let local_team = snapshot_client_team(&presented, local.0.0 as i32);
+    let Some(snapshot) = presented.snapshot() else {
+        hide(&mut pass);
+        return;
+    };
+    let dvars = snapshot.meta.script_dvars(local.0);
     let Some(item) = catalog
         .as_ref()
         .and_then(|c| c.get("hud_fullscreen"))
@@ -537,7 +580,7 @@ pub(crate) fn update_killfeed(
                             applied.h,
                             font_material.clone(),
                             attacker.clone(),
-                            obituary_name_color(local_team, *attacker_team),
+                            team_name_color(local_team, *attacker_team, dvars),
                             "killfeed_obituary",
                         ));
                         x_virtual += attacker_w + icon_spacing;
@@ -601,7 +644,7 @@ pub(crate) fn update_killfeed(
                         applied.h,
                         font_material.clone(),
                         victim.clone(),
-                        obituary_name_color(local_team, *victim_team),
+                        team_name_color(local_team, *victim_team, dvars),
                         "killfeed_obituary",
                     ));
                 }

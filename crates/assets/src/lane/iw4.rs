@@ -361,6 +361,11 @@ impl ZoneLane for Iw4Lane {
         });
         report.extend(image_report.into_iter().flatten());
         report.extend(clip_report);
+        let map_content = std::sync::Arc::new(asset_world::build_map_content(
+            &stream,
+            fx_glass.as_ref(),
+            clip.as_ref(),
+        ));
         let fx_glass = fx_glass.map(|mut g| {
             g.resolve_material_edges(&materials);
             g
@@ -414,6 +419,7 @@ impl ZoneLane for Iw4Lane {
                     fx: std::mem::take(&mut fx),
                     fx_models,
                     fx_glass,
+                    map_content,
                     impact_fx: impact_fx.take(),
                     dyn_ents,
                     exp_fog,
@@ -421,7 +427,7 @@ impl ZoneLane for Iw4Lane {
                     film_visions,
                     createart_name,
                     policy: WorldDrawPolicy::iw4(),
-                    ..Default::default()
+                    ..PreparedWorld::empty(WorldDrawPolicy::iw4())
                 },
                 collision: clip,
                 spawns: dm_spawns,
@@ -636,6 +642,7 @@ impl ZoneLane for Iw4Lane {
                     sound: map_sound,
                     materials: map_materials,
                     world: PreparedWorld {
+                        source_namespace: Some(asset_core::AssetNamespace::Iw4),
                         draw: Some(draw),
                         dynamic_light: None,
                         static_model_meshes,
@@ -651,11 +658,14 @@ impl ZoneLane for Iw4Lane {
                         fx,
                         fx_models,
                         fx_glass,
+                        map_content,
                         impact_fx,
+                        family_impact_fx: Vec::new(),
                         reflection_probe_images,
                         intermission_view,
                         exp_fog,
-                        t6_film_grade: None,
+                        t6_vision: None,
+                        t6_visions: Default::default(),
                         film_vision,
                         film_visions,
                         createart_name,
@@ -697,6 +707,7 @@ impl ZoneLane for Iw4Lane {
                         fx,
                         fx_models,
                         fx_glass,
+                        map_content,
                         impact_fx,
                         dyn_ents,
                         exp_fog,
@@ -704,7 +715,7 @@ impl ZoneLane for Iw4Lane {
                         film_visions,
                         createart_name,
                         policy: WorldDrawPolicy::iw4(),
-                        ..Default::default()
+                        ..PreparedWorld::empty(WorldDrawPolicy::iw4())
                     },
                     collision: clip,
                     spawns: dm_spawns,
@@ -1076,6 +1087,7 @@ impl ZoneLane for Iw4Lane {
             moved.total_bytes() as f64 / (1024.0 * 1024.0),
         ));
             CommonCensus {
+                ui_images: Vec::new(),
                 pending_images,
                 scene_models: sink.scene_models,
                 shared_surfaces: sink.shared_surfaces,
@@ -1113,6 +1125,7 @@ impl ZoneLane for Iw4Lane {
                 memory.payload_bytes,
             ));
             CommonCensus {
+                ui_images: Vec::new(),
                 pending_images: None,
                 scene_models: sink.scene_models,
                 shared_surfaces: sink.shared_surfaces,
@@ -1236,7 +1249,9 @@ fn decode_map_material_images(
     glass_names: Vec<String>,
 ) -> Vec<String> {
     let mut report = Vec::new();
-    match decode_material_color_maps(path, catalog, &stage, crate::session_load::load_pool()) {
+    let mut trees = asset_transport::NamespaceTrees::default();
+    trees.adopt_zone(path);
+    match decode_material_color_maps(&trees, catalog, &stage, crate::session_load::load_pool()) {
         Ok(stats) => {
             report.push(format!(
                 "IWD color/normal maps: {}/{} decoded, {} missing, {} unsupported from {} archives",
@@ -1257,7 +1272,7 @@ fn decode_map_material_images(
         name: name.clone(),
     }));
     match asset_material::material_images::decode_images_for_keys(
-        path,
+        &trees,
         catalog,
         keys,
         &stage,

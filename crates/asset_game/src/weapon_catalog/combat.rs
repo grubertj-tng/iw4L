@@ -42,6 +42,7 @@ fn captured_input(f: WeaponBodyFacts, melee_charge_anim: bool) -> CapturedCombat
         first_raise_time_ms: f.first_raise_time_ms,
         reload_time_ms: f.reload_time_ms,
         reload_empty_time_ms: f.reload_empty_time_ms,
+        empty_reload: weapon_iw4::EmptyReloadPolicy::Authored,
         clip_size: f.clip_size,
         start_ammo: f.start_ammo_rounds(),
         max_ammo: f.max_ammo_rounds(),
@@ -78,6 +79,7 @@ fn captured_input(f: WeaponBodyFacts, melee_charge_anim: bool) -> CapturedCombat
         stunned_start_time_ms: f.stunned_start_time_ms,
         stunned_end_time_ms: f.stunned_end_time_ms,
         damage: f.damage,
+        flame_damage_interval_ms: f.flame_damage_interval_ms,
         min_damage: f.min_damage,
         max_damage_range: f.max_damage_range,
         min_damage_range: f.min_damage_range,
@@ -103,6 +105,7 @@ fn captured_input(f: WeaponBodyFacts, melee_charge_anim: bool) -> CapturedCombat
         ads_fire_only: f.ads_fire_only,
         melee_damage: f.melee_damage,
         can_hold_breath: f.can_hold_breath,
+        scope_zoom: f.scope_zoom,
         overlay_reticle: f.overlay_reticle,
         melee_time_ms: f.melee_time_ms,
         melee_delay_ms: f.melee_delay_ms,
@@ -142,6 +145,14 @@ impl WeaponCombatProjection {
             f.knife_model = melee_weapon;
         }
         let mut input = captured_input(f, melee_charge_anim);
+        input.empty_reload = if registry
+            .anim_of(id, asset_iw4::size::weap_anim::RELOAD_EMPTY)
+            .is_some()
+        {
+            weapon_iw4::EmptyReloadPolicy::Authored
+        } else {
+            weapon_iw4::EmptyReloadPolicy::Ordinary
+        };
         input.alternate_weapon = registry.alternate_of(id);
         Some(Self {
             input,
@@ -191,7 +202,7 @@ impl WeaponCombatProjection {
 }
 
 impl WeaponRegistry {
-    pub fn combat_facts_of(
+    pub(crate) fn combat_facts_of(
         &self,
         id: u32,
         rules: WeaponHostRules,

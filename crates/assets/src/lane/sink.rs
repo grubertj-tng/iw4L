@@ -9,9 +9,15 @@ use super::helpers::MapXModelCatalog;
 
 fn is_cac_table(name: &str) -> bool {
     asset_game::is_stats_table_name(name)
+        || name.eq_ignore_ascii_case("mp/perkTable.csv")
+        || name.eq_ignore_ascii_case("mp/rankTable.csv")
+        || name.eq_ignore_ascii_case("mp/rankIconTable.csv")
+        || name.eq_ignore_ascii_case("mp/unlockTable.csv")
+        || name.eq_ignore_ascii_case("mp/unlockTableMP.csv")
         || name.eq_ignore_ascii_case("mp/attachmentTable.csv")
         || name.eq_ignore_ascii_case("mp/attachmentCombos.csv")
         || name.eq_ignore_ascii_case("mp/weaponoptions.csv")
+        || name.eq_ignore_ascii_case("mp/camoTable.csv")
 }
 
 fn iw5_cac_table(
@@ -159,6 +165,7 @@ pub(crate) struct ZoneWalkSink {
     pub models: ModelCensus,
     pub materials: MaterialCatalog,
     pub fx: FxCatalog,
+    material_names_t5: HashMap<fastfile_t5::Ptr, fastfile_t5::Ptr>,
     pub fx_models: asset_game::FxModelCatalog,
     pub impact_fx: ImpactFxCatalog,
     pub tracers: asset_game::TracerCatalog,
@@ -371,6 +378,14 @@ impl fastfile_iw5::AssetSink for ZoneWalkSink {
 }
 
 impl fastfile_iw5::AssetLinkSink for ZoneWalkSink {
+    fn capture_fx(
+        &mut self,
+        stream: &fastfile_iw5::ZoneStream<'_>,
+        geometry: fastfile_iw5::FxEffectDefGeometry,
+    ) -> fastfile_iw5::Result<()> {
+        self.fx.capture_iw5(stream, geometry, &self.materials)
+    }
+
     fn remember_xmodel_surfaces(
         &mut self,
         slot: fastfile_iw5::Ptr,
@@ -477,6 +492,7 @@ impl fastfile_iw5::AssetLinkSink for ZoneWalkSink {
         if let Some(sound) = self.sound.as_mut() {
             sound.raw_file(name, data, zlib_compressed);
         }
+        capture_film_vision(&mut self.film_visions, name, data, zlib_compressed);
         self.compass.capture(name, data, zlib_compressed);
         if asset_world::is_createart_source(name) {
             self.createart_name = Some(name.to_owned());
@@ -557,7 +573,7 @@ impl fastfile_iw5::AssetLinkSink for CommonWalkSink {
             .name
             .and_then(|ptr| stream.cstr(ptr).ok())
             .map(str::to_owned);
-        Ok(())
+        self.fx.capture_iw5(stream, geometry, &self.materials)
     }
 
     fn capture_attachment(
@@ -723,6 +739,13 @@ impl fastfile_iw5::AssetLinkSink for CommonWalkSink {
         if let Some(sound) = self.sound.as_mut() {
             sound.raw_file(name, data, zlib_compressed);
         }
+        self.player_anim_sources.capture(
+            asset_core::AssetNamespace::Iw5,
+            name,
+            data,
+            zlib_compressed,
+        );
+        capture_film_vision(&mut self.film_visions, name, data, zlib_compressed);
         Ok(())
     }
 
@@ -874,7 +897,17 @@ impl fastfile_t5::AssetLinkSink for CommonWalkSink {
         s: &fastfile_t5::ZoneStream<'_>,
         geometry: fastfile_t5::FxEffectDefGeometry,
     ) -> fastfile_t5::Result<()> {
-        self.fx.capture_t5(s, geometry, &self.materials);
+        self.fx.capture_t5(s, geometry, &self.materials, &|slot| {
+            let name = self.material_names_t5.get(&slot).copied().or_else(|| {
+                let fastfile_t5::ZonePtr::Offset(target) = s.ptr_at(slot, 0).ok()? else {
+                    return None;
+                };
+                self.material_names_t5
+                    .get(&s.resolve_alias(target))
+                    .copied()
+            })?;
+            s.cstr(s.resolve_alias(name)).ok().map(str::to_owned)
+        });
         Ok(())
     }
 
@@ -930,6 +963,12 @@ impl fastfile_t5::AssetLinkSink for CommonWalkSink {
         {
             self.teamsets.insert(key, icons);
         }
+        self.player_anim_sources.capture(
+            asset_core::AssetNamespace::T5,
+            name,
+            data,
+            zlib_compressed,
+        );
         self.scripts.capture(name, data, zlib_compressed);
         Ok(())
     }
@@ -984,7 +1023,17 @@ impl fastfile_t5::AssetLinkSink for ZoneWalkSink {
         s: &fastfile_t5::ZoneStream<'_>,
         geometry: fastfile_t5::FxEffectDefGeometry,
     ) -> fastfile_t5::Result<()> {
-        self.fx.capture_t5(s, geometry, &self.materials);
+        self.fx.capture_t5(s, geometry, &self.materials, &|slot| {
+            let name = self.material_names_t5.get(&slot).copied().or_else(|| {
+                let fastfile_t5::ZonePtr::Offset(target) = s.ptr_at(slot, 0).ok()? else {
+                    return None;
+                };
+                self.material_names_t5
+                    .get(&s.resolve_alias(target))
+                    .copied()
+            })?;
+            s.cstr(s.resolve_alias(name)).ok().map(str::to_owned)
+        });
         Ok(())
     }
 
@@ -1031,6 +1080,13 @@ impl fastfile_t5::AssetLinkSink for ZoneWalkSink {
         target: fastfile_t5::Ptr,
     ) -> fastfile_t5::Result<()> {
         self.materials.t5_alias(ty, slot, target);
+        if ty == fastfile_t5::AssetType::Material {
+            if let Some(name) = self.material_names_t5.get(&target).copied() {
+                self.material_names_t5.insert(slot, name);
+            } else {
+                self.material_names_t5.remove(&slot);
+            }
+        }
         if ty == fastfile_t5::AssetType::Fx {
             self.fx.note_alias(t5_iw4_ptr(slot), t5_iw4_ptr(target));
         }
@@ -1047,6 +1103,22 @@ impl fastfile_t5::AssetLinkSink for ZoneWalkSink {
             );
         }
         Ok(())
+    }
+
+    fn remember_material_name(
+        &mut self,
+        slot: fastfile_t5::Ptr,
+        insert_slot: Option<fastfile_t5::Ptr>,
+        name: fastfile_t5::Ptr,
+    ) {
+        self.material_names_t5.insert(slot, name);
+        if let Some(slot) = insert_slot {
+            self.material_names_t5.insert(slot, name);
+        }
+    }
+
+    fn material_name_ptr(&self, slot: fastfile_t5::Ptr) -> Option<fastfile_t5::Ptr> {
+        self.material_names_t5.get(&slot).copied()
     }
 
     fn capture_raw_file(
@@ -1447,7 +1519,7 @@ impl AssetLinkSink for CommonWalkSink {
                     geometry,
                     Some(&self.materials),
                 )
-                .map(std::sync::Arc::new);
+                .map(|skel| self.shared_surfaces.share_geometry(skel));
                 if let Some(skel) = &skel {
                     self.shared_surfaces.retain(stream, geometry, skel.clone());
                     self.fx_models.capture_shared(skel.clone(), &self.materials);
@@ -1512,7 +1584,7 @@ impl AssetLinkSink for CommonWalkSink {
             sound.raw_file(name, data, zlib_compressed);
         }
         self.player_anim_sources
-            .capture(name, data, zlib_compressed);
+            .capture(self.materials.capture_ns(), name, data, zlib_compressed);
         if let Some(table) = asset_game::capture_pen_table(name, data, zlib_compressed) {
             self.pen_table = Some(table);
         }
@@ -2106,4 +2178,18 @@ fn t5_iw4_ptr(p: fastfile_t5::Ptr) -> Ptr {
         block: p.block,
         offset: p.offset,
     }
+}
+
+fn capture_film_vision(
+    catalog: &mut super::FilmVisionCatalog,
+    name: &str,
+    data: &[u8],
+    compressed: bool,
+) {
+    let result = match asset_world::parse_film_vision_rawfile(name, data, compressed) {
+        Ok(Some(vision)) => Ok(vision),
+        Ok(None) => return,
+        Err(error) => Err(error),
+    };
+    catalog.insert(name.replace('\\', "/").to_ascii_lowercase(), result);
 }

@@ -1,3 +1,5 @@
+mod skin_support;
+pub use skin_support::SkinSupport;
 pub mod camera;
 pub mod dpvs_cells;
 pub mod dyn_atpoint;
@@ -13,7 +15,9 @@ pub mod view_parms;
 pub mod world_instances;
 pub mod xmodel_draw;
 
-pub use camera::{FlyCamera, FpvLens, SimCamera, WorldCameraPose, transform_from_iw_view};
+pub use camera::{
+    CameraView, FlyCamera, FpvLens, SimCamera, WorldCameraPose, transform_from_iw_view,
+};
 pub use dpvs_cells::{DynEntModelEntity, PublishedCellVis, WorldDpvsCells};
 pub use dyn_atpoint::DynAtPointLookup;
 pub use frustum::{FrustumSpec, clip_from_world_frustum_planes, perspective_frustum_planes};
@@ -52,4 +56,6 @@ pub use view_parms::{
     pack_live_view_parms, prepare_scene_view,
 };
 pub use world_instances::{WorldDynEntInstance, WorldScriptModelInstance};
-pub use xmodel_draw::{XModelCasterBound, XModelColourRefusal, XModelSurfaceDraw};
+pub use xmodel_draw::{
+    PreparedSunShadowFrame, XModelCasterBound, XModelColourRefusal, XModelSurfaceDraw,
+};

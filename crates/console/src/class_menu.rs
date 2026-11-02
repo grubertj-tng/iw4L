@@ -1,7 +1,7 @@
 use asset_core::AssetNamespace;
 use bevy::prelude::*;
 use frame::{UiMenuDvars, UiMenuRequest};
-use ui::classes::display::{category_label, label, localized, preview_image};
+use ui::classes::display::{category_label, class_name, label, localized, preview_image};
 use ui::{ClassEditRow, ClassLoadoutCatalog, ClassPickerFolder, SessionClassStore};
 
 use crate::{CommandSpec, ConsoleCommand, ConsoleRegistry};
@@ -16,6 +16,7 @@ pub(crate) struct ClassMenuState {
     page: usize,
     attachments: bool,
     camo: bool,
+    samples: bool,
     hover: usize,
 }
 
@@ -23,9 +24,12 @@ fn camo_names(catalog: &ClassLoadoutCatalog, weapon: &str) -> Vec<String> {
     let Some(registry) = catalog.resolver.0.as_deref() else {
         return Vec::new();
     };
-    let Ok(id) =
-        session::resolve_class_weapon(registry, weapon, &[], asset_game::LoadoutRules::default())
-    else {
+    let Ok(id) = session::resolve_editor_class_weapon(
+        registry,
+        weapon,
+        &[],
+        asset_game::LoadoutRules::default(),
+    ) else {
         return Vec::new();
     };
     registry
@@ -39,11 +43,68 @@ fn camo_preview(catalog: &ClassLoadoutCatalog, weapon: &str, camo: &str) -> Stri
     let Some(registry) = catalog.resolver.0.as_deref() else {
         return String::new();
     };
-    session::resolve_class_weapon(registry, weapon, &[], asset_game::LoadoutRules::default())
+    session::resolve_editor_class_weapon(registry, weapon, &[], asset_game::LoadoutRules::default())
         .map_or_else(
             |_| String::new(),
-            |id| registry.camouflage_preview(id, camo),
+            |id| {
+                registry
+                    .camouflage_preview(id, camo)
+                    .unwrap_or_else(String::new)
+            },
         )
+}
+
+fn localized_camo_label(
+    catalog: &ClassLoadoutCatalog,
+    loc: &asset_game::LocalizeCatalog,
+    weapon: &str,
+    camo: &str,
+) -> String {
+    let label = || {
+        if camo.is_empty() {
+            return loc.text("MPUI_NONE");
+        }
+        let registry = catalog.resolver.0.as_deref()?;
+        let id = session::resolve_editor_class_weapon(
+            registry,
+            weapon,
+            &[],
+            asset_game::LoadoutRules::default(),
+        )
+        .ok()?;
+        loc.text_in(
+            registry.identity_namespace_of(id)?,
+            registry.camouflage_caption(id, camo)?,
+        )
+    };
+    let mut label = label()
+        .map(str::to_owned)
+        .unwrap_or_else(|| camo_label(camo));
+    if !camo.is_empty()
+        && let Some(registry) = catalog.resolver.0.as_deref()
+        && let Ok(id) = session::resolve_editor_class_weapon(
+            registry,
+            weapon,
+            &[],
+            asset_game::LoadoutRules::default(),
+        )
+        && let Some(slot) = registry.camouflage_slot(id, camo)
+        && let Some((view, world)) = registry.appearance_status(id, slot)
+    {
+        let unavailable = |status: &asset_game::AppearanceModelStatus| {
+            matches!(
+                status,
+                asset_game::AppearanceModelStatus::DeclaredUnavailable { .. }
+            )
+        };
+        match (unavailable(&view), unavailable(&world)) {
+            (true, true) => label.push_str(" (models unavailable)"),
+            (true, false) => label.push_str(" (first-person model unavailable)"),
+            (false, true) => label.push_str(" (world model unavailable)"),
+            _ => {}
+        }
+    }
+    label
 }
 
 fn camo_label(camo: &str) -> String {
@@ -95,6 +156,12 @@ impl ClassMenuState {
     }
 
     fn choices(&self, catalog: &ClassLoadoutCatalog, store: &SessionClassStore) -> Vec<String> {
+        if self.samples {
+            return ui::showcase_classes()
+                .iter()
+                .map(|preset| preset.name.to_owned())
+                .collect();
+        }
         let Some(row) = self.row else {
             return Vec::new();
         };
@@ -127,6 +194,8 @@ impl ClassMenuState {
 
 pub(crate) fn register(registry: &mut ConsoleRegistry) {
     for name in [
+        "ui_class_setup",
+        "ui_class_samples",
         "ui_class_slot",
         "ui_class_preview_slot",
         "ui_class_edit",
@@ -152,22 +221,81 @@ fn index(command: &ConsoleCommand) -> Result<usize, String> {
         .ok_or_else(|| "Invalid class selection".into())
 }
 
+fn open_class_setup(
+    state: &mut ClassMenuState,
+    store: &mut SessionClassStore,
+    player_data: &sim::LocalPlayerData,
+    menus: &mut MessageWriter<UiMenuRequest>,
+) {
+    if !player_data.custom_class_available(store.selected) {
+        store.selected = 0;
+    }
+    *state = ClassMenuState::default();
+    menus.write(UiMenuRequest::Open("class_setup".into()));
+}
+
 pub(crate) fn route(
     mut events: MessageReader<ConsoleCommand>,
     mut state: Local<ClassMenuState>,
     mut store: ResMut<SessionClassStore>,
     catalog: Res<ClassLoadoutCatalog>,
-    loc: Res<asset_game::LocalizeCatalog>,
+    loading: Option<Res<frame::FrontendContentLoading>>,
+    menu_state: hud::MenuState,
+    player_data: Res<sim::LocalPlayerData>,
+    loc: (
+        Res<asset_game::LocalizeCatalog>,
+        Option<Res<assets::PreparedLocalizedStrings>>,
+    ),
     mut dvars: ResMut<UiMenuDvars>,
     mut menus: MessageWriter<UiMenuRequest>,
     mut echo: crate::feature_dispatch::ConsoleEcho,
 ) {
+    let (shell_loc, prepared_loc) = loc;
+    let loc = prepared_loc
+        .as_ref()
+        .map_or(&*shell_loc, |strings| &strings.0);
+    if loading.is_none() && menu_state.is_some_and(|menus| menus.is_open("class_loading")) {
+        menus.write(UiMenuRequest::Close("class_loading".into()));
+        if let Some(reason) = catalog.progression_lock("cac", &player_data) {
+            dvars.set("ui_class_status", &reason);
+            echo.write(format!("menu: {reason}"));
+        } else {
+            open_class_setup(&mut state, &mut store, &player_data, &mut menus);
+        }
+    }
     for command in events
         .read()
         .filter(|command| command.name.starts_with("ui_class_"))
     {
+        if command.name == "ui_class_setup" && loading.is_some() {
+            menus.write(UiMenuRequest::Open("class_loading".into()));
+            continue;
+        }
         let result = (|| -> Result<(), String> {
+            if !matches!(
+                command.name.as_str(),
+                "ui_class_hover" | "ui_class_preview_slot"
+            ) {
+                if let Some(reason) = catalog.progression_lock("cac", &player_data) {
+                    return Err(reason);
+                }
+                if !matches!(command.name.as_str(), "ui_class_setup" | "ui_class_slot")
+                    && !player_data.custom_class_available(store.selected)
+                {
+                    return Err("Custom class slot is locked".into());
+                }
+            }
             match command.name.as_str() {
+                "ui_class_setup" => {
+                    open_class_setup(&mut state, &mut store, &player_data, &mut menus);
+                }
+                "ui_class_samples" => {
+                    *state = ClassMenuState {
+                        samples: true,
+                        ..Default::default()
+                    };
+                    menus.write(UiMenuRequest::Open("class_samples_picker".into()));
+                }
                 "ui_class_hover" => state.hover = index(command)?.min(PAGE_SIZE - 1),
                 "ui_class_preview_slot" => {
                     let selected = index(command)?;
@@ -176,6 +304,9 @@ pub(crate) fn route(
                 }
                 "ui_class_slot" => {
                     let selected = index(command)?;
+                    if !player_data.custom_class_available(selected) {
+                        return Err("Custom class slot is locked".into());
+                    }
                     let slot = store.slots.get(selected).ok_or("Class is unavailable")?;
                     dvars.set("ui_class_name", &slot.name);
                     store.selected = selected;
@@ -194,6 +325,7 @@ pub(crate) fn route(
                     state.hover = 0;
                     state.attachments = command.name == "ui_class_attachments";
                     state.camo = false;
+                    state.samples = false;
                     if state.attachments
                         && !matches!(row, ClassEditRow::Primary | ClassEditRow::Secondary)
                     {
@@ -264,6 +396,26 @@ pub(crate) fn route(
                         .saturating_add_signed(delta)
                         .min(len.saturating_sub(1) / PAGE_SIZE);
                 }
+                "ui_class_pick" if state.samples => {
+                    let at = index(command)?;
+                    if at >= PAGE_SIZE {
+                        return Err("Invalid sample row".into());
+                    }
+                    let preset = ui::showcase_classes()
+                        .get(state.page * PAGE_SIZE + at)
+                        .ok_or("Sample is unavailable")?;
+                    let candidate = ui::ClassSlotState::from_preset(preset);
+                    catalog.validate_class(&candidate)?;
+                    catalog.validate_progression(&candidate, &player_data)?;
+                    let selected = store.selected;
+                    *store
+                        .slots
+                        .get_mut(selected)
+                        .ok_or("Class is unavailable")? = candidate;
+                    dvars.set("ui_class_name", &store.slots[selected].name);
+                    menus.write(UiMenuRequest::Close("class_samples_picker".into()));
+                    *state = ClassMenuState::default();
+                }
                 "ui_class_pick" => {
                     let row = state.row.ok_or("No loadout slot selected")?;
                     let at = index(command)?;
@@ -333,6 +485,18 @@ pub(crate) fn route(
                         }
                     }
                     catalog.validate_edit(&candidate, row)?;
+                    if let Some(reason) =
+                        catalog.progression_lock(candidate.row_value(row), &player_data)
+                    {
+                        return Err(reason);
+                    }
+                    if candidate.perk1 == "specialty_bling"
+                        && candidate.secondary_attachments.len() > 1
+                        && let Some(reason) =
+                            catalog.progression_lock("specialty_secondarybling", &player_data)
+                    {
+                        return Err(reason);
+                    }
                     candidate.lock_reason = catalog.validate_class(&candidate).err();
                     if slot.lock_reason.is_none()
                         && let Some(reason) = &candidate.lock_reason
@@ -346,7 +510,7 @@ pub(crate) fn route(
                             "menu: class {} {} camouflage = {}",
                             selected + 1,
                             row.label(),
-                            camo_label(camo)
+                            localized_camo_label(&catalog, loc, slot.row_value(row), camo)
                         ));
                     } else {
                         echo.write(format!(
@@ -402,6 +566,7 @@ pub(crate) fn route(
                         default
                     };
                     catalog.validate_class(&candidate)?;
+                    catalog.validate_progression(&candidate, &player_data)?;
                     *slot = candidate;
                     dvars.set("ui_class_name", &slot.name);
                 }
@@ -415,7 +580,7 @@ pub(crate) fn route(
                         .collect();
                     if name.is_empty() {
                         return Err(localized(
-                            &loc,
+                            loc,
                             "MENU_IWNET_CREATE_BADNAME",
                             "Enter a class name",
                         ));
@@ -443,29 +608,78 @@ pub(crate) fn route(
             echo.write(format!("menu: {error}"));
         }
     }
+    let feature_lock = loading
+        .is_none()
+        .then(|| catalog.progression_lock("cac", &player_data))
+        .flatten();
+    dvars.set(
+        "ui_class_available",
+        if feature_lock.is_none() { "1" } else { "0" },
+    );
+    dvars.set(
+        "ui_class_feature_lock",
+        feature_lock.clone().unwrap_or_default(),
+    );
+    dvars.set(
+        "ui_class_feature_label",
+        feature_lock.map_or_else(
+            || "CLASSES".to_owned(),
+            |reason| format!("CLASSES — {reason}"),
+        ),
+    );
     for at in 0..10 {
         dvars.set(
             &format!("ui_class_slot_{at}"),
             store
                 .slots
                 .get(at)
-                .map(|slot| slot.name.clone())
+                .filter(|_| player_data.custom_class_available(at))
+                .map(|slot| class_name(&slot.name))
                 .unwrap_or_default(),
         );
     }
     if let Some(slot) = store.slots.get(store.selected) {
         if dvars.get("ui_class_status").is_none_or(str::is_empty)
-            && let Some(reason) = &slot.lock_reason
+            && let Some(reason) = store.lock_reason(store.selected)
         {
             dvars.set("ui_class_status", format!("Class unavailable: {reason}"));
         }
-        dvars.set("ui_class_title", &slot.name);
+        dvars.set("ui_class_title", class_name(&slot.name));
         dvars.set("ui_class_saved_name", &slot.name);
         dvars.set("ui_class_index", store.selected.to_string());
+        for (at, row, weapon) in [
+            (0, ClassEditRow::Primary, &slot.primary),
+            (1, ClassEditRow::Secondary, &slot.secondary),
+        ] {
+            let caption = localized(loc, row.loc_key().trim_start_matches('@'), row.label());
+            for (kind, key, fallback, available) in [
+                (
+                    "attachments",
+                    "MENU_ATTACHMENTS_CAPS",
+                    "Attachments",
+                    !catalog.attachments(row, weapon).is_empty(),
+                ),
+                (
+                    "camo",
+                    "MENU_CAMO_CAPS",
+                    "Camouflage",
+                    !camo_names(&catalog, weapon).is_empty(),
+                ),
+            ] {
+                dvars.set(
+                    &format!("ui_class_has_{kind}_{at}"),
+                    if available { "1" } else { "0" },
+                );
+                dvars.set(
+                    &format!("ui_class_{kind}_button_{at}"),
+                    format!("{caption}: {}", localized(loc, key, fallback)),
+                );
+            }
+        }
         for row in ClassEditRow::ALL {
             dvars.set(
                 &format!("ui_class_value_{}", row.as_u8()),
-                label(slot.row_value(row), &catalog, &loc),
+                label(slot.row_value(row), &catalog, loc),
             );
             dvars.set(
                 &format!("ui_class_image_{}", row.as_u8()),
@@ -517,14 +731,14 @@ pub(crate) fn route(
                     if key.is_empty() {
                         String::new()
                     } else {
-                        label(&key, &catalog, &loc)
+                        label(&key, &catalog, loc)
                     },
                 );
             }
             dvars.set(
                 &format!("ui_class_{name}_attachments"),
                 if selected.is_empty() {
-                    label("", &catalog, &loc)
+                    label("", &catalog, loc)
                 } else {
                     selected
                         .iter()
@@ -539,7 +753,7 @@ pub(crate) fn route(
                                     }
                                 ),
                                 &catalog,
-                                &loc,
+                                loc,
                             )
                         })
                         .collect::<Vec<_>>()
@@ -579,14 +793,15 @@ pub(crate) fn route(
     };
     dvars.set("ui_class_picker_depth", picker_depth.to_string());
     let mut caption = state.row.map_or_else(
-        || localized(&loc, "MENU_CLASSES", "Classes"),
-        |row| localized(&loc, row.loc_key(), row.label()),
+        || localized(loc, "MENU_CLASSES", "Classes"),
+        |row| localized(loc, row.loc_key(), row.label()),
     );
     if state.attachments {
         caption.push_str(" / ");
-        caption.push_str(&localized(&loc, "MENU_ATTACHMENTS_CAPS", "Attachments"));
+        caption.push_str(&localized(loc, "MENU_ATTACHMENTS_CAPS", "Attachments"));
     } else if state.camo {
-        caption.push_str(" / Camouflage");
+        caption.push_str(" / ");
+        caption.push_str(&localized(loc, "MENU_CAMO_CAPS", "Camouflage"));
     }
     dvars.set("ui_class_caption", caption);
     dvars.set(
@@ -600,11 +815,31 @@ pub(crate) fn route(
         "ui_class_category_label",
         state
             .folder
-            .map(|folder| category_label(folder, &loc))
+            .map(|folder| category_label(folder, loc))
             .unwrap_or_default(),
     );
     state.page = state.page.min(choices.len().saturating_sub(1) / PAGE_SIZE);
     for at in 0..PAGE_SIZE {
+        let choice_lock = choices.get(state.page * PAGE_SIZE + at).and_then(|value| {
+            if state.samples {
+                let preset = ui::showcase_classes()
+                    .iter()
+                    .find(|preset| preset.name == value)?;
+                let candidate = ui::ClassSlotState::from_preset(preset);
+                catalog
+                    .validate_class(&candidate)
+                    .and_then(|()| catalog.validate_progression(&candidate, &player_data))
+                    .err()
+            } else if !state.attachments && !state.camo {
+                catalog.progression_lock(value, &player_data)
+            } else {
+                None
+            }
+        });
+        dvars.set(
+            &format!("ui_class_choice_unavailable_{at}"),
+            choice_lock.unwrap_or_default(),
+        );
         dvars.set(
             &format!("ui_class_game_{at}"),
             games
@@ -616,7 +851,7 @@ pub(crate) fn route(
             &format!("ui_class_category_{at}"),
             folders
                 .get(at)
-                .map(|folder| category_label(*folder, &loc))
+                .map(|folder| category_label(*folder, loc))
                 .unwrap_or_default(),
         );
         dvars.set(
@@ -625,6 +860,22 @@ pub(crate) fn route(
                 .get(state.page * PAGE_SIZE + at)
                 .map(|value| {
                     let slot = store.slots.get(store.selected);
+                    if state.samples {
+                        let preset = ui::showcase_classes()
+                            .iter()
+                            .find(|preset| preset.name == value)
+                            .expect("sample choice exists");
+                        let candidate = ui::ClassSlotState::from_preset(preset);
+                        let reason = catalog
+                            .validate_class(&candidate)
+                            .and_then(|()| catalog.validate_progression(&candidate, &player_data))
+                            .err();
+                        return format!(
+                            "{}{}",
+                            class_name(value),
+                            reason.map_or_else(String::new, |reason| format!(" — {reason}"))
+                        );
+                    }
                     if state.camo {
                         let selected = slot
                             .zip(state.row.and_then(camo_slot))
@@ -632,7 +883,13 @@ pub(crate) fn route(
                         return format!(
                             "{}{}",
                             if selected { "* " } else { "" },
-                            camo_label(value)
+                            localized_camo_label(
+                                &catalog,
+                                loc,
+                                slot.zip(state.row)
+                                    .map_or("", |(slot, row)| slot.row_value(row)),
+                                value
+                            )
                         );
                     }
                     let key = if state.attachments && !value.is_empty() {
@@ -658,29 +915,33 @@ pub(crate) fn route(
                             slot.row_value(row) == value
                         }
                     });
+                    let lock = (!state.attachments)
+                        .then(|| catalog.progression_lock(value, &player_data))
+                        .flatten();
                     format!(
-                        "{}{}",
+                        "{}{}{}",
                         if selected { "* " } else { "" },
-                        label(&key, &catalog, &loc)
+                        label(&key, &catalog, loc),
+                        lock.map_or_else(String::new, |reason| format!(" — {reason}"))
                     )
                 })
                 .unwrap_or_default(),
         );
     }
     let title = if state.camo {
-        "Camouflage".to_owned()
+        localized(loc, "MENU_CAMO_CAPS", "Camouflage")
     } else if state.attachments {
-        localized(&loc, "MENU_ATTACHMENTS_CAPS", "Attachments")
+        localized(loc, "MENU_ATTACHMENTS_CAPS", "Attachments")
     } else if let Some(folder) = state.folder {
         format!(
             "{} / {}",
             folder.namespace.as_str().to_uppercase(),
-            category_label(folder, &loc)
+            category_label(folder, loc)
         )
     } else {
         state.row.map_or_else(
-            || localized(&loc, "MENU_WEAPON_CLASSES_CAPS", "Classes"),
-            |row| localized(&loc, row.loc_key(), row.label()),
+            || localized(loc, "MENU_WEAPON_CLASSES_CAPS", "Classes"),
+            |row| localized(loc, row.loc_key(), row.label()),
         )
     };
     dvars.set("ui_class_picker_title", title);
@@ -688,16 +949,20 @@ pub(crate) fn route(
         .get(state.page * PAGE_SIZE + state.hover)
         .filter(|_| !state.camo)
         .and_then(|key| {
-            let lookup = if state.attachments {
+            let lookup = if state.samples {
+                ui::showcase_classes()
+                    .iter()
+                    .find(|preset| preset.name == key)?
+                    .primary
+                    .to_owned()
+            } else if state.attachments {
                 let slot = store.slots.get(store.selected)?;
                 format!("{}+{key}", slot.row_value(state.row?))
             } else {
                 key.clone()
             };
             let preview = catalog.previews.get(&lookup)?;
-            let ns = asset_core::AssetKey::parse(&lookup)
-                .map(|key| key.namespace)
-                .unwrap_or(asset_core::AssetNamespace::Iw4);
+            let ns = asset_core::AssetKey::parse(&lookup).ok()?.namespace;
             Some((ns, preview))
         });
     let image = preview
@@ -745,8 +1010,24 @@ pub(crate) fn route(
     );
     dvars.set(
         "ui_class_preview_title",
-        preview
-            .map(|(_, p)| localized(&loc, &p.name_key, &p.reference))
+        choices
+            .get(state.page * PAGE_SIZE + state.hover)
+            .map(|key| {
+                let weapon = store
+                    .slots
+                    .get(store.selected)
+                    .zip(state.row)
+                    .map_or("", |(slot, row)| slot.row_value(row));
+                if state.samples {
+                    class_name(key)
+                } else if state.camo {
+                    localized_camo_label(&catalog, loc, weapon, key)
+                } else if state.attachments && !key.is_empty() {
+                    label(&format!("{weapon}+{key}"), &catalog, loc)
+                } else {
+                    label(key, &catalog, loc)
+                }
+            })
             .unwrap_or_default(),
     );
     for (at, bar) in asset_game::CacStatBar::ALL.into_iter().enumerate() {
@@ -767,9 +1048,35 @@ pub(crate) fn route(
     }
     dvars.set(
         "ui_class_description",
-        preview
-            .and_then(|(_, preview)| loc.text(preview.desc_key.trim_start_matches('@')))
-            .unwrap_or_default(),
+        if state.samples {
+            choices
+                .get(state.page * PAGE_SIZE + state.hover)
+                .and_then(|name| {
+                    ui::showcase_classes()
+                        .iter()
+                        .find(|preset| preset.name == name)
+                })
+                .map(|preset| {
+                    let slot = ui::ClassSlotState::from_preset(preset);
+                    ClassEditRow::ALL
+                        .into_iter()
+                        .map(|row| {
+                            format!(
+                                "{}: {}",
+                                localized(loc, row.loc_key(), row.label()),
+                                label(slot.row_value(row), &catalog, loc)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        } else {
+            preview
+                .and_then(|(_, preview)| loc.text(preview.desc_key.trim_start_matches('@')))
+                .unwrap_or_default()
+                .to_owned()
+        },
     );
     dvars.set(
         "ui_class_page",

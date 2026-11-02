@@ -1,6 +1,7 @@
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::tasks::{Task, futures_lite::future};
+use frame::ScopeApp;
 use net::{
     AUTHORITY_MS, AuthorityClock, AuthorityWorld, ClientActionInbox, ClientCommandInbox,
     LocalPresentClient, ReliableEventHub, authority_should_tick, look_angles_from_degrees,
@@ -14,7 +15,7 @@ use crate::roster::{
     default_class_index,
 };
 use crate::sensor;
-use frame::{AuthoritySet, BotNavigationReady, ClientSet, HasWorld, MatchTornDown, RuntimeRole};
+use frame::{AuthoritySet, BotNavigationReady, ClientSet, RuntimeRole};
 
 const VIEW_PITCH_DOWN: f32 = 85.0;
 const TRACE_QUOTA: u32 = 96;
@@ -99,34 +100,39 @@ pub struct BotsPlugin;
 
 impl Plugin for BotsPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<BotRoster>()
+        app.scoped::<BotRoster>(frame::MatchScope::Live)
             .init_resource::<BotAddQueue>()
             .init_resource::<BotHold>()
             .init_resource::<BotTpQueue>()
             .init_resource::<BotFireQueue>()
-            .init_resource::<BotNav>()
-            .init_resource::<BotNavigationReady>()
-            .init_resource::<BotMeter>()
+            .scoped::<BotNav>(frame::MatchScope::Live)
+            .scoped::<BotNavigationReady>(frame::MatchScope::Live)
+            .scoped::<BotMeter>(frame::MatchScope::Live)
             .add_systems(
                 Update,
                 (
-                    drain_bot_add_queue,
-                    evict_bots_claiming_local_client,
-                    boot_bots,
-                    apply_bot_tp,
+                    fill_bots_from_rules.in_set(frame::InMatch),
+                    drain_bot_add_queue.in_set(frame::InMatch),
+                    evict_bots_claiming_local_client.in_set(frame::InMatch),
+                    boot_bots.in_set(frame::InMatch),
+                    apply_bot_tp.in_set(frame::InMatch),
                 )
                     .chain()
-                    .after(ClientSet::Load),
+                    .after(ClientSet::Load)
+                    .before(ClientSet::Receive),
             )
             .add_systems(
                 Update,
-                (reset_roster_on_match_torn_down, prepare_navigation)
+                (prepare_navigation.in_set(frame::InMatch))
                     .chain()
                     .in_set(ClientSet::Load),
             )
             .add_systems(
                 FixedUpdate,
-                (evict_bots_claiming_local_client, think_bots)
+                (
+                    evict_bots_claiming_local_client.in_set(frame::InMatch),
+                    think_bots.in_set(frame::InMatch),
+                )
                     .chain()
                     .in_set(AuthoritySet::Ingress)
                     .run_if(authority_should_tick),
@@ -134,18 +140,47 @@ impl Plugin for BotsPlugin {
     }
 }
 
-fn reset_roster_on_match_torn_down(
-    mut torn: MessageReader<MatchTornDown>,
+fn fill_bots_from_rules(
     mut roster: ResMut<BotRoster>,
-    mut nav: ResMut<BotNav>,
-    mut ready: ResMut<BotNavigationReady>,
+    mut queue: ResMut<BotAddQueue>,
+    installed: Option<Res<State<frame::MatchScope>>>,
+    rules: Option<Res<frame::HostMatchRules>>,
+    world: Option<Res<AuthorityWorld>>,
 ) {
-    if torn.read().len() == 0 {
+    if roster.rules_filled
+        || !installed.is_some_and(|installed| *installed.get() == frame::MatchScope::Live)
+    {
         return;
     }
-    *roster = BotRoster::default();
-    *nav = BotNav::default();
-    *ready = BotNavigationReady::default();
+    let Some(world) = world else {
+        return;
+    };
+    roster.rules_filled = true;
+    let Some(rules) = rules else {
+        return;
+    };
+    let count = |dvar: &str| {
+        rules
+            .0
+            .iter()
+            .find(|(name, _)| name == dvar)
+            .and_then(|(_, value)| value.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    let enemies = count(sim::ENEMY_BOTS_DVAR);
+    let friends = if world.0.game_mode_kind() == gamemode_iw4::GameModeKind::FreeForAll {
+        0
+    } else {
+        count(sim::FRIENDLY_BOTS_DVAR)
+    };
+    queue.push_side(enemies, crate::BotSide::Enemy);
+    queue.push_side(friends, crate::BotSide::Friendly);
+    if enemies > 0 || friends > 0 {
+        diag::info!(
+            Sim,
+            "bots: game rules add {enemies} enemy and {friends} friendly"
+        );
+    }
 }
 
 fn drain_bot_add_queue(
@@ -168,7 +203,7 @@ fn drain_bot_add_queue(
     }
     for request in requests {
         let count = request.count;
-        let added = roster.add_bots(count, &taken, request.dummy);
+        let added = roster.add_bots(count, &taken, request.dummy, request.side);
         if added.len() < count as usize {
             diag::warn!(
                 Sim,
@@ -204,20 +239,39 @@ fn boot_bots(
     mut roster: ResMut<BotRoster>,
     mut actions: ResMut<ClientActionInbox>,
     mut request_ids: ResMut<net::ActionRequestIds>,
-    installed: Option<Res<HasWorld>>,
+    installed: Option<Res<State<frame::MatchScope>>>,
     world: Option<ResMut<AuthorityWorld>>,
+    local: Res<LocalPresentClient>,
 ) {
     let Some(mut world) = world else {
         return;
     };
-    if !installed.is_some_and(|installed| installed.0) {
+    if !installed.is_some_and(|installed| *installed.get() == frame::MatchScope::Live) {
         return;
     }
     let seed = roster.seed;
+    let team_based = world.0.game_mode_kind() != gamemode_iw4::GameModeKind::FreeForAll;
+    let local_team = match world.0.client_state_team(local.0) {
+        Some(entity_iw4::TEAM_AXIS) => Some(("axis", "allies")),
+        Some(entity_iw4::TEAM_ALLIES) => Some(("allies", "axis")),
+        _ => None,
+    };
     for bot in &mut roster.bots {
         if bot.joined {
             continue;
         }
+        let team = match bot.side.filter(|_| team_based) {
+            None => None,
+            Some(side) => {
+                let Some((mine, theirs)) = local_team else {
+                    continue;
+                };
+                Some(match side {
+                    crate::BotSide::Friendly => mine,
+                    crate::BotSide::Enemy => theirs,
+                })
+            }
+        };
         if world.0.gsc_realm() == Some(sim::script::Realm::Iw4)
             && let Err(error) = world
                 .0
@@ -242,6 +296,23 @@ fn boot_bots(
                     request_id: join_id,
                 },
             ),
+            team.map_or(Ok(()), |team| {
+                let request_id = request_ids.allocate();
+                match (
+                    sim::menu_response_field(sim::TEAM_MENU),
+                    sim::menu_response_field(team),
+                ) {
+                    (Some(menu), Some(response)) => actions.push(
+                        bot.id,
+                        ClientAction::MenuResponse {
+                            request_id,
+                            menu,
+                            response,
+                        },
+                    ),
+                    _ => Ok(()),
+                }
+            }),
             actions.push(
                 bot.id,
                 ClientAction::ChooseDefaultClass {
@@ -510,19 +581,19 @@ fn think_bots(mut p: ThinkBots) {
 
 fn prepare_navigation(
     world: Option<Res<AuthorityWorld>>,
-    installed: Option<Res<HasWorld>>,
+    installed: Option<Res<State<frame::MatchScope>>>,
     role: Res<RuntimeRole>,
     generation: Res<frame::WorldGeneration>,
     mut nav: ResMut<BotNav>,
     mut ready: ResMut<BotNavigationReady>,
     load: Option<Res<assets::MapLoadProcess>>,
 ) {
-    ready.0 = frame::WorldReadiness::new(*generation, frame::ReadinessState::Pending);
+    ready.0 = frame::WorldReadiness::new(generation.stamp(), frame::ReadinessState::Pending);
     if !matches!(*role, RuntimeRole::Listen | RuntimeRole::Dedicated) {
         ready.0.state = frame::ReadinessState::Ready;
         return;
     }
-    if !installed.is_some_and(|installed| installed.0) {
+    if !installed.is_some_and(|installed| *installed.get() == frame::MatchScope::Live) {
         return;
     }
     let Some(world) = world else {
@@ -534,7 +605,7 @@ fn prepare_navigation(
 }
 
 fn refresh_nav(world: &SimWorld, nav: &mut BotNav, load: Option<&assets::MapLoadProcess>) -> bool {
-    let digest = world.content_digest();
+    let digest = nav_digest(world);
     if nav.graph.digest == digest && nav.graph.schema == NAV_SCHEMA && nav.graph.hull == NAV_HULL {
         return true;
     }
@@ -581,6 +652,14 @@ fn refresh_nav(world: &SimWorld, nav: &mut BotNav, load: Option<&assets::MapLoad
 
 const NAV_CACHE_KIND: &str = "nav";
 
+fn nav_digest(world: &SimWorld) -> u64 {
+    let parts = world.content_components();
+    assets::fnv1a64_more(
+        assets::fnv1a64(&parts.map.to_le_bytes()),
+        &parts.models.to_le_bytes(),
+    )
+}
+
 /// The digest, schema and hull that decide in-memory reuse are the whole key,
 /// so the same map read back from disk is the same graph the walk would bake.
 fn nav_cache_key(digest: u64) -> String {
@@ -623,7 +702,7 @@ fn navigation_for(world: &mut SimWorld, digest: u64) -> NavGraph {
 }
 
 fn bake_navigation(world: &mut SimWorld, graph: &mut NavGraph) {
-    let digest = world.content_digest();
+    let digest = nav_digest(world);
     if graph.digest == digest && graph.schema == NAV_SCHEMA && graph.hull == NAV_HULL {
         return;
     }

@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use frame::ScopeApp;
 use playerstate_iw4::{ENTITYNUM_NONE, PLAYER_CORPSE_ENTITY_BASE};
 use sim::{ClientId, PlayerCorpsePool, PlayerCorpseSlot};
 
@@ -11,16 +12,29 @@ use crate::{AuthoritySet, ClientSet, LastAdoptedSnapshot, ServerTick};
 
 pub const CLIENT_ENTITY_SLOT_COUNT: usize = ENTITYNUM_NONE as usize;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CorpseIdentity {
+    pub match_key: frame::MatchKey,
+    pub slot: u16,
+    pub spawn_sequence: u64,
+}
+
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 #[component(immutable)]
+#[require(bevy::prelude::DespawnOnExit<frame::Timeline> = bevy::prelude::DespawnOnExit(frame::Timeline::Running))]
 pub struct CEntity {
     number: u16,
     client: Option<ClientId>,
+    corpse: Option<CorpseIdentity>,
 }
 
 impl CEntity {
     pub const fn number(&self) -> u16 {
         self.number
+    }
+
+    pub const fn corpse_identity(&self) -> Option<CorpseIdentity> {
+        self.corpse
     }
 
     pub const fn client(&self) -> Option<ClientId> {
@@ -117,12 +131,14 @@ pub fn sync_client_entities(
     proxy: Option<Res<crate::RemoteProxyState>>,
     clock: Option<Res<crate::FrameClock>>,
     local: Option<Res<crate::LocalPresentClient>>,
-    mut selected_tick: Local<Option<(sim::Tick, bool)>>,
+    mut selected_tick: Local<Option<(sim::Tick, bool, u64)>>,
+    timeline: Res<crate::EntityEventCursor>,
     mut slots: ResMut<CEntitySlots>,
     mut gaps: ResMut<NetIdentityGaps>,
     identities: Query<&CEntity>,
     mut runtimes: Query<&mut CEntityRuntime>,
     mut census: ResMut<CEntityBirthCensus>,
+    installed: Res<frame::InstalledMatch>,
 ) {
     let archived = adopted.next().is_some_and(|snap| {
         snap.players.iter().any(|(id, ps)| {
@@ -139,7 +155,7 @@ pub fn sync_client_entities(
         None
     };
     let next = selected.as_deref().or_else(|| adopted.next());
-    let key = next.map(|snap| (snap.tick, archived));
+    let key = next.map(|snap| (snap.tick, archived, timeline.timeline()));
     if archived {
         if *selected_tick == key {
             return;
@@ -180,6 +196,7 @@ pub fn sync_client_entities(
             .flatten(),
         CEntitySyncArm::Client,
         Some(&mut census),
+        installed.load_key.match_key,
     );
 }
 
@@ -191,6 +208,7 @@ pub(crate) fn sync_authority_entities(
     identities: Query<&CEntity>,
     mut runtimes: Query<&mut CEntityRuntime>,
     mut census: ResMut<CEntityBirthCensus>,
+    installed: Res<frame::InstalledMatch>,
 ) {
     let players = server_tick
         .0
@@ -228,6 +246,7 @@ pub(crate) fn sync_authority_entities(
         None,
         CEntitySyncArm::Authority,
         Some(&mut census),
+        installed.load_key.match_key,
     );
 }
 
@@ -235,12 +254,14 @@ pub(crate) fn sync_authority_entities(
 struct WantedOccupant {
     client: Option<ClientId>,
     next_state: entity_iw4::EntityState,
+    corpse_sequence: Option<u64>,
 }
 
 fn occupant_from_player(client: ClientId, ps: &playerstate_iw4::PlayerState) -> WantedOccupant {
     WantedOccupant {
         client: Some(client),
         next_state: player_state_to_entity_state(client, ps),
+        corpse_sequence: None,
     }
 }
 
@@ -248,6 +269,7 @@ fn occupant_from_corpse(slot: &PlayerCorpseSlot) -> WantedOccupant {
     WantedOccupant {
         client: Some(slot.victim),
         next_state: corpse_slot_to_entity_state(slot),
+        corpse_sequence: Some(slot.spawn_sequence),
     }
 }
 
@@ -258,6 +280,7 @@ fn occupant_from_replicated(es: entity_iw4::EntityState) -> WantedOccupant {
     WantedOccupant {
         client,
         next_state: es,
+        corpse_sequence: None,
     }
 }
 
@@ -286,6 +309,7 @@ fn sync_snapshot_entities(
     seated_viewer: Option<ClientId>,
     arm: CEntitySyncArm,
     mut census: Option<&mut CEntityBirthCensus>,
+    match_key: frame::MatchKey,
 ) {
     if pair_ready {
         for mut runtime in runtimes.iter_mut() {
@@ -348,11 +372,17 @@ fn sync_snapshot_entities(
         let index = usize::from(number);
         let client = occupant.client;
         let next_state = occupant.next_state;
+        let corpse = occupant
+            .corpse_sequence
+            .map(|spawn_sequence| CorpseIdentity {
+                match_key,
+                slot: number,
+                spawn_sequence,
+            });
         let valid = slots.slots[index].is_some_and(|slot| {
-            identities
-                .get(slot.entity)
-                .is_ok_and(|identity| identity.number == number && identity.client == client)
-                && runtimes.get(slot.entity).is_ok()
+            identities.get(slot.entity).is_ok_and(|identity| {
+                identity.number == number && identity.client == client && identity.corpse == corpse
+            }) && runtimes.get(slot.entity).is_ok()
         });
         if valid {
             let entity = slots.slots[index].expect("valid slot").entity;
@@ -372,7 +402,16 @@ fn sync_snapshot_entities(
         }
         let mut runtime = CEntityRuntime::default();
         reset_entity(&mut runtime, next_state, at_time_ms, true);
-        let entity = commands.spawn((CEntity { number, client }, runtime)).id();
+        let entity = commands
+            .spawn((
+                CEntity {
+                    number,
+                    client,
+                    corpse,
+                },
+                runtime,
+            ))
+            .id();
         slots.slots[index] = Some(CEntitySlot { client, entity });
         if let Some(census) = census.as_mut() {
             census.note_birth(arm);
@@ -395,22 +434,25 @@ fn sync_snapshot_entities(
 }
 
 pub(crate) fn register_authority_entities(app: &mut App) {
-    app.init_resource::<CEntitySlots>()
+    app.scoped::<CEntitySlots>(frame::Timeline::Running)
         .init_resource::<NetIdentityGaps>()
-        .init_resource::<CEntityBirthCensus>()
+        .scoped::<CEntityBirthCensus>(frame::Timeline::Running)
         .add_systems(
             FixedUpdate,
-            sync_authority_entities.in_set(AuthoritySet::Fanout),
+            sync_authority_entities
+                .in_set(frame::InMatch)
+                .in_set(AuthoritySet::Fanout),
         );
 }
 
 pub fn register_client_entities(app: &mut App) {
-    app.init_resource::<CEntitySlots>()
+    app.scoped::<CEntitySlots>(frame::Timeline::Running)
         .init_resource::<NetIdentityGaps>()
-        .init_resource::<CEntityBirthCensus>()
+        .scoped::<CEntityBirthCensus>(frame::Timeline::Running)
         .add_systems(
             Update,
             sync_client_entities
+                .in_set(frame::InMatch)
                 .in_set(ClientSet::Reconcile)
                 .after(crate::reconcile_prediction),
         );

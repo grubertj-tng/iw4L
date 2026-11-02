@@ -232,6 +232,7 @@ pub struct ClientPrediction {
 
     owner_events: Vec<(EntityEventRecord, std::time::Instant)>,
     next_owner_event: EventSequence,
+    owner_pellet_fx: Vec<(sim::PelletFxRecord, std::time::Instant)>,
 }
 
 impl ClientPrediction {
@@ -259,6 +260,7 @@ impl ClientPrediction {
             tick_input: TickInput::default(),
             owner_events: Vec::new(),
             next_owner_event: EventSequence(1),
+            owner_pellet_fx: Vec::new(),
         };
         pred.world.suppress_snapshot_publish();
         pred
@@ -332,6 +334,14 @@ impl ClientPrediction {
             .collect()
     }
 
+    pub fn take_owner_pellet_fx(&mut self) -> Vec<sim::PelletFxRecord> {
+        std::mem::take(&mut self.owner_pellet_fx)
+            .into_iter()
+            .filter(|(_, at)| at.elapsed() < std::time::Duration::from_secs(5))
+            .map(|(record, _)| record)
+            .collect()
+    }
+
     pub fn arm_from_content(&mut self, authority: &SimWorld) {
         self.world.initialize_prediction_from(authority);
         self.world
@@ -398,20 +408,6 @@ impl ClientPrediction {
         self.last_cmd = Some(cmd);
 
         Some((seq, cmd))
-    }
-
-    /// Drop the unacknowledged history so the next snapshot is adopted whole —
-    /// the same recovery `MAX_UNACKED_SNAPSHOTS` performs, on demand. The
-    /// pending send window is deliberately left alone: the authority consumes a
-    /// client's commands in sequence, so a hole punched in that window wedges it
-    /// for good.
-    pub fn force_resync(&mut self) {
-        self.snapshots_since_ack = 0;
-        if self.history.is_empty() {
-            return;
-        }
-        self.drop_history();
-        self.metrics.forced_adopts += 1;
     }
 
     /// The floor lets stale acks for the dropped commands retire; read as
@@ -610,9 +606,12 @@ impl ClientPrediction {
         for record in self.world.entity_events() {
             if (record.sequence == events_from || record.sequence.is_newer_than(events_from))
                 && record.payload.number == local
+                && record.audience.projects_to(self.local)
                 && matches!(
                     entity_event_action(record.event),
-                    Ok(EntityEventAction::WeaponFire | EntityEventAction::EjectBrass)
+                    Ok(EntityEventAction::WeaponFire
+                        | EntityEventAction::EjectBrass
+                        | EntityEventAction::BulletHit)
                 )
             {
                 owner_events.push((
@@ -626,6 +625,14 @@ impl ClientPrediction {
                 next = next.next();
             }
         }
+        self.owner_pellet_fx.extend(
+            self.world
+                .pellet_fx()
+                .iter()
+                .copied()
+                .filter(|record| record.attacker == local)
+                .map(|record| (record, std::time::Instant::now())),
+        );
         self.next_owner_event = next;
         let life = self.local_life();
         let now = std::time::Instant::now();
@@ -636,9 +643,20 @@ impl ClientPrediction {
                     .fire_cause
                     .is_none_or(|cause| Some(cause.life) == life)
         });
-        let excess = owner_events.len().saturating_sub(DEFAULT_HISTORY_CAP * 2);
+        let excess = owner_events.len().saturating_sub(DEFAULT_HISTORY_CAP * 32);
         owner_events.drain(..excess);
         self.owner_events = owner_events;
+        self.owner_pellet_fx.retain(|(record, at)| {
+            now.duration_since(*at) < std::time::Duration::from_secs(5)
+                && record
+                    .fire_cause
+                    .is_some_and(|cause| Some(cause.life) == life)
+        });
+        let excess = self
+            .owner_pellet_fx
+            .len()
+            .saturating_sub(DEFAULT_HISTORY_CAP * 32);
+        self.owner_pellet_fx.drain(..excess);
     }
 
     fn local_state(&self) -> Option<PlayerState> {

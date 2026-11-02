@@ -317,6 +317,8 @@ pub struct AttachmentGeometry {
     pub view_model_names: [Option<Ptr>; crate::size::ATTACH_MODEL_COUNT],
     pub world_model_names: [Option<Ptr>; crate::size::ATTACH_MODEL_COUNT],
     pub reticle_model_names: [Option<Ptr>; crate::size::ATTACH_RETICLE_COUNT],
+    pub reticle_center_name: Option<Ptr>,
+    pub reticle_side_name: Option<Ptr>,
     pub overlay_names: [Option<Ptr>; 4],
     pub overlay_width: f32,
     pub overlay_height: f32,
@@ -342,12 +344,14 @@ pub struct WeaponGeometry {
     pub weap_def: Option<Ptr>,
 
     pub gun_xmodel_name: Option<Ptr>,
+    pub gun_xmodel_names: [Option<Ptr>; crate::size::ATTACH_MODEL_COUNT],
 
     pub hand_xmodel_name: Option<Ptr>,
     pub rocket_model_name: Option<Ptr>,
     pub projectile_model_name: Option<Ptr>,
 
     pub world_model_name: Option<Ptr>,
+    pub world_model_names: [Option<Ptr>; crate::size::ATTACH_MODEL_COUNT],
 
     pub knife_xmodel_name: Option<Ptr>,
 

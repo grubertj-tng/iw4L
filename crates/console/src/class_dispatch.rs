@@ -80,17 +80,7 @@ pub(crate) fn route_class_commands(
             }
 
             "spawn" => {
-                if let Some(arg) = cmd.args.first()
-                    && class_index_by_name(&store, arg).is_none()
-                {
-                    echo(
-                        format!("spawn: unknown_class `{arg}`"),
-                        &mut console,
-                        &mut line,
-                    );
-                    continue;
-                }
-                match spawn_gate(change_allowed.0, cmd.background) {
+                match spawn_gate(change_allowed.0 && !store.slots.is_empty(), cmd.background) {
                     SpawnGate::RefuseNow => {
                         let reason = block_reason
                             .0
@@ -164,7 +154,7 @@ pub(crate) fn complete_pending_spawn(
         console.echo(msg, capacity);
         return;
     }
-    if !change_allowed.0 {
+    if !change_allowed.0 || store.slots.is_empty() {
         return;
     }
     let class = dispatch.pending_spawn_class.take();
@@ -249,7 +239,7 @@ fn describe_slot(store: &SessionClassStore, index: usize) -> String {
     let Some(slot) = store.slots.get(index) else {
         return format!("{index} (missing)");
     };
-    let lock = match slot.lock_reason.as_deref() {
+    let lock = match store.lock_reason(index) {
         Some(reason) => format!(" LOCKED — {reason}"),
         None => String::new(),
     };
@@ -262,9 +252,8 @@ fn describe_slot(store: &SessionClassStore, index: usize) -> String {
 fn class_listing(store: &SessionClassStore, highlight: usize) -> Vec<String> {
     let mut lines = Vec::with_capacity(store.slots.len() + 1);
     lines.push(format!(
-        "class: {} presets, selected {highlight}, equipped {:?}",
-        store.slots.len(),
-        store.equipped
+        "class: {} presets, selected {highlight}",
+        store.slots.len()
     ));
     for index in 0..store.slots.len() {
         let marker = if index == highlight { '>' } else { ' ' };

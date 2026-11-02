@@ -14,7 +14,7 @@ pub(crate) struct ScriptAmbientPlayback {
 }
 
 pub(crate) fn update_script_ambient(
-    epoch: Res<crate::backend::MatchEpoch>,
+    epoch: Option<Res<net::EntityEventCursor>>,
     ready: Res<crate::AudioReady>,
     generation: Res<frame::WorldGeneration>,
     loading: Option<Res<assets::LoadingScreen>>,
@@ -27,14 +27,15 @@ pub(crate) fn update_script_ambient(
     mut map: Option<ResMut<MapSources>>,
     mut feedback: ResMut<crate::clip_store::CueFeedback>,
 ) {
-    if playback.epoch != epoch.0 {
-        playback.epoch = epoch.0;
+    if playback.epoch != crate::backend::presentation_epoch(epoch.as_deref()) {
+        playback.epoch = crate::backend::presentation_epoch(epoch.as_deref());
         playback.target = None;
         playback.started = false;
         playback.voices.clear();
     }
     playback.voices.retain(CueHandle::active);
-    if !ready.0.ready_for(*generation) || loading.is_some_and(|screen| !screen.is_complete()) {
+    if !ready.0.ready_for(generation.stamp()) || loading.is_some_and(|screen| !screen.is_complete())
+    {
         return;
     }
     let Some(presented) = presented else { return };
@@ -108,8 +109,9 @@ pub(crate) fn update_script_ambient(
             origin_inches: None,
             emitter: None,
             class: SoundClass::Ambience,
-            epoch: epoch.0,
+            epoch: crate::backend::presentation_epoch(epoch.as_deref()),
             pitch_scale: 1.0,
+            volume_scale: 1.0,
             fallbacks: Vec::new(),
         },
         frames,

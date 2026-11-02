@@ -1,7 +1,7 @@
 use super::args::{int, string, vector};
 use super::natives::player::player;
 use crate::frame::FrameWorld;
-use crate::script::{NativeRegistry, Runtime, Value};
+use crate::script::{NativeRegistry, RoundScript, Value};
 use crate::{ClientId, ClientLifecycle};
 use bevy_ecs::prelude::World;
 
@@ -27,7 +27,7 @@ pub(crate) fn register(registry: &mut NativeRegistry) {
         }
         let on = int(args, 1)? != 0;
         world
-            .resource_mut::<Runtime>()
+            .resource_mut::<RoundScript>()
             .players
             .get_mut(&client)
             .unwrap()
@@ -40,14 +40,14 @@ pub(crate) fn register(registry: &mut NativeRegistry) {
         let client = player(world, receiver)?;
         let defaults = (vector(args, 0)?, vector(args, 1)?);
         world
-            .resource_mut::<Runtime>()
+            .resource_mut::<RoundScript>()
             .players
             .get_mut(&client)
             .unwrap()
             .spectator
             .defaults = Some(defaults);
         update(world, false);
-        let slot = &world.resource::<Runtime>().players[&client];
+        let slot = &world.resource::<RoundScript>().players[&client];
         if &*slot.sessionstate == "spectator"
             && slot.spectator.target.is_none()
             && slot.seat.archive_ms == 0
@@ -60,7 +60,7 @@ pub(crate) fn register(registry: &mut NativeRegistry) {
     registry.register(Method, "getspectatingplayer", |world, receiver, _| {
         let client = player(world, receiver)?;
         update(world, false);
-        let runtime = world.resource::<Runtime>();
+        let runtime = world.resource::<RoundScript>();
         Ok(runtime
             .players
             .get(&client)
@@ -97,8 +97,35 @@ pub(crate) fn advance(world: &mut World) {
     update(world, true);
 }
 
+pub(crate) fn hold_killcam_viewer(
+    world: &mut World,
+    client: ClientId,
+    cmd: &mut playerstate_iw4::UserCmd,
+) {
+    let seated = world
+        .get_resource::<RoundScript>()
+        .and_then(|runtime| runtime.players.get(&client.0))
+        .is_some_and(|slot| {
+            &*slot.sessionstate == "spectator"
+                && slot.seat.archive_ms > 0
+                && slot.spectator.target.is_some()
+        });
+    if !seated {
+        return;
+    }
+    use playerstate_iw4::buttons;
+    let held = FrameWorld::from_world(world)
+        .player(client)
+        .map_or(0, |ps| ps.weapon);
+    cmd.forwardmove = 0;
+    cmd.rightmove = 0;
+    cmd.buttons &= buttons::PRONE | buttons::CROUCH | buttons::STANCE_HELD;
+    cmd.weapon = held as u16;
+}
+
 fn update(world: &mut World, input: bool) {
-    let mut runtime = std::mem::take(&mut *world.resource_mut::<Runtime>());
+    let replacement = RoundScript::new(world.resource::<crate::script::MatchScript>());
+    let mut runtime = std::mem::replace(&mut *world.resource_mut::<RoundScript>(), replacement);
     let clients: Vec<u32> = runtime.players.keys().copied().collect();
     let mut frame = FrameWorld::from_world(world);
     let targets: Vec<(u32, i32, bool)> = clients
@@ -147,7 +174,9 @@ fn update(world: &mut World, input: bool) {
             && !archived
             && pressed & (playerstate_iw4::buttons::ATTACK | playerstate_iw4::buttons::ADS) != 0;
         if let Some(forced) = forced {
-            slot.spectator.target = allowed.contains(&forced).then_some(forced);
+            let own_replay =
+                archived && forced == client && targets.iter().any(|(id, ..)| *id == client);
+            slot.spectator.target = (own_replay || allowed.contains(&forced)).then_some(forced);
             slot.spectator.free = false;
         } else if input
             && pressed & playerstate_iw4::buttons::USE != 0
@@ -234,7 +263,7 @@ fn update(world: &mut World, input: bool) {
             }
         }
     }
-    *frame.ecs().resource_mut::<Runtime>() = runtime;
+    *frame.ecs().resource_mut::<RoundScript>() = runtime;
     for object in notes {
         crate::script::runtime::raise(
             frame.ecs(),

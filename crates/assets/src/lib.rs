@@ -11,7 +11,6 @@ mod match_load;
 pub mod plugin;
 pub mod prepared;
 pub mod session_load;
-mod teardown;
 
 pub use artifact_cache::{cache_flight, cache_get, cache_put, fnv1a64, fnv1a64_more};
 pub(crate) use asset_graph::stamp_match_destructible_death;
@@ -33,15 +32,15 @@ pub use lighting_iw4::MODEL_LIGHTING_TILE_BYTES;
 pub use loading_screen::{LoadingPreviewSource, LoadingScreen};
 pub use map_load_process::MapLoadProcess;
 pub use match_load::{
-    MapLoadApproval, MatchLoadAbort, MatchLoadAccepted, MatchLoadBusy, MatchLoadDispatch,
-    MatchLoadRequest, PreparedMatchReady, PreparedMatchSound,
+    CurrentMatchLoad, MapLoadApproval, MatchLoadAbort, MatchLoadAccepted, MatchLoadBusy,
+    MatchLoadDispatch, MatchLoadRequest, PreparedMatchReady, PreparedMatchSound,
 };
 pub use plugin::AssetPlugin;
 pub use prepared::{
-    MapFacts, MatchMaterials, MatchType10SoundHints, PreparedBodies, PreparedBodyClips,
-    PreparedDestructibleDeath, PreparedFpvMeshes, PreparedGaps, PreparedLocalizedStrings,
-    PreparedMap, PreparedProjectileMeshes, PreparedWeapons, PreparedWorldWeapons, PreparedXAnims,
-    PreparedXModelWalkCensus, SessionCompass,
+    BoundWeapons, MapFacts, MatchMaterials, MatchType10SoundHints, PreparedBodies,
+    PreparedBodyClips, PreparedDestructibleDeath, PreparedFpvMeshes, PreparedGaps,
+    PreparedLocalizedStrings, PreparedMap, PreparedProjectileMeshes, PreparedWeapons,
+    PreparedWorldWeapons, PreparedXAnims, PreparedXModelWalkCensus, SessionCompass,
 };
 pub use session_load::{
     MatchLoadOutcome, MatchMaterialSeed, PreparedMatch, PreparedWorld, ShellCommon,

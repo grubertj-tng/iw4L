@@ -216,6 +216,7 @@ impl RuntimeProgramPort {
             && pass.arguments == self.arguments
             && pass.color_space == self.color_space
             && pass.hardware_shadow_compare == self.hardware_shadow_compare
+            && pass.depth_to_colour == self.abi.depth_to_colour
             && self.abi.vertex_type == vertex_type
     }
 }
@@ -253,11 +254,12 @@ impl RuntimeProgramRegistry {
                 u8,
                 render_material::PassColorSpace,
                 bool,
+                bool,
                 Vec<RuntimeArgumentBinding>,
             ),
             usize,
         > = HashMap::new();
-        for (set_i, set) in catalog.technique_sets.iter().enumerate() {
+        for (set_i, set) in catalog.parts().technique_sets.iter().enumerate() {
             if only_sets.is_some_and(|sets| !sets.contains(&set_i)) {
                 continue;
             }
@@ -274,6 +276,7 @@ impl RuntimeProgramRegistry {
                     pass.t5_custom_sampler_flags,
                     pass.color_space,
                     pass.hardware_shadow_compare,
+                    pass.depth_to_colour,
                     pass.arguments.clone(),
                 );
                 if seen.contains_key(&key) {
@@ -293,6 +296,7 @@ impl RuntimeProgramRegistry {
         pass_i: usize,
     ) -> Option<&'a RuntimePass> {
         catalog
+            .parts()
             .technique_sets
             .get(set_i)?
             .technique(tech_type)?

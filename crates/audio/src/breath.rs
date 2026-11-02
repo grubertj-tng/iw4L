@@ -29,12 +29,11 @@ pub(crate) fn update(
     view: Option<Res<frame::ViewSubject>>,
     screen: Option<Res<frame::AppScreen>>,
     bank: Option<Res<crate::SoundBank>>,
-    mut torn: MessageReader<frame::MatchTornDown>,
     mut died: MessageReader<frame::LifeEnded>,
     mut state: Local<BreathAudio>,
     mut sources: ResMut<BreathSources>,
     runtime: Res<crate::AudioRuntime>,
-    epoch: Res<crate::backend::MatchEpoch>,
+    epoch: Option<Res<net::EntityEventCursor>>,
     mut play: MessageWriter<AliasCommand>,
 ) {
     let client = local.as_ref().map(|local| local.0);
@@ -46,9 +45,13 @@ pub(crate) fn update(
             .for_client(client)
             .map(|meta| meta.life_sequence.0)
     });
-    let context = client
-        .zip(life)
-        .map(|(client, life)| (epoch.0, client.0, life));
+    let context = client.zip(life).map(|(client, life)| {
+        (
+            crate::backend::presentation_epoch(epoch.as_deref()),
+            client.0,
+            life,
+        )
+    });
     if sources.context != context {
         if state.active {
             stop_aliases(
@@ -61,15 +64,13 @@ pub(crate) fn update(
         sources.context = context;
         *state = BreathAudio::default();
     }
-    let torn_down = torn.read().count() != 0;
     let died = died.read().any(|event| {
         client.is_some_and(|client| event.client == client.0) && life == Some(event.life)
     });
     let ps = client
         .and_then(|client| presented.as_ref()?.alive_player(client))
         .filter(|_| !view.as_ref().is_some_and(|view| view.in_killcam()));
-    if torn_down
-        || died
+    if died
         || !screen.is_some_and(|screen| matches!(*screen, frame::AppScreen::InGame))
         || ps.is_none()
     {
@@ -85,7 +86,7 @@ pub(crate) fn update(
     let selection = ps.and_then(|ps| {
         let policy = weapons
             .as_ref()?
-            .0
+            .registry()
             .semantic_policy_of(playerstate_iw4::get_viewmodel_weapon_index(ps))?;
         Some((policy.cue_namespace.namespace(), policy.breath_cues))
     });
@@ -148,7 +149,7 @@ pub(crate) fn update(
                     alias: cues.heartbeat.into(),
                     emitter: client.map(|client| client.0),
                     scope: crate::backend::AudioScope::Match,
-                    epoch: epoch.0,
+                    epoch: crate::backend::presentation_epoch(epoch.as_deref()),
                     group: None,
                 })
             {
@@ -159,7 +160,7 @@ pub(crate) fn update(
                 sources.source = Some(DesiredSource {
                     key: SourceKey {
                         scope: crate::backend::AudioScope::Match,
-                        epoch: epoch.0,
+                        epoch: crate::backend::presentation_epoch(epoch.as_deref()),
                         object: u64::from(client.expect("alive client").0),
                         slot: 6,
                     },

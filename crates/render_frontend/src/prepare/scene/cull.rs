@@ -89,6 +89,8 @@ pub struct DpvsFrameStats {
 
     pub cell_clips: Vec<CellClipPlanes>,
 
+    pub cell_clip_visits: Vec<(u32, CellClipPlanes)>,
+
     pub cell_vis_all: bool,
 }
 
@@ -105,9 +107,11 @@ fn single_cell_from_env() -> bool {
 pub struct WorldMeshEntity;
 
 #[derive(Component)]
+#[require(bevy::prelude::DespawnOnExit<frame::MatchScope> = bevy::prelude::DespawnOnExit(frame::MatchScope::Live))]
 pub struct StaticModelEntity;
 
 #[derive(Component)]
+#[require(bevy::prelude::DespawnOnExit<frame::MatchScope> = bevy::prelude::DespawnOnExit(frame::MatchScope::Live))]
 pub struct ScriptModelEntity;
 
 pub use render_scene::DynEntModelEntity;
@@ -146,6 +150,7 @@ pub fn apply_dpvs_cull(
     stats.cell_vis.clear();
     stats.cell_vis_count = 0;
     stats.cell_clips.clear();
+    stats.cell_clip_visits.clear();
     stats.cell_vis_all = false;
     stats.view_prepared = 0;
     stats.lock_pvs = 0;
@@ -222,6 +227,9 @@ pub fn apply_dpvs_cull(
                 &mut scratch,
                 Some(&mut cell_clips),
                 bevels.as_ref(),
+                Some(&mut |visited: usize, planes: &CellClipPlanes| {
+                    stats.cell_clip_visits.push((visited as u32, *planes));
+                }),
             );
             stats.cell_clips = cell_clips;
         }
@@ -326,6 +334,7 @@ pub fn apply_dpvs_cull(
             &mut cull.surface_vis,
             &cull.surface_draw_fields,
             &cull.capture.packed_draw_surfs,
+            &cull.surface_materials,
             &mut cull.bsp_run_scratch,
             &mut cull.draw_items,
             &mut cull.g0_surfs,
@@ -594,6 +603,7 @@ fn append_camera_bsp_range(
     surface_vis: &mut [u8],
     surfaces: &[asset_world::SurfaceDrawFields],
     draw_surfs: &[GfxDrawSurf],
+    surface_materials: &[Option<assets::MaterialIndex>],
     scratch: &mut Vec<BspDrawSurfRun<asset_world::CameraRangeKind>>,
     draw_items: &mut Vec<WorldDrawItem>,
     g0_surfs: &mut Vec<u16>,
@@ -652,11 +662,21 @@ fn append_camera_bsp_range(
         range_n,
         ..BspDrawSurfCensus::default()
     };
+    let material = |surf: usize| surface_materials.get(surf).copied().flatten();
     let mut span_begin = begin;
     let mut previous_key = None;
-    for span in surface_vis[begin_i..end_i].chunk_by(|a, b| (*a != 0) == (*b != 0)) {
-        let span_end = span_begin + span.len() as u32;
-        if span[0] != 0 {
+    while (span_begin as usize) < end_i {
+        let head = span_begin as usize;
+        let visible = surface_vis[head] != 0;
+        let span_len = surface_vis[head..end_i]
+            .iter()
+            .enumerate()
+            .position(|(offset, &vis)| {
+                (vis != 0) != visible || (visible && material(head + offset) != material(head))
+            })
+            .unwrap_or(end_i - head);
+        let span_end = span_begin + span_len as u32;
+        if visible {
             let output = &mut scratch[census.run_n as usize..];
             let part = add_bsp_draw_surfs_camera(
                 kind,

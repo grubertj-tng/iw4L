@@ -16,6 +16,23 @@ pub(crate) fn spectator_lifecycle(team: i32) -> ClientLifecycle {
     }
 }
 
+fn spawn_command_angles(world: &mut FrameWorld, id: ClientId) -> [i32; 3] {
+    world
+        .ecs()
+        .get_resource::<crate::step::StepRequest>()
+        .and_then(|request| {
+            request
+                .input
+                .cmds
+                .iter()
+                .rev()
+                .find(|command| command.client == id)
+                .map(|command| command.command.angles)
+        })
+        .or_else(|| world.old_cmd_angles(id))
+        .unwrap_or([0; 3])
+}
+
 pub(crate) fn spawn(
     world: &mut FrameWorld,
     tick: Tick,
@@ -32,6 +49,7 @@ pub(crate) fn spawn(
     };
     world.unlink_player_area(id);
     world.client_meta_mut(id).shield = None;
+    let prev_health = world.player(id).map(|p| p.health);
     let mut ps = spawn_player_state(origin, angles);
     if let Some(max) = world
         .client_meta(id)
@@ -39,11 +57,14 @@ pub(crate) fn spawn(
         .filter(|&n| n > 0)
     {
         ps.max_health = max;
-        ps.health = max;
     }
-    if let Some(cmd) = world.old_cmd_angles(id) {
-        ps.delta_angles = std::array::from_fn(|axis| angles[axis] - cmd[axis] as f32 * SHORT2ANGLE);
-    }
+    ps.health = match sessionstate {
+        "playing" => ps.max_health,
+        "dead" | "intermission" => prev_health.unwrap_or(0),
+        _ => 0,
+    };
+    let cmd = spawn_command_angles(world, id);
+    ps.delta_angles = std::array::from_fn(|axis| angles[axis] - cmd[axis] as f32 * SHORT2ANGLE);
     let prev_teleport = world
         .player(id)
         .map(|p| p.e_flags & playerstate_iw4::eflags::TELEPORT)
@@ -114,6 +135,12 @@ pub(crate) fn spawn(
     world.link_player_standing_area(id);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HitInflictor {
+    Projectile(crate::ProjectileId),
+    ScriptModel(crate::ScriptModelId),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Hit {
     pub victim: ClientId,
@@ -125,7 +152,7 @@ pub(crate) struct Hit {
     pub point: [f32; 3],
     pub dir: [f32; 3],
     pub hitloc: u8,
-    pub inflictor: Option<crate::ProjectileId>,
+    pub inflictor: Option<HitInflictor>,
     pub commit: Option<DeathCommit>,
 }
 
@@ -206,7 +233,8 @@ pub(crate) fn damage(
         dir: normalized([0, 1, 2].map(|i| victim_origin[i] - from[i])),
         hitloc: intent.hitloc,
         inflictor: match intent.source {
-            DamageSource::Projectile(id) => Some(id),
+            DamageSource::Projectile(id) => Some(HitInflictor::Projectile(id)),
+            DamageSource::Radius(id) => Some(HitInflictor::ScriptModel(id)),
             _ => None,
         },
         commit: Some(DeathCommit {
@@ -286,7 +314,15 @@ pub(crate) fn finish_damage(
     };
     movement_iw4::update_damage_timer(ps, amount, dir);
     ps.health = (ps.health - amount.max(0)).max(0);
-    ps.damage_count = ps.damage_count.saturating_add(1);
+    if let Some(dir) = dir.filter(|dir| *dir != [0.0; 3]) {
+        let angles = math_iw4::vect_to_angles(dir);
+        ps.damage_pitch = (angles[0] / 360.0 * 256.0) as u32 & 0xff;
+        ps.damage_yaw = (angles[1] / 360.0 * 256.0) as u32 & 0xff;
+    } else {
+        ps.damage_pitch = 255;
+        ps.damage_yaw = 255;
+    }
+    ps.damage_count = amount.clamp(0, 127);
     ps.damage_event = ps.damage_event.wrapping_add(1);
     if ps.health > 0 {
         return Finish::Hurt;
@@ -419,10 +455,13 @@ pub(crate) fn move_to_forced_spawn(world: &mut FrameWorld, id: ClientId, pick: c
     let Some((origin, angles)) = forced_point(world, id, pick) else {
         return;
     };
+    let cmd_angles = spawn_command_angles(world, id);
     world.unlink_player_area(id);
     world.set_origin(id, origin);
     world.set_viewangles(id, angles);
     if let Some(ps) = world.player_mut(id) {
+        ps.delta_angles =
+            std::array::from_fn(|axis| angles[axis] - cmd_angles[axis] as f32 * SHORT2ANGLE);
         ps.velocity = [0.0; 3];
         ps.health = ps.max_health;
         ps.e_flags ^= playerstate_iw4::eflags::TELEPORT;
@@ -511,6 +550,7 @@ pub(crate) fn take_weapon(world: &mut FrameWorld, id: ClientId, weapon: u32) {
     }
     if ps.weapon == weapon {
         ps.weapon = 0;
+        ps.scope_zoom_level = 0;
     }
     if ps.weapon_primary == weapon {
         ps.weapon_primary = 0;
@@ -531,6 +571,7 @@ pub(crate) fn take_all_weapons(world: &mut FrameWorld, id: ClientId) {
     ps.ammo.fill(0);
     ps.ammoclip.fill(0);
     ps.weapon = 0;
+    ps.scope_zoom_level = 0;
     ps.weapon_primary = 0;
     ps.offhand_primary = 0;
     ps.offhand_secondary = 0;
@@ -552,6 +593,7 @@ pub(crate) fn set_spawn_weapon(
     let ps = world.player_mut(id).expect("checked above");
     let (ammo_before, clip_before) = (ps.ammo, ps.ammoclip);
     ps.weapon = weapon;
+    ps.scope_zoom_level = 0;
     arm_held_weapon(ps, weapon, &facts);
     ps.ammo = ammo_before;
     ps.ammoclip = clip_before;
@@ -730,10 +772,13 @@ fn perk_bits(name: &str) -> ([u32; 2], u32) {
         "specialty_fastmantle" => playerstate_iw4::PERK_FASTMANTLE,
         "specialty_quickdraw" => playerstate_iw4::PERK_QUICKDRAW,
         "specialty_holdbreath" => playerstate_iw4::PERK_HOLDBREATH,
+        "specialty_selectivehearing" => playerstate_iw4::PERK_SELECTIVEHEARING,
         _ => 0,
     };
     let perk1 = match name {
         "specialty_spygame" => playerstate_iw4::PERK1_SPYGAME,
+        "specialty_extendedmelee" => playerstate_iw4::PERK1_EXTENDEDMELEE,
+        "specialty_fastsprintrecovery" => playerstate_iw4::PERK1_FASTSPRINTRECOVERY,
         _ => 0,
     };
     let e_flags = match name {

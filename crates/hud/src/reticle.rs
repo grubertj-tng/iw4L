@@ -109,7 +109,11 @@ pub(crate) fn update_reticle(
         hide_all(&mut quads);
         return;
     };
-    let Some(facts) = weapons.0.hud_facts_of(viewmodel_index) else {
+    let Some(facts) = weapons
+        .snapshot_weapon(presented.weapon_epoch(), viewmodel_index)
+        .ok()
+        .and_then(|weapon| weapon.hud_facts())
+    else {
         gaps.raise(GapCause::ReticleWeaponNotInCatalog { viewmodel_index });
         hide_all(&mut quads);
         return;
@@ -166,7 +170,14 @@ pub(crate) fn update_reticle(
                 .map_or(SCREEN_BLEND_BLURRED, |shock| shock.screen_type),
         ) != 0,
         draw_hud: true,
-        dvars_allow: true,
+        dvars_allow: presented.snapshot().is_none_or(|snapshot| {
+            snapshot
+                .meta
+                .script_dvars(local.0)
+                .int("cg_drawCrosshair")
+                .unwrap_or(1)
+                != 0
+        }),
         f_weapon_pos_frac: ps.f_weapon_pos_frac,
         cg_draw_gun: true,
 
@@ -189,7 +200,7 @@ pub(crate) fn update_reticle(
         return;
     }
 
-    let Some(assets) = weapons.0.reticle_of(viewmodel_index) else {
+    let Some(assets) = weapons.registry().reticle_of(viewmodel_index) else {
         gaps.raise(GapCause::ReticleNoAuthoredMaterials { viewmodel_index });
         hide_all(&mut quads);
         return;
@@ -226,7 +237,12 @@ pub(crate) fn update_reticle(
         side_size_v,
     );
 
-    let center_size_v = assets.center_size as f32 * trans_scale;
+    let cook_size = if facts.cooks_grenade && ps.grenade_time_left > 0 {
+        (ps.grenade_time_left % 1000) as f32 / 100.0
+    } else {
+        0.0
+    };
+    let center_size_v = (assets.center_size as f32 + cook_size) * trans_scale;
     let alpha = calc_reticle_alpha(
         1.0,
         CG_CROSSHAIR_ALPHA_DEFAULT,
@@ -246,8 +262,8 @@ pub(crate) fn update_reticle(
     };
 
     let weapon_ns = weapons
-        .0
-        .namespace_of(viewmodel_index)
+        .registry()
+        .component_namespace_of(viewmodel_index, asset_game::WeaponComponent::Material)
         .unwrap_or(crate::images::HUD_CHROME_NAMESPACE);
     let center = resolve_slot(
         ReticleSlot::Center,

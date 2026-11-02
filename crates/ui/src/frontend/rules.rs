@@ -20,7 +20,9 @@ pub fn selected_game(
 pub const MATCH_CONFIG: &str = "default_xboxlive.cfg";
 
 fn is_rule(name: &str) -> bool {
-    name.starts_with("scr_") || name == "g_hardcore"
+    name.starts_with("scr_")
+        || name.starts_with("koth_")
+        || matches!(name, "g_hardcore" | "camera_thirdperson")
 }
 
 pub fn seed_rules(dvars: &mut UiMenuDvars, config: &str) {
@@ -36,6 +38,15 @@ pub fn seed_rules(dvars: &mut UiMenuDvars, config: &str) {
         let name = name.to_ascii_lowercase();
         if is_rule(&name) && dvars.get(&name).is_none() {
             dvars.set(&name, value.trim_matches('"'));
+        }
+    }
+    for dvar in [
+        sim::CONSTANT_RADAR_DVAR,
+        sim::ENEMY_BOTS_DVAR,
+        sim::FRIENDLY_BOTS_DVAR,
+    ] {
+        if dvars.get(dvar).is_none() {
+            dvars.set(dvar, "0");
         }
     }
 }

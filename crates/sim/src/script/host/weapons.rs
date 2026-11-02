@@ -5,7 +5,7 @@ use crate::equipment::WeaponNote;
 use crate::frame::FrameWorld;
 use crate::script::Namespace::{Function, Method};
 use crate::script::runtime::raise;
-use crate::script::{Arc, NativeRegistry, Runtime, Value};
+use crate::script::{Arc, NativeRegistry, RoundScript, Value};
 use crate::world::ClientId;
 use bevy_ecs::prelude::World;
 pub(crate) use weapon_iw4::WEAPTYPE_PROJECTILE;
@@ -40,7 +40,7 @@ fn now_ms(world: &World) -> i32 {
 }
 
 fn missile_of(world: &World, receiver: &Value) -> Result<(u64, ProjectileId, i32), String> {
-    match world.resource::<Runtime>().entity(receiver) {
+    match world.resource::<RoundScript>().entity(receiver) {
         Some((object, e)) => match e.kind {
             EntityKind::Missile(id) => Ok((object, id, e.number)),
             _ => Err("receiver is not a missile".into()),
@@ -58,13 +58,31 @@ fn adopt(
     let model =
         Value::string(FrameWorld::from_world(world).weapon_projectile_model(projectile.weapon));
     let facts = FrameWorld::from_world(world).equipment_facts_for(projectile.weapon);
+    if let Some(object) = world
+        .resource::<RoundScript>()
+        .missiles
+        .get(&projectile.id)
+        .copied()
+    {
+        return Ok(object);
+    }
+    let object = world
+        .resource_mut::<RoundScript>()
+        .create_entity(EntityKind::Missile(projectile.id), classname)?;
     let presence = if facts.is_some_and(|facts| !facts.timed_detonation && facts.stickiness != 0) {
-        Some(super::presence::spawn_presence(world, projectile.origin)?)
+        match super::presence::spawn_presence(world, projectile.origin) {
+            Ok(presence) => Some(presence),
+            Err(error) => {
+                let mut runtime = world.resource_mut::<RoundScript>();
+                runtime.entities.remove(&object);
+                runtime.objects.remove(&object);
+                return Err(error);
+            }
+        }
     } else {
         None
     };
-    let mut runtime = world.resource_mut::<Runtime>();
-    let object = runtime.create_entity(EntityKind::Missile(projectile.id), classname)?;
+    let mut runtime = world.resource_mut::<RoundScript>();
     let owner = runtime
         .players
         .get(&projectile.owner.0)
@@ -73,6 +91,7 @@ fn adopt(
     entity.presence = presence;
     entity.missile_owner = owner;
     entity.number = projectile.entnum;
+    runtime.set_object_field(object, "birthtime", Value::Int(projectile.spawn_time_ms));
     runtime.set_object_field(object, "model", model);
     runtime.set_object_field(object, "origin", Value::Vector(projectile.origin_at(now)));
     runtime.set_object_field(
@@ -110,7 +129,7 @@ pub(crate) fn register(registry: &mut NativeRegistry) {
             return Err("GetMissileOwner requires one missile argument".into());
         }
         let (object, _, _) = missile_of(world, &args[0])?;
-        let runtime = world.resource::<Runtime>();
+        let runtime = world.resource::<RoundScript>();
         let owner = runtime.entities[&object]
             .missile_owner
             .filter(|owner| runtime.players.values().any(|slot| slot.object == *owner));
@@ -132,7 +151,7 @@ pub(crate) fn register(registry: &mut NativeRegistry) {
         let (start, end) = (vector(args, 1)?, vector(args, 2)?);
         let owner = match args.get(3) {
             Some(value) => world
-                .resource::<Runtime>()
+                .resource::<RoundScript>()
                 .player_client_of(value)
                 .map(ClientId)
                 .ok_or("MagicBullet owner is not a player")?,
@@ -169,6 +188,7 @@ pub(crate) fn register(registry: &mut NativeRegistry) {
                 angles,
                 ..Default::default()
             });
+            crate::remote_missile::mark_remote(frame.ecs(), id);
         }
         Ok(Value::Undefined)
     });
@@ -191,7 +211,7 @@ pub(crate) fn register(registry: &mut NativeRegistry) {
         let client = super::natives::player::player(world, receiver)?;
         super::natives::engine::entity_id(world, arg(args, 0)?)?;
         world
-            .resource::<Runtime>()
+            .resource::<RoundScript>()
             .players
             .get(&client)
             .ok_or("player has disconnected")?;
@@ -213,7 +233,7 @@ pub(crate) fn sync_engine_events(world: &mut World) {
         return;
     }
     let notes = std::mem::take(&mut FrameWorld::from_world(world).weapon_notes);
-    let runtime = world.resource::<Runtime>();
+    let runtime = world.resource::<RoundScript>();
     if runtime.program.is_none() || runtime.fault.is_some() || !runtime.started {
         return;
     }
@@ -251,7 +271,7 @@ pub(crate) fn sync_engine_events(world: &mut World) {
 
 fn notify_weapon_changes(world: &mut World) {
     let slots: Vec<(u32, u64, u32, bool)> = world
-        .resource::<Runtime>()
+        .resource::<RoundScript>()
         .players
         .iter()
         .map(|(client, slot)| (*client, slot.object, slot.weapon, slot.switching))
@@ -278,18 +298,27 @@ fn notify_weapon_changes(world: &mut World) {
             let name = weapon_name(world, current);
             raise(world, Value::Object(object), "weapon_change", vec![name]);
         }
-        if let Some(slot) = world.resource_mut::<Runtime>().players.get_mut(&client) {
+        if let Some(slot) = world.resource_mut::<RoundScript>().players.get_mut(&client) {
             slot.weapon = ps.weapon;
             slot.switching = switching;
         }
     }
 }
 
+pub(crate) fn publish_projectile_launches(world: &mut World) {
+    if world
+        .resource::<crate::step::StepRequest>()
+        .reason
+        .advances_authority_world()
+        && world.resource::<RoundScript>().started
+    {
+        adopt_fired(world);
+    }
+}
+
 fn adopt_fired(world: &mut World) {
-    let now = now_ms(world);
-    let seen = std::mem::replace(&mut world.resource_mut::<Runtime>().missiles_seen_ms, now);
     let touches = world
-        .resource::<Runtime>()
+        .resource::<RoundScript>()
         .grenade_touches
         .iter()
         .map(|touch| touch.projectile)
@@ -298,8 +327,8 @@ fn adopt_fired(world: &mut World) {
     let fresh: Vec<crate::ProjectileState> = crate::frame::collect_projectiles(world)
         .into_iter()
         .chain(touches)
-        .filter(|p| p.live && p.spawn_time_ms > seen)
-        .filter(|p| !world.resource::<Runtime>().missiles.contains_key(&p.id))
+        .filter(|p| p.live)
+        .filter(|p| !world.resource::<RoundScript>().missiles.contains_key(&p.id))
         .filter(|p| adopted.insert(p.id))
         .collect();
     for projectile in fresh {
@@ -308,7 +337,7 @@ fn adopt_fired(world: &mut World) {
             continue;
         }
         let weap_type = FrameWorld::from_world(world)
-            .combat_facts_for(projectile.weapon)
+            .equipment_facts_for(projectile.weapon)
             .map_or(-1, |facts| facts.weap_type);
         let (classname, notify) = match weap_type {
             WEAPTYPE_GRENADE => ("grenade", "grenade_fire"),
@@ -334,7 +363,7 @@ fn adopt_fired(world: &mut World) {
         let model = format!("{}{}", crate::WEAPON_MODEL_PREFIX, projectile.weapon);
         let native = weapon_name(world, projectile.weapon);
         {
-            let mut runtime = world.resource_mut::<Runtime>();
+            let mut runtime = world.resource_mut::<RoundScript>();
             runtime.set_object_field(object, "nativename", native);
             runtime.set_object_field(object, "weaponname", name.clone());
             runtime.set_object_field(object, "weaponmodel", Value::string(&model));
@@ -345,11 +374,11 @@ fn adopt_fired(world: &mut World) {
 
 fn settle_items(world: &mut World) {
     let items: Vec<(u64, i32, Arc<str>)> = {
-        let runtime = world.resource::<Runtime>();
+        let runtime = world.resource::<RoundScript>();
         runtime
             .entities
             .iter()
-            .filter(|(id, _)| !runtime.pending_deletes.contains(id))
+            .filter(|(id, _)| runtime.script_is_defined(id))
             .filter_map(|(id, e)| match e.kind {
                 EntityKind::Item(number) => Some((*id, number, e.classname.clone())),
                 _ => None,
@@ -357,7 +386,6 @@ fn settle_items(world: &mut World) {
             .collect()
     };
     let pickups = FrameWorld::from_world(world).item_pickups_mut().clone();
-    let mut retired = Vec::new();
     for pickup in pickups {
         let Some((object, _, classname)) = items
             .iter()
@@ -382,15 +410,12 @@ fn settle_items(world: &mut World) {
             });
             raise(world, receiver.clone(), "trigger", vec![player, swapped]);
         }
-        retire(world, object);
-        retired.push(object);
     }
-    for (object, number, _) in items {
-        if !retired.contains(&object)
-            && FrameWorld::from_world(world)
-                .dropped_item_by_number(number)
-                .is_none()
-        {
+    // Retire only after every pickup is raised: a death between two triggers on one
+    // item ends the script thread still waiting on it.
+    let retired = world.resource_mut::<RoundScript>().take_retired_items();
+    for object in retired {
+        if world.resource::<RoundScript>().script_is_defined(&object) {
             retire(world, object);
         }
     }
@@ -398,31 +423,31 @@ fn settle_items(world: &mut World) {
 
 fn retire(world: &mut World, object: u64) {
     raise(world, Value::Object(object), "death", Vec::new());
-    world.resource_mut::<Runtime>().pending_deletes.push(object);
+    world.resource_mut::<RoundScript>().request_delete(object);
 }
 
 fn settle_projectiles(world: &mut World, notes: &[WeaponNote]) {
     let now = now_ms(world);
     let tracked: Vec<(ProjectileId, u64)> = world
-        .resource::<Runtime>()
+        .resource::<RoundScript>()
         .missiles
         .iter()
         .map(|(id, object)| (*id, *object))
         .collect();
     for (id, object) in tracked {
         let Some(number) = world
-            .resource::<Runtime>()
+            .resource::<RoundScript>()
             .entities
             .get(&object)
             .map(|e| e.number)
         else {
-            world.resource_mut::<Runtime>().missiles.remove(&id);
+            world.resource_mut::<RoundScript>().missiles.remove(&id);
             if let Some(number) = crate::frame::collect_projectiles(world)
                 .iter()
                 .find(|p| p.id == id)
                 .map(|p| p.entnum)
             {
-                FrameWorld::from_world(world).remove_projectile_by_number(number);
+                FrameWorld::from_world(world).despawn_projectile(number);
             }
             continue;
         };
@@ -439,7 +464,7 @@ fn settle_projectiles(world: &mut World, notes: &[WeaponNote]) {
         let receiver = Value::Object(object);
         match (flying, detonated) {
             (Some(projectile), None) => {
-                let mut runtime = world.resource_mut::<Runtime>();
+                let mut runtime = world.resource_mut::<RoundScript>();
                 runtime.set_object_field(
                     object,
                     "origin",
@@ -456,7 +481,7 @@ fn settle_projectiles(world: &mut World, notes: &[WeaponNote]) {
                 }
             }
             _ => {
-                let mut runtime = world.resource_mut::<Runtime>();
+                let mut runtime = world.resource_mut::<RoundScript>();
                 runtime.missiles.remove(&id);
                 if let Some(origin) = detonated {
                     runtime.set_object_field(object, "origin", Value::Vector(origin));
@@ -478,18 +503,18 @@ fn settle_projectiles(world: &mut World, notes: &[WeaponNote]) {
                 }
                 if lingers {
                     world
-                        .resource_mut::<Runtime>()
+                        .resource_mut::<RoundScript>()
                         .lingering
                         .push((i64::from(now) + GRENADE_LINGER_MS, object));
                 } else {
                     raise(world, receiver, "death", Vec::new());
-                    world.resource_mut::<Runtime>().pending_deletes.push(object);
+                    world.resource_mut::<RoundScript>().request_delete(object);
                 }
             }
         }
     }
     let due: Vec<u64> = {
-        let mut runtime = world.resource_mut::<Runtime>();
+        let mut runtime = world.resource_mut::<RoundScript>();
         let (due, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut runtime.lingering)
             .into_iter()
             .partition(|(at, _)| *at <= i64::from(now));
@@ -497,9 +522,13 @@ fn settle_projectiles(world: &mut World, notes: &[WeaponNote]) {
         due.into_iter().map(|(_, object)| object).collect()
     };
     for object in due {
-        if world.resource::<Runtime>().entities.contains_key(&object) {
+        if world
+            .resource::<RoundScript>()
+            .entities
+            .contains_key(&object)
+        {
             raise(world, Value::Object(object), "death", Vec::new());
-            world.resource_mut::<Runtime>().pending_deletes.push(object);
+            world.resource_mut::<RoundScript>().request_delete(object);
         }
     }
 }

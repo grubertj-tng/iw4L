@@ -46,9 +46,12 @@ pub(crate) fn apply_window_settings(
     let Ok(mut window) = windows.single_mut() else {
         return;
     };
-    window
-        .resolution
-        .set_physical_resolution(settings.resolution.width, settings.resolution.height);
+    // Fullscreen covers the display; there the resolution sets the render size.
+    if !settings.fullscreen {
+        window
+            .resolution
+            .set_physical_resolution(settings.resolution.width, settings.resolution.height);
+    }
     window.mode = if settings.fullscreen {
         bevy::window::WindowMode::BorderlessFullscreen(MonitorSelection::Current)
     } else {

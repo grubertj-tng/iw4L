@@ -18,6 +18,11 @@ scenario`, `chaos`, `bench` ([`BENCH.md`](BENCH.md)), `bench-live`, `lifecycle-*
 
 Linux startup creates `iw4`, `iw5`, `t5` and `t6` symlinks in `IW4L_GAMES` for missing games with exactly one valid Steam installation. Existing entries are preserved.
 
+`menu` opens the main menu immediately while the shared weapon catalog prepares
+in the background. Opening Classes before it is ready shows Loading Classes;
+Escape returns to the menu, and readiness opens the editor for unlocked accounts. In `--cmds`,
+`wait progression` holds until then.
+
 **Cheats are on by default.** The host accepts the debug
 actions: `move`, `look`, `tp`, `nudge`, `god`, `kill`, `damage`, `force_spawn`,
 `force_match_start`, `rotatevelocity` and the `give` supply commands. `--no-cheats`
@@ -44,6 +49,14 @@ A hand-typed `quit`/`exit`/`disconnect` goes further: it jumps **every** hold,
 `wait 60s` included, and releases it. A `quit` written into `--cmds` does not —
 it is part of the script and waits its turn.
 
+Public chat is **T**, team chat is **Y**. Multiplayer settings and Controls →
+Actions can rebind both;
+`bind T chatmodepublic` / `bind Y chatmodeteam` also persist. Enter sends,
+Escape cancels; arrows, Home/End, Backspace/Delete edit the message.
+`say <message>` and `say_team <message>` send from the console. Chat lasts
+eight seconds, shows five recent messages, and uses team colors for names with white
+message text. Lines contain only `nickname: message`, without status prefixes.
+
 ## Verbs and traps
 
 `map spawn class give attach name god kill damage move tp look nudge press hold
@@ -63,6 +76,7 @@ received plus its own presented state; `demo LATEST` plays it back.
 * ADS is `hold +speed_throw`, not `+speed`;
 * Hold Shift (`+breath_sprint`) or bind `+holdbreath` to steady eligible sights
   at full ADS. Breath lasts 4.5 seconds; releasing or exhausting it requires recovery.
+* Variable scopes: at full ADS, press `+changezoom` to cycle magnification. Fresh defaults bind Q; `bind Q +changezoom` adds it to existing settings. Options → Controls → Actions also exposes Change zoom. `+melee_zoom` changes zoom while scoped and melees otherwise; controller layouts use the melee button.
 * Aim binding: `bind MOUSE2 +speed_throw` aims only while held;
   `bind MOUSE2 +toggleads_throw` toggles aim on each press. Both are available
   under Options → Controls → Actions, and the chosen bind is saved in settings.
@@ -73,6 +87,7 @@ received plus its own presented state; `demo LATEST` plays it back.
   deployable gadgets when there is room in their equipment ammo slot.
 * `give` searches one completion list: `give ammo`, `give killstreak/uav`, or `give weapon/iw5:msr [attachment...]`. Search by any part of the name, then accept the suggested item.
 * `give killstreak/care_package` and `give killstreak/pave_low` acquire rewards without activating them. Available familiar names appear alongside script names in autocomplete.
+* `give camo <name>` changes the held weapon’s camouflage without changing its attachments or ammo. Autocomplete offers its catalog camos; `give camo none` clears it.
 * `give ammo` refills carried reserves and equipment; reload magazines normally. Supply commands require a live player and a host allowing debug actions.
 * `bot` hints follow the subcommand: counts, on/off, current bot IDs, weapons, and `tp … above`.
 * custom classes live in `iw4l-artifacts/profile/classes.txt` (one tab-separated
@@ -80,6 +95,12 @@ received plus its own presented state; `demo LATEST` plays it back.
   five available classes again. Random presets use a pool of 20: five each for
   IW4, IW5, T5 and T6, with IW4 equipment. Players and bots select only
   presets supported by the loaded weapons, attachments and equipment.
+
+In the class editor, choose Camouflage for the primary or secondary weapon.
+MW3 weapons use their installed camo names and previews, including Gold, Marine
+and Winter where models are available. The selection is saved with the class and
+applies to first-person and world weapons. Console equip also accepts
+`give weapon/iw5:acr reflex camo=gold`.
 
 Callsign on the main menu selects a title and emblem. Killstreaks selects three
 rewards with different kill requirements; Apply saves the selection for the next
@@ -91,8 +112,10 @@ sliders and a saved First person / Third person camera selector. Use
 `thirdperson` to toggle, `thirdperson 0|1` to select, or `set cg_thirdPerson 0|1`.
 Death, killcam and remote missile cameras take priority. Drag with the mouse
 or use Left/Right on the focused slider; the value
-appears to its right. Multiplayer settings contain the player-name field
-(Enter to edit and accept, Escape to cancel). These settings persist across
+appears to its right. Windowed, Resolution sizes the window; fullscreen covers
+the display, and a resolution shorter than the display renders the match at
+that many rows (the window's aspect) and scales it up. Multiplayer settings
+contain the player-name field (Enter to edit and accept, Escape to cancel). These settings persist across
 launches in `$XDG_CONFIG_HOME/iw4l/settings.cfg` or `~/.config/iw4l/settings.cfg`
 on Linux; `IW4L_SETTINGS_PATH` selects a separate settings file for probes.
 Listen hosts also persist the three script completion percentages in `profile.cfg`
@@ -107,5 +130,21 @@ before level entry scripts start. Player-data methods read and write the bound s
 external scripts block persistent-data writes. IW4 remote admission exchanges a
 signed profile before gameplay; host updates save locally before acknowledgement.
 Installed multiplayer validation and schema migration remain incomplete.
+
+At the main menu, `unlock all` saves the maximum shared level and completes the
+native challenges, including all Pro perk requirements. `unlock reset` saves
+level 1, clears prestige, and restores initial challenge progress. Both preserve
+account identity, custom classes and other statistics. Disconnect before using
+these commands; active matches, loading and replay refuse progression edits.
+The console offers `all` and `reset` as argument completions. Unlocking progression
+does not supply missing weapon assets or enable unsupported content.
+
 Older account files upgrade while retaining stats;
 conflicting disk revisions refuse save instead of overwriting another writer.
+
+On a local match host with cheats, `round_restart` runs the script round restart
+while retaining prepared map content and round-persistent state. `map_restart`
+creates a new match on the current map.
+
+For console scripts that edit progression as the menu starts, use
+`wait progression; unlock all` to wait for native account content.

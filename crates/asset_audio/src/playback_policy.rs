@@ -2,7 +2,7 @@ mod compiler;
 
 use std::sync::Arc;
 
-use crate::{AssetNamespace, CapturedAlias, CapturedSound, ChannelKey, EntChannel, VoicePriority};
+use crate::{AssetNamespace, CapturedAlias, ChannelKey, EntChannel, VoicePriority};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VoiceLimitMode {
@@ -95,7 +95,7 @@ pub enum SecondaryActivation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SecondaryPolicySource {
-    T5IndependentCompatibility,
+    IndependentLayers,
     PrimaryPreparedCompatibility,
 }
 
@@ -135,6 +135,7 @@ pub enum UnsupportedCueFeature {
 
 #[derive(Clone, Debug)]
 pub struct CueCompositionPolicy {
+    pub start_delay_ms: u32,
     pub secondary: Option<SecondaryLayerPolicy>,
     pub unsupported: Arc<[UnsupportedCueFeature]>,
 }
@@ -206,12 +207,10 @@ impl AliasPlaybackPolicy {
     }
 
     pub(crate) fn compile(
-        sound: &CapturedSound,
+        catalog: &crate::SoundCatalog,
+        alias: usize,
         variant: usize,
-        row: &CapturedAlias,
-        channels: Option<&[EntChannel]>,
-        group_volumes: Option<&[Result<f32, crate::MixerGroupError>]>,
-    ) -> Self {
-        compiler::compile(sound, variant, row, channels, group_volumes)
+    ) -> Option<Self> {
+        compiler::compile(catalog, alias, variant)
     }
 }

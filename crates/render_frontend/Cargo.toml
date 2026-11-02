@@ -33,6 +33,7 @@ hud_iw4.workspace = true
 marks_iw4.workspace = true
 math_iw4.workspace = true
 net.workspace = true
+master_protocol.workspace = true
 perf.workspace = true
 playerstate_iw4.workspace = true
 render_anim.workspace = true
@@ -43,7 +44,7 @@ render_scene.workspace = true
 sim.workspace = true
 weapon_iw4.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
-naga = { version = "29", features = ["wgsl-in"] }
+naga = { version = "30", features = ["wgsl-in"] }
 
 [lints]
 workspace = true

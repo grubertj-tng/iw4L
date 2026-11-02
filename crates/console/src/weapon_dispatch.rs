@@ -3,7 +3,6 @@ use std::sync::{Arc, RwLock};
 use asset_game::{LoadoutRules, WeaponSelection};
 use assets::PreparedWeapons;
 use bevy::prelude::*;
-use frame::MatchTornDown;
 use net::{ClientActionInbox, LocalPresentClient, PresentedSnapshot};
 use sim::{ClientAction, ClientLifecycle};
 
@@ -12,65 +11,53 @@ use crate::{
     StaticCompleter,
 };
 
-#[derive(Resource, Clone)]
+#[derive(Clone, Default)]
 pub struct WeaponArgCompletions {
-    pub give: Arc<RwLock<Vec<String>>>,
-    pub attach: Arc<RwLock<Vec<String>>>,
-    pub killstreaks: Arc<RwLock<Vec<String>>>,
-    pub bots: Arc<RwLock<Vec<String>>>,
+    pub give: Vec<String>,
+    pub attach: Vec<String>,
+    pub camos: Vec<String>,
+    pub killstreaks: Vec<String>,
+    pub bots: Vec<String>,
 }
 
-impl Default for WeaponArgCompletions {
-    fn default() -> Self {
-        Self {
-            give: Arc::new(RwLock::new(Vec::new())),
-            attach: Arc::new(RwLock::new(Vec::new())),
-            killstreaks: Arc::new(RwLock::new(Vec::new())),
-            bots: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-}
+#[derive(Resource, Clone, Default)]
+pub(crate) struct CompletionSlot(Arc<RwLock<Option<WeaponArgCompletions>>>);
 
-pub(crate) fn clear_weapon_args_on_torn_down(
-    mut torn: MessageReader<MatchTornDown>,
-    completions: Res<WeaponArgCompletions>,
-) {
-    if torn.read().len() == 0 {
-        return;
+impl CompletionSlot {
+    fn read<R>(&self, read: impl FnOnce(Option<&WeaponArgCompletions>) -> R) -> R {
+        read(self.0.read().expect("completion slot poisoned").as_ref())
     }
-    if let Ok(mut give) = completions.give.write() {
-        give.clear();
-    }
-    if let Ok(mut attach) = completions.attach.write() {
-        attach.clear();
-    }
-    if let Ok(mut values) = completions.killstreaks.write() {
-        values.clear();
-    }
-    if let Ok(mut values) = completions.bots.write() {
-        values.clear();
+
+    fn publish(&self, value: Option<WeaponArgCompletions>) {
+        *self.0.write().expect("completion slot poisoned") = value;
     }
 }
 
-struct LiveListCompleter(Arc<RwLock<Vec<String>>>);
+pub(crate) fn clear_weapon_arg_completions(completions: Res<CompletionSlot>) {
+    completions.publish(None);
+}
+
+struct LiveListCompleter(CompletionSlot, fn(&WeaponArgCompletions) -> &[String]);
 
 impl ArgCompleter for LiveListCompleter {
     fn complete(&self, prefix: &str) -> Vec<String> {
-        let Ok(values) = self.0.read() else {
-            return Vec::new();
-        };
-        StaticCompleter::new(values.iter().cloned()).complete(prefix)
+        self.0.read(|value| {
+            value.map_or_else(Vec::new, |value| {
+                StaticCompleter::new((self.1)(value).iter().cloned()).complete(prefix)
+            })
+        })
     }
 }
 
 pub(crate) fn register_weapon_commands(
     registry: &mut ConsoleRegistry,
-    completions: &WeaponArgCompletions,
+    completions: &CompletionSlot,
 ) {
     if registry.resolve("give").is_none() {
         registry.register(
             crate::CommandSpec::new("give")
                 .usage(GIVE_USAGE)
+                .arg(GiveCompleter(completions.clone()))
                 .arg(GiveCompleter(completions.clone())),
         );
     }
@@ -85,60 +72,70 @@ pub(crate) fn register_weapon_commands(
         registry.register(
             crate::CommandSpec::new("attach")
                 .usage("attach [name] — show the current set and choices, or toggle a named attachment")
-                .arg(LiveListCompleter(Arc::clone(&completions.attach))),
+                .arg(LiveListCompleter(completions.clone(), |value| &value.attach)),
         );
     }
 }
 
 pub(crate) fn refresh_weapon_arg_completions(
-    weapons: Option<Res<PreparedWeapons>>,
+    weapons: Res<PreparedWeapons>,
     killstreaks: Option<Res<assets::prepared::PreparedKillstreaks>>,
     presented: Res<PresentedSnapshot>,
     local: Res<LocalPresentClient>,
-    completions: Res<WeaponArgCompletions>,
-    mut last_held: Local<Option<u32>>,
+    completions: Res<CompletionSlot>,
+    generation: Res<frame::WorldGeneration>,
+    mut previous: Local<Option<(u64, u32, Vec<String>)>>,
 ) {
-    if let Ok(mut values) = completions.killstreaks.write() {
-        *values = killstreaks.as_ref().map_or_else(Vec::new, |v| v.0.clone());
-    }
-    if let Ok(mut values) = completions.bots.write() {
-        *values = presented.snapshot().map_or_else(Vec::new, |snapshot| {
-            snapshot
-                .meta
-                .clients
-                .iter()
-                .filter(|(_, meta)| {
-                    ["bot", "dummy"]
-                        .iter()
-                        .any(|name| meta.name == entity_iw4::pack_client_state_name(name))
-                })
-                .map(|(id, _)| id.0.to_string())
-                .collect()
-        });
-    }
-    let Some(weapons) = weapons.as_ref() else {
-        return;
-    };
     let held = presented.held_weapon_id(local.0).unwrap_or(0);
-    let changed = weapons.is_changed();
-    if !should_refresh_weapon_args(changed, *last_held, held) {
+    let bots = presented.snapshot().map_or_else(Vec::new, |snapshot| {
+        snapshot
+            .meta
+            .clients
+            .iter()
+            .filter(|(_, meta)| {
+                ["bot", "dummy"]
+                    .iter()
+                    .any(|name| meta.name == entity_iw4::pack_client_state_name(name))
+            })
+            .map(|(id, _)| id.0.to_string())
+            .collect()
+    });
+    let epoch = generation.0.expect("live match generation");
+    if previous
+        .as_ref()
+        .is_some_and(|(old_epoch, old_held, old_bots)| {
+            *old_epoch == epoch && *old_held == held && *old_bots == bots
+        })
+        && !weapons.is_changed()
+        && killstreaks.as_ref().is_none_or(|value| !value.is_changed())
+    {
         return;
     }
-    *last_held = Some(held);
-    if let Ok(mut give) = completions.give.write() {
-        *give = weapon_completions(weapons);
-    }
-    if let Ok(mut attach) = completions.attach.write() {
-        *attach = if held == 0 {
+    *previous = Some((epoch, held, bots.clone()));
+    let camos = if held == 0 {
+        Vec::new()
+    } else {
+        std::iter::once("none".to_owned())
+            .chain(
+                weapons
+                    .registry()
+                    .camouflage_choices(held)
+                    .into_iter()
+                    .map(|(_, name)| name.to_owned()),
+            )
+            .collect()
+    };
+    completions.publish(Some(WeaponArgCompletions {
+        give: weapon_completions(&weapons),
+        attach: if held == 0 {
             Vec::new()
         } else {
-            attach_completions(weapons, held)
-        };
-    }
-}
-
-fn should_refresh_weapon_args(catalog_changed: bool, last_held: Option<u32>, held: u32) -> bool {
-    catalog_changed || last_held != Some(held)
+            attach_completions(&weapons, held)
+        },
+        camos,
+        killstreaks: killstreaks.map_or_else(Vec::new, |value| value.0.clone()),
+        bots,
+    }));
 }
 
 pub(crate) fn route_weapon_commands(
@@ -151,7 +148,7 @@ pub(crate) fn route_weapon_commands(
     local: Res<LocalPresentClient>,
     mut inbox: ResMut<ClientActionInbox>,
     mut seq: ResMut<net::ActionRequestIds>,
-    completions: Res<WeaponArgCompletions>,
+    completions: Res<CompletionSlot>,
     authority: Option<Res<net::AuthorityWorld>>,
 ) {
     let capacity = settings.log_capacity;
@@ -200,6 +197,18 @@ pub(crate) fn route_weapon_commands(
                         );
                         continue;
                     }
+                    GiveTarget::Camo(name) => {
+                        change_camo(
+                            name,
+                            weapons.as_deref(),
+                            &presented,
+                            &local,
+                            &mut inbox,
+                            &mut seq,
+                            |msg| echo(msg, &mut console, &mut line),
+                        );
+                        continue;
+                    }
                     GiveTarget::Weapon(name) => name,
                 };
                 let Some(weapons) = weapons.as_ref() else {
@@ -219,8 +228,9 @@ pub(crate) fn route_weapon_commands(
                     continue;
                 }
                 let (camo, attachments) = split_camo(&cmd.args[1..]);
-                match resolve_give_id(&weapons.0, arg, &attachments).and_then(|weapon| {
-                    let model = camo.map_or(Ok(0), |camo| camo_slot(&weapons.0, weapon, camo))?;
+                match resolve_give_id(weapons.registry(), arg, &attachments).and_then(|weapon| {
+                    let model =
+                        camo.map_or(Ok(0), |camo| camo_slot(weapons.registry(), weapon, camo))?;
                     Ok((weapon, model))
                 }) {
                     Ok((weapon, model)) => {
@@ -240,7 +250,7 @@ pub(crate) fn route_weapon_commands(
                         echo(
                             format!(
                                 "give: queued {} id={weapon} request_id={request_id}",
-                                weapons.0.configuration_label(weapon)
+                                weapons.registry().configuration_label(weapon)
                             ),
                             &mut console,
                             &mut line,
@@ -272,13 +282,13 @@ pub(crate) fn route_weapon_commands(
                     continue;
                 }
                 let Some(name) = cmd.args.first() else {
-                    match attachment_hints(&weapons.0, current) {
+                    match attachment_hints(weapons.registry(), current) {
                         Ok(hints) => echo(format!("attach: {hints}"), &mut console, &mut line),
                         Err(reason) => echo(format!("attach: {reason}"), &mut console, &mut line),
                     }
                     continue;
                 };
-                let next = toggle_named_attachment(&weapons.0, current, name);
+                let next = toggle_named_attachment(weapons.registry(), current, name);
                 let next = match next {
                     Ok(id) => id,
                     Err(msg) => {
@@ -291,7 +301,7 @@ pub(crate) fn route_weapon_commands(
                         format!(
                             "attach: `{}` is already the selected configuration — refused \
                              (an unchanged id is not a successful attach)",
-                            weapons.0.configuration_label(current)
+                            weapons.registry().configuration_label(current)
                         ),
                         &mut console,
                         &mut line,
@@ -313,7 +323,7 @@ pub(crate) fn route_weapon_commands(
                 echo(
                     format!(
                         "attach: queued {} id={next} request_id={request_id}",
-                        weapons.0.configuration_label(next)
+                        weapons.registry().configuration_label(next)
                     ),
                     &mut console,
                     &mut line,
@@ -324,7 +334,7 @@ pub(crate) fn route_weapon_commands(
     }
 }
 
-const GIVE_USAGE: &str = "give ammo | give killstreak/<name> | give weapon/<game:weapon> [attachment...] [camo=<name|slot>] — resupply ammo, acquire a reward, or equip a weapon";
+const GIVE_USAGE: &str = "give camo <name|slot|none> | give ammo | give killstreak/<name> | give weapon/<game:weapon> [attachment...] [camo=<name|slot>] — resupply ammo, acquire a reward, or equip a weapon";
 
 pub(crate) fn split_camo(args: &[String]) -> (Option<&str>, Vec<String>) {
     let mut camo = None;
@@ -367,6 +377,7 @@ pub(crate) fn camo_slot(
 #[derive(Debug, PartialEq)]
 enum GiveTarget<'a> {
     Ammo,
+    Camo(&'a str),
     Killstreak(&'a str),
     Weapon(&'a str),
 }
@@ -375,6 +386,9 @@ fn parse_give_target(args: &[String]) -> Result<GiveTarget<'_>, &'static str> {
     let Some(item) = args.first() else {
         return Err(GIVE_USAGE);
     };
+    if item == "camo" && args.len() == 2 {
+        return Ok(GiveTarget::Camo(&args[1]));
+    }
     if item == "ammo" && args.len() == 1 {
         return Ok(GiveTarget::Ammo);
     }
@@ -391,20 +405,63 @@ fn parse_give_target(args: &[String]) -> Result<GiveTarget<'_>, &'static str> {
     Err(GIVE_USAGE)
 }
 
-fn grant_killstreak(
+fn change_camo(
     name: &str,
-    completions: &WeaponArgCompletions,
+    weapons: Option<&PreparedWeapons>,
     presented: &PresentedSnapshot,
     local: &LocalPresentClient,
     inbox: &mut ClientActionInbox,
     seq: &mut net::ActionRequestIds,
     mut echo: impl FnMut(String),
 ) {
-    let names = completions
-        .killstreaks
-        .read()
-        .map(|v| v.clone())
-        .unwrap_or_else(|_| Vec::new());
+    let Some(weapons) = weapons else {
+        echo("give camo: weapon catalog not loaded".into());
+        return;
+    };
+    let Some(ps) = presented.alive_player(local.0) else {
+        echo("give camo: not Alive — spawn a class first".into());
+        return;
+    };
+    let weapon = ps.weapon;
+    if weapon == 0 {
+        echo("give camo: no weapon in hands".into());
+        return;
+    }
+    let model = match camo_slot(weapons.registry(), weapon, name) {
+        Ok(model) => model,
+        Err(error) => {
+            echo(format!("give camo: {error}"));
+            return;
+        }
+    };
+    let request_id = seq.allocate();
+    match inbox.push(
+        local.0,
+        ClientAction::ChangeWeaponCamo {
+            request_id,
+            weapon,
+            model,
+        },
+    ) {
+        Ok(()) => echo(format!(
+            "give camo: queued {name} for {} request_id={request_id}",
+            weapons.registry().configuration_label(weapon)
+        )),
+        Err(error) => echo(format!("give camo: {error}")),
+    }
+}
+
+fn grant_killstreak(
+    name: &str,
+    completions: &CompletionSlot,
+    presented: &PresentedSnapshot,
+    local: &LocalPresentClient,
+    inbox: &mut ClientActionInbox,
+    seq: &mut net::ActionRequestIds,
+    mut echo: impl FnMut(String),
+) {
+    let names =
+        completions.read(|value| value.map_or_else(Vec::new, |value| value.killstreaks.clone()));
     let requested = name.to_ascii_lowercase().replace(['-', ' '], "_");
     let requested = KILLSTREAK_ALIASES
         .iter()
@@ -467,13 +524,13 @@ const KILLSTREAK_ALIASES: &[(&str, &str)] = &[
     ("harrier", "harrier_airstrike"),
 ];
 
-struct KillstreakCompleter(Arc<RwLock<Vec<String>>>);
+struct KillstreakCompleter(CompletionSlot);
 
 impl ArgCompleter for KillstreakCompleter {
     fn complete(&self, prefix: &str) -> Vec<String> {
-        let Ok(names) = self.0.read() else {
-            return Vec::new();
-        };
+        let names = self
+            .0
+            .read(|value| value.map_or_else(Vec::new, |value| value.killstreaks.clone()));
         let aliases = KILLSTREAK_ALIASES
             .iter()
             .filter(|(_, name)| names.iter().any(|value| value == name))
@@ -482,25 +539,35 @@ impl ArgCompleter for KillstreakCompleter {
     }
 }
 
-struct GiveCompleter(WeaponArgCompletions);
+struct GiveCompleter(CompletionSlot);
 
 impl ArgCompleter for GiveCompleter {
     fn complete(&self, prefix: &str) -> Vec<String> {
-        let mut items = vec!["ammo".to_owned()];
-        if let Ok(weapons) = self.0.give.read() {
-            items.extend(weapons.iter().map(|name| format!("weapon/{name}")));
-        }
+        let mut items = vec!["ammo".to_owned(), "camo".to_owned()];
+        self.0.read(|value| {
+            if let Some(value) = value {
+                items.extend(value.give.iter().map(|name| format!("weapon/{name}")));
+            }
+        });
         items.extend(
-            KillstreakCompleter(Arc::clone(&self.0.killstreaks))
+            KillstreakCompleter(self.0.clone())
                 .complete("")
                 .into_iter()
                 .map(|name| format!("killstreak/{name}")),
         );
         StaticCompleter::new(items).complete(prefix)
     }
+
+    fn complete_with_context(&self, prefix: &str, args: &[&str]) -> Vec<String> {
+        match args {
+            [] => self.complete(prefix),
+            ["camo"] => LiveListCompleter(self.0.clone(), |value| &value.camos).complete(prefix),
+            _ => Vec::new(),
+        }
+    }
 }
 
-struct BotCompleter(WeaponArgCompletions);
+struct BotCompleter(CompletionSlot);
 
 impl ArgCompleter for BotCompleter {
     fn complete(&self, prefix: &str) -> Vec<String> {
@@ -518,10 +585,7 @@ impl ArgCompleter for BotCompleter {
             ("give" | "fire" | "tp", 1) => {
                 let mut ids = self
                     .0
-                    .bots
-                    .read()
-                    .map(|v| v.clone())
-                    .unwrap_or_else(|_| Vec::new());
+                    .read(|value| value.map_or_else(Vec::new, |value| value.bots.clone()));
                 if *verb != "give" {
                     ids.insert(0, "all".into());
                 }
@@ -530,10 +594,7 @@ impl ArgCompleter for BotCompleter {
             ("give", 2) => {
                 let names = self
                     .0
-                    .give
-                    .read()
-                    .map(|v| v.clone())
-                    .unwrap_or_else(|_| Vec::new());
+                    .read(|value| value.map_or_else(Vec::new, |value| value.give.clone()));
                 StaticCompleter::new(names).complete(prefix)
             }
             ("tp", 2) => StaticCompleter::new(["above"]).complete(prefix),
@@ -564,7 +625,7 @@ pub(crate) fn echo_give_results(
     *echoed = Some((request_id, accepted));
     let key = weapons
         .as_ref()
-        .map(|w| w.0.configuration_label(weapon))
+        .map(|w| w.registry().configuration_label(weapon))
         .filter(|label| !label.is_empty())
         .unwrap_or_else(|| format!("#{weapon}"));
     let capacity = settings.log_capacity;
@@ -603,7 +664,7 @@ pub(crate) fn echo_configuration_change_results(
     *echoed = Some(request_id);
     let key = weapons
         .as_ref()
-        .map(|w| w.0.configuration_label(to))
+        .map(|w| w.registry().configuration_label(to))
         .filter(|label| !label.is_empty())
         .unwrap_or_else(|| format!("#{to}"));
     let msg = if accepted {
@@ -634,7 +695,12 @@ pub(crate) fn resolve_give_id(
     let resolve = |selection: WeaponSelection| {
         registry
             .resolve_configuration(&selection, LoadoutRules::default())
-            .map(|resolved| resolved.id)
+            .map(|resolved| {
+                registry
+                    .bind(resolved.handle())
+                    .expect("resolved in this registry")
+                    .wire_id()
+            })
             .map_err(|refusal| format!("`{raw}`: {refusal} ({})", refusal.code()))
     };
     let families = registry.weapon_families();
@@ -730,19 +796,25 @@ fn toggle_named_attachment(
     option
         .toggle
         .clone()
+        .map(|resolved| {
+            registry
+                .bind(resolved.handle())
+                .expect("toggle in this registry")
+                .wire_id()
+        })
         .map_err(|refusal| format!("{refusal} ({})", refusal.code()))
 }
 
 pub fn weapon_completions(weapons: &PreparedWeapons) -> Vec<String> {
-    weapons.0.weapon_completion_names().to_vec()
+    weapons.registry().weapon_completion_names().to_vec()
 }
 
 pub fn attach_completions(weapons: &PreparedWeapons, current_weapon: u32) -> Vec<String> {
-    let Ok(selection) = family_of(&weapons.0, current_weapon) else {
+    let Ok(selection) = family_of(weapons.registry(), current_weapon) else {
         return Vec::new();
     };
     weapons
-        .0
+        .registry()
         .list_attachment_choices(&selection, LoadoutRules::default())
         .map(|options| {
             options

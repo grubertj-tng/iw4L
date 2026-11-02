@@ -1,14 +1,12 @@
+use frame::ScopeApp;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 
-use crate::adapters::anim::dyn_ent::DynEntCellBits;
-use crate::prepare::scene::camera::FlyCamera;
-use crate::prepare::scene::cull::{DynEntModelEntity, ScriptModelEntity, StaticModelEntity};
 use crate::prepare::scene::world::WorldScene;
-use frame::{LaunchReport, MatchInstalled, MatchTornDown, WorldGeneration};
+use frame::{LaunchReport, WorldGeneration, WorldStamp};
 use render_fx::{HostFxSystem, PreparedFxCatalog, PreparedTracers};
 
 pub(crate) use super::world_gpu::WorldGpuReady;
@@ -122,7 +120,7 @@ pub struct WorldSpawnJob {
 
     pub gpu_wait: super::world_gpu::WorldGpuWait,
 
-    pub spawn: WorldGeneration,
+    pub spawn: WorldStamp,
 
     last_slice_at: Option<std::time::Instant>,
 }
@@ -185,10 +183,9 @@ pub(crate) fn spawn_world(
     prepared: (
         Res<render_anim::PreparedFpv>,
         Res<render_anim::PreparedModelMaterials>,
-        Option<Res<render_fx::PreparedFxModels>>,
     ),
 ) {
-    let (fpv, model_materials, fx_models) = prepared;
+    let (fpv, model_materials) = prepared;
     if scene.readiness.generation != job.spawn || job.spawn.0.is_none() {
         return;
     }
@@ -209,7 +206,8 @@ pub(crate) fn spawn_world(
         let spawn = job.spawn;
         let gpu_ready = gpu.as_deref();
         let gpu_done = super::world_gpu::poll(&mut job.gpu_wait, spawn, gpu_ready, gap_ms);
-        let fpv_done = fpv.settled_for(&tess.catalog) && model_materials.settled_for(&tess.catalog);
+        let fpv_done =
+            fpv.settled_for(&tess.catalog()) && model_materials.settled_for(&tess.catalog());
         if gpu_done && !fpv_done {
             diag::info!(
                 World,
@@ -395,12 +393,22 @@ pub(crate) fn spawn_world(
             programs,
             exact_shaders,
         );
-        commands.insert_resource(render_scene::TessMaterials {
-            catalog: std::sync::Arc::clone(&generation.catalog),
-            prepared: std::sync::Arc::clone(&generation.prepared),
-            material_images: std::sync::Arc::new(Vec::new()),
-        });
-        commands.insert_resource(scene.map_xmodel_scene_assets.clone());
+        {
+            let value = render_scene::TessMaterials::new(
+                std::sync::Arc::clone(&generation.catalog),
+                std::sync::Arc::clone(&generation.prepared),
+            )
+            .expect("admitted material publication");
+            commands.queue(move |world: &mut World| {
+                frame::scope::insert(world, value, frame::MatchScope::Live);
+            });
+        };
+        {
+            let value = scene.map_xmodel_scene_assets.clone();
+            commands.queue(move |world: &mut World| {
+                frame::scope::insert(world, value, frame::MatchScope::Live);
+            });
+        };
         match &generation.postfx {
             crate::assemble::drawsurf::RuntimePostFxResources::Ready(film) => diag::info!(
                 World,
@@ -414,8 +422,19 @@ pub(crate) fn spawn_world(
                 diag::warn!(World, "post-fx film material: RED cause=Uninstalled")
             }
         }
-        commands.insert_resource(generation);
-        commands.insert_resource(crate::assemble::drawsurf::MaterialFrameInputs::default());
+        {
+            let value = generation;
+            commands.queue(move |world: &mut World| {
+                frame::scope::insert(world, value, frame::MatchScope::Live);
+            });
+        };
+        commands.queue(move |world: &mut World| {
+            frame::scope::insert(
+                world,
+                crate::assemble::drawsurf::MaterialFrameInputs::default(),
+                frame::MatchScope::Live,
+            );
+        });
         match scene.exp_fog {
             Some(fog) => {
                 diag::info!(
@@ -426,7 +445,13 @@ pub(crate) fn spawn_world(
                     fog.max_opacity,
                     fog.sun.is_some()
                 );
-                commands.insert_resource(crate::assemble::drawsurf::MapFrameFog::new(fog));
+                commands.queue(move |world: &mut World| {
+                    frame::scope::insert(
+                        world,
+                        crate::assemble::drawsurf::MapFrameFog::new(fog),
+                        frame::MatchScope::Live,
+                    );
+                });
             }
             None => {
                 commands.remove_resource::<crate::assemble::drawsurf::MapFrameFog>();
@@ -449,7 +474,12 @@ pub(crate) fn spawn_world(
                     light.color[1],
                     light.color[2]
                 );
-                commands.insert_resource(light);
+                {
+                    let value = light;
+                    commands.queue(move |world: &mut World| {
+                        frame::scope::insert(world, value, frame::MatchScope::Live);
+                    });
+                };
             }
             None => {
                 commands.remove_resource::<crate::assemble::drawsurf::MapDirPrimaryLight>();
@@ -466,8 +496,13 @@ pub(crate) fn spawn_world(
                     "drawsurf T5 sunParse exposure: READY {exposure:.4} volumes={}",
                     scene.t5_exposure_volume_count
                 );
-                commands
-                    .insert_resource(crate::assemble::drawsurf::MapT5SunParseExposure { exposure });
+                commands.queue(move |world: &mut World| {
+                    frame::scope::insert(
+                        world,
+                        crate::assemble::drawsurf::MapT5SunParseExposure { exposure },
+                        frame::MatchScope::Live,
+                    )
+                });
             }
             None => {
                 commands.remove_resource::<crate::assemble::drawsurf::MapT5SunParseExposure>();
@@ -478,24 +513,36 @@ pub(crate) fn spawn_world(
             scene.t5_tree_scatter_amount,
         ) {
             (Some(intensity), Some(amount)) => {
-                commands.insert_resource(crate::assemble::drawsurf::MapT5TreeScatter {
-                    intensity,
-                    amount,
-                });
+                {
+                    let value = crate::assemble::drawsurf::MapT5TreeScatter { intensity, amount };
+                    commands.queue(move |world: &mut World| {
+                        frame::scope::insert(world, value, frame::MatchScope::Live);
+                    });
+                };
             }
             _ => {
                 commands.remove_resource::<crate::assemble::drawsurf::MapT5TreeScatter>();
             }
         }
-        commands.insert_resource(crate::assemble::drawsurf::MapOutdoor {
-            image: scene
-                .outdoor_image
-                .map(|id| crate::assemble::drawsurf::RuntimeImageId(id)),
-            lookup: scene.outdoor_lookup,
-        });
-        commands.insert_resource(crate::assemble::drawsurf::MapSunEffects {
-            def: scene.sun_effects,
-        });
+        {
+            let value = crate::assemble::drawsurf::MapOutdoor {
+                image: scene
+                    .outdoor_image
+                    .map(|id| crate::assemble::drawsurf::RuntimeImageId(id)),
+                lookup: scene.outdoor_lookup,
+            };
+            commands.queue(move |world: &mut World| {
+                frame::scope::insert(world, value, frame::MatchScope::Live);
+            });
+        };
+        {
+            let value = crate::assemble::drawsurf::MapSunEffects {
+                def: scene.sun_effects,
+            };
+            commands.queue(move |world: &mut World| {
+                frame::scope::insert(world, value, frame::MatchScope::Live);
+            });
+        };
         match scene.sun_effects {
             Some(sun) => diag::info!(
                 World,
@@ -519,23 +566,33 @@ pub(crate) fn spawn_world(
                 f32::from_bits(scene.outdoor_lookup[0]),
                 f32::from_bits(scene.outdoor_lookup[12])
             ),
-            None => diag::warn!(
+            None => diag::info!(
                 World,
-                "drawsurf outdoor: RED no $outdoor / GfxWorld outdoorImage — code texture 14 stays unproduced (lookup_m00={:.6e} lookup_m30={:.4})",
+                "drawsurf outdoor: no authored image; code texture 14 is unavailable (lookup_m00={:.6e} lookup_m30={:.4})",
                 f32::from_bits(scene.outdoor_lookup[0]),
                 f32::from_bits(scene.outdoor_lookup[12])
             ),
         }
-        commands.insert_resource(crate::assemble::drawsurf::MapPrimaryLightTypes {
-            types: scene.primary_light_types.clone(),
-        });
-        commands.insert_resource(crate::assemble::drawsurf::MapPrimaryLights {
-            lights: scene.primary_light_pack.clone(),
-            attenuation: scene.primary_light_attenuation.clone(),
-            overrides: scene.primary_light_overrides.clone(),
-            reflection_probe_sh: scene.reflection_probe_sh.clone(),
-            dynamic: scene.dynamic_light,
-        });
+        {
+            let value = crate::assemble::drawsurf::MapPrimaryLightTypes {
+                types: scene.primary_light_types.clone(),
+            };
+            commands.queue(move |world: &mut World| {
+                frame::scope::insert(world, value, frame::MatchScope::Live);
+            });
+        };
+        {
+            let value = crate::assemble::drawsurf::MapPrimaryLights {
+                lights: scene.primary_light_pack.clone(),
+                attenuation: scene.primary_light_attenuation.clone(),
+                overrides: scene.primary_light_overrides.clone(),
+                reflection_probe_sh: scene.reflection_probe_sh.clone(),
+                dynamic: scene.dynamic_light,
+            };
+            commands.queue(move |world: &mut World| {
+                frame::scope::insert(world, value, frame::MatchScope::Live);
+            });
+        };
         {
             let n = scene.primary_light_pack.len();
             let falloff_w = scene
@@ -657,7 +714,12 @@ pub(crate) fn spawn_world(
                 scene.reflection_probe_origins.len(),
             );
         }
-        commands.insert_resource(crate::assemble::drawsurf::DrawMethodDfog(false));
+        {
+            let value = crate::assemble::drawsurf::DrawMethodDfog(false);
+            commands.queue(move |world: &mut World| {
+                frame::scope::insert(world, value, frame::MatchScope::Live);
+            });
+        };
         if let Some(stage) = job.admit.take_stage() {
             stage.done();
         }
@@ -694,10 +756,6 @@ pub(crate) fn spawn_world(
             tracers.as_deref(),
             fx_catalog.as_deref(),
         );
-        let fx_geometry =
-            super::world_plan::prepare_fx_model_geometry(&scene, fx_models.as_deref());
-        commands.insert_resource(fx_geometry.0.clone());
-        commands.insert_resource(fx_geometry);
         tess.material_images = std::sync::Arc::new(job.images.exact_handles().to_vec());
         if let Some(host) = fx_host.as_mut() {
             match scene.fx_glass.as_ref() {
@@ -723,6 +781,7 @@ pub(crate) fn spawn_world_finish(
     mut images: ResMut<Assets<Image>>,
     mut job: ResMut<WorldSpawnJob>,
     mut tess: ResMut<render_scene::TessMaterials>,
+    fx_models: Option<Res<render_fx::PreparedFxModels>>,
 ) {
     if scene.readiness.generation != job.spawn
         || job.spawn.0.is_none()
@@ -744,6 +803,13 @@ pub(crate) fn spawn_world_finish(
         job.images.probe_handles().to_vec(),
         job.images.lightmap_handles().to_vec(),
     );
+    let fx_geometry = super::world_plan::prepare_fx_model_geometry(&scene, fx_models.as_deref());
+    {
+        let value = fx_geometry;
+        commands.queue(move |world: &mut World| {
+            frame::scope::insert(world, value, frame::MatchScope::Live);
+        });
+    };
     tess.material_images = std::sync::Arc::new(job.images.exact_handles().to_vec());
     job.last_work_ms = frame_started.elapsed().as_secs_f32() * 1000.0;
     if paced {
@@ -805,10 +871,10 @@ fn record_first_world_frame(
 }
 
 #[derive(Resource, Clone, Default)]
-pub(crate) struct WorldPresentAck(Arc<Mutex<Option<(WorldGeneration, std::time::Instant)>>>);
+pub(crate) struct WorldPresentAck(Arc<Mutex<Option<(WorldStamp, std::time::Instant)>>>);
 
 impl WorldPresentAck {
-    fn presented_at(&self, generation: WorldGeneration) -> Option<std::time::Instant> {
+    fn presented_at(&self, generation: WorldStamp) -> Option<std::time::Instant> {
         self.0.lock().ok().and_then(|ack| {
             ack.as_ref()
                 .filter(|(seen, _)| *seen == generation)
@@ -818,7 +884,7 @@ impl WorldPresentAck {
 }
 
 #[derive(Resource, Default)]
-struct ExtractedWorldPresent(Option<WorldGeneration>);
+struct ExtractedWorldPresent(Option<WorldStamp>);
 
 fn log_load_ledger(
     job: &WorldSpawnJob,
@@ -858,118 +924,21 @@ fn finish_world_spawn(scene: &mut WorldScene, job: &mut WorldSpawnJob, commands:
     job.phase = WorldSpawnPhase::Done;
     scene.spawned = true;
     scene.readiness.state = frame::ReadinessState::Ready;
-    commands.insert_resource(render_scene::WorldPresentFacts { spawned: true });
+    {
+        let value = render_scene::WorldPresentFacts { spawned: true };
+        commands.queue(move |world: &mut World| {
+            frame::scope::insert(world, value, frame::MatchScope::Live);
+        });
+    };
     perf::world_ready(1);
 }
 
-pub(crate) fn despawn_world_entities_on_teardown(
-    mut torn: MessageReader<MatchTornDown>,
-    smodels: Query<Entity, With<StaticModelEntity>>,
-    scripts: Query<Entity, With<ScriptModelEntity>>,
-    dynents: Query<Entity, With<DynEntModelEntity>>,
-    mut commands: Commands,
-) {
-    if torn.read().count() == 0 {
-        return;
-    }
-    for entity in smodels.iter().chain(scripts.iter()).chain(dynents.iter()) {
-        commands.entity(entity).despawn();
-    }
-}
-
-pub(crate) fn reset_world_spawn_on_teardown(
-    mut torn: MessageReader<MatchTornDown>,
-    mut job: ResMut<WorldSpawnJob>,
-    mut gpu: ResMut<WorldGpuReady>,
-    mut demand: ResMut<super::world_gpu::PipelineDemandTracker>,
-    mut image_handles: Option<ResMut<crate::assemble::drawsurf::RuntimeImageHandles>>,
-    mut retiring: ResMut<frame::Retiring>,
-    images: Res<Assets<Image>>,
-    mut commands: Commands,
-) {
-    if torn.read().count() == 0 {
-        return;
-    }
-    let live_before = images.len();
-    retiring.hand_over(std::mem::take(&mut *job));
-    *gpu = WorldGpuReady::default();
-    *demand = super::world_gpu::PipelineDemandTracker::default();
-    if let Some(handles) = image_handles.as_mut() {
-        **handles = crate::assemble::drawsurf::RuntimeImageHandles::default();
-    }
-    diag::info!(
-        World,
-        "world: render side let go of its images ({live_before} live in Assets<Image> at the \
-         moment of release; what survives is what another owner still holds)"
-    );
-    commands.insert_resource(crate::assemble::drawsurf::MapSunEffects::default());
-    commands.queue(|world: &mut World| {
-        frame::retire::retire_resources(world, |batch| {
-            batch
-                .resource::<crate::assemble::drawsurf::WorldDrawGpuPlan>()
-                .resource::<crate::assemble::drawsurf::SmodelGpuPlan>()
-                .resource::<crate::assemble::drawsurf::tess::sky::SkyModelDrawPlan>()
-                .resource::<crate::prepare::scene::smodel_lighting::WorldSmodelLighting>()
-                .resource::<crate::prepare::scene::smodel_geom_cache::WorldStaticModelCache>()
-                .resource::<crate::prepare::scene::model_lighting_atlas::WorldModelLightingAtlas>()
-                .resource::<crate::prepare::scene::model_lighting_cache::WorldModelLightingCache>();
-        });
-    });
-}
-
-pub(crate) fn shutdown_world_on_teardown(
-    mut torn: MessageReader<MatchTornDown>,
-    mut retiring: ResMut<frame::Retiring>,
-    mut scene: Option<ResMut<WorldScene>>,
-    mut membership: Option<ResMut<DynEntCellBits>>,
-    mut present: ResMut<render_scene::WorldPresentFacts>,
-    mut tess: ResMut<render_scene::TessMaterials>,
-    mut lookup: ResMut<render_scene::DynAtPointLookup>,
-    mut cells: ResMut<render_scene::WorldDpvsCells>,
-) {
-    if torn.read().count() == 0 {
-        return;
-    }
-    if let Some(scene) = scene.as_mut() {
-        retiring.hand_over(std::mem::take(&mut **scene));
-    }
-    if let Some(membership) = membership.as_mut() {
-        **membership = DynEntCellBits::default();
-    }
-    *present = render_scene::WorldPresentFacts::default();
-    *tess = render_scene::TessMaterials::default();
-    lookup.clear();
-    *cells = render_scene::WorldDpvsCells::default();
-    let spawned = scene.as_ref().map(|s| i64::from(s.spawned)).unwrap_or(0);
-    perf::world_hold(spawned, 0, 0);
-    diag::info!(
-        World,
-        "world: shutdown — leftover geometry, tess plans, and model lighting dropped"
-    );
-}
-
-pub(crate) fn despawn_fly_cameras_on_teardown(
-    mut torn: MessageReader<MatchTornDown>,
-    cameras: Query<Entity, With<FlyCamera>>,
-    mut commands: Commands,
-) {
-    if torn.read().count() == 0 {
-        return;
-    }
-    for entity in &cameras {
-        commands.entity(entity).despawn();
-    }
-}
-
 pub(crate) fn arm_world_spawn_on_install(
-    mut installed: MessageReader<MatchInstalled>,
+    generation: Res<WorldGeneration>,
     mut job: ResMut<WorldSpawnJob>,
     mut gpu: ResMut<WorldGpuReady>,
 ) {
-    let Some(install) = installed.read().last().cloned() else {
-        return;
-    };
-    let spawn = WorldGeneration::from_install(install.request_id);
+    let spawn = generation.stamp();
     *job = WorldSpawnJob {
         spawn,
         ..Default::default()
@@ -980,10 +949,158 @@ pub(crate) fn arm_world_spawn_on_install(
     };
 }
 
+fn check_skin_support(
+    support: Option<Res<render_scene::SkinSupport>>,
+    generation: Option<Res<WorldGeneration>>,
+    scene: Option<ResMut<WorldScene>>,
+    products: (
+        Option<Res<assets::PreparedBodies>>,
+        Option<Res<assets::PreparedFpvMeshes>>,
+        Option<Res<assets::PreparedWorldWeapons>>,
+        Option<Res<assets::PreparedWeapons>>,
+    ),
+    mut checked: Local<Option<(WorldStamp, u64)>>,
+) {
+    let Some(support) = support else {
+        return;
+    };
+    let world = generation.map_or(WorldStamp(None), |generation| generation.stamp());
+    support.set_world(world);
+    let Some(mut scene) = scene else {
+        return;
+    };
+    if world.0.is_none() {
+        return;
+    }
+    let installation = (world, support.device_generation());
+    if *checked != Some(installation) {
+        let Some(limits) = support.limits() else {
+            scene.readiness.state = frame::ReadinessState::Pending;
+            return;
+        };
+        let (Some(bodies), Some(fpv), Some(weapons), Some(registry)) = products else {
+            scene.readiness.state = frame::ReadinessState::Pending;
+            return;
+        };
+        let actors = u64::from(master_protocol::MAX_SESSION_MEMBERS)
+            + playerstate_iw4::MAX_CLIENT_CORPSES as u64;
+        let body_sizes: Vec<u64> = bodies
+            .0
+            .names()
+            .filter_map(|name| bodies.0.get(name))
+            .map(|entry| entry.skel.packed_vertices.len() as u64)
+            .collect();
+        let weapon_sizes: Vec<u64> = (0..weapons.0.len())
+            .filter_map(|index| weapons.0.get_at(index))
+            .map(|entry| entry.skel.packed_vertices.len() as u64)
+            .collect();
+        let body = body_sizes.iter().copied().max().unwrap_or(0);
+        let weapon = weapon_sizes.iter().copied().max().unwrap_or(0);
+        let mut fpv_vertices = 0_u64;
+        let mut fpv_parts = 0_u64;
+        for id in 1..=registry.registry().len() as u32 {
+            for axis in [false, true] {
+                let Some(side) = registry.registry().fpv_assemblies_of(id, axis) else {
+                    continue;
+                };
+                for assembly in std::iter::once(&side.bare)
+                    .chain(side.rocket.iter())
+                    .chain(side.melee.iter())
+                    .chain(side.ads.iter())
+                    .chain(side.jammed.iter())
+                {
+                    let vertices = assembly
+                        .parts()
+                        .iter()
+                        .filter_map(|part| fpv.0.get_at(part.model.order()))
+                        .map(|part| part.skel.packed_vertices.len() as u64)
+                        .sum();
+                    fpv_vertices = fpv_vertices.max(vertices);
+                    fpv_parts = fpv_parts.max(assembly.parts().len() as u64);
+                }
+            }
+        }
+        let output = ((body * 2 + weapon * 7) * actors + fpv_vertices) * 32;
+        let input = ((body * 2 + weapon * 7) * actors + fpv_vertices) * 64;
+        let max_bones = bodies
+            .0
+            .names()
+            .filter_map(|name| bodies.0.get(name))
+            .map(|entry| entry.skel.bones.len() as u64)
+            .chain(
+                (0..weapons.0.len())
+                    .filter_map(|index| weapons.0.get_at(index))
+                    .map(|entry| entry.skel.bones.len() as u64),
+            )
+            .chain(
+                (0..fpv.0.len())
+                    .filter_map(|index| fpv.0.get_at(index))
+                    .map(|entry| entry.skel.bones.len() as u64),
+            )
+            .max()
+            .unwrap_or(0);
+        let palettes = (actors * 9 + fpv_parts) * max_bones * 64;
+        let largest_shape = body.max(weapon).max(
+            (0..fpv.0.len())
+                .filter_map(|index| fpv.0.get_at(index))
+                .map(|entry| entry.skel.packed_vertices.len() as u64)
+                .max()
+                .unwrap_or(0),
+        );
+        diag::info!(
+            World,
+            "skinning support envelope: actors={actors} output={output} input={input} palettes={palettes} largest_shape={largest_shape} max_bones={max_bones} budget={} buffer_limit={} binding_limit={}",
+            support.resident_budget,
+            limits.buffer_bytes,
+            limits.storage_bytes
+        );
+        if largest_shape * 64 > limits.storage_bytes
+            || max_bones * 64 > limits.storage_bytes
+            || output > limits.buffer_bytes
+        {
+            support.refuse(
+                world,
+                render_frame::skinning::SkinRefusal::UnsupportedProduct,
+            );
+        } else if (input + palettes)
+            .saturating_mul(2)
+            .saturating_add(output.saturating_mul(3))
+            > support.resident_budget
+        {
+            support.refuse(
+                world,
+                render_frame::skinning::SkinRefusal::ResidencyPressure,
+            );
+        }
+        if let Some(refusal) = support.failure(world) {
+            diag::warn!(World, "skinning support refused: {refusal:?}");
+        }
+        *checked = Some(installation);
+        if scene.spawned && support.failure(world).is_none() {
+            scene.readiness.state = frame::ReadinessState::Ready;
+        }
+    }
+    if support.failure(world).is_some() {
+        scene.readiness.state = frame::ReadinessState::Failed;
+    }
+}
+
 pub(crate) fn register_world_gpu_ready(app: &mut App) {
+    app.add_systems(
+        Update,
+        check_skin_support
+            .after(spawn_world)
+            .in_set(frame::ClientSet::Present),
+    );
     super::world_gpu::register_resources(app);
-    app.init_resource::<super::world_images::ResidentGpuImages>();
-    app.add_systems(Update, supply_requested_shaders.before(spawn_world));
+    app.scoped::<super::world_images::ResidentGpuImages>(frame::MatchScope::Live);
+    app.add_systems(
+        Update,
+        supply_requested_shaders
+            .in_set(frame::InMatch)
+            .in_set(frame::ClientSet::Present)
+            .before(spawn_world),
+    );
     let present_ack = WorldPresentAck::default();
     app.insert_resource(present_ack.clone());
     let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) else {
@@ -1013,8 +1130,8 @@ fn extract_world_present(
 ) {
     let generation = main_world
         .get_resource::<WorldGeneration>()
-        .copied()
-        .unwrap_or(WorldGeneration(None));
+        .map(|generation| generation.stamp())
+        .unwrap_or(WorldStamp(None));
     let spawned = main_world
         .get_resource::<WorldScene>()
         .is_some_and(|scene| scene.spawned && scene.readiness.ready_for(generation));
