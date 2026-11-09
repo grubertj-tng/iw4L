@@ -3,6 +3,7 @@ pub mod action_file;
 pub mod drive;
 mod record;
 pub mod table;
+mod video;
 
 use std::path::PathBuf;
 
@@ -13,6 +14,7 @@ use action::MoveScales;
 use action_file::ActionFile;
 use drive::Driver;
 pub use record::MovementRecorder;
+pub use video::{VIDEO_CODEC_ENV, VIDEO_ENV, VIDEO_FPS_ENV, VideoRecorder};
 
 pub const RECORD_ENV: &str = "IW4L_RFM_RECORD";
 pub const DRIVE_ENV: &str = "IW4L_RFM_DRIVE";
@@ -32,18 +34,34 @@ impl Plugin for RfmIoPlugin {
             .map(PathBuf::from)
             .and_then(|path| match MovementRecorder::create(&path) {
                 Ok(recorder) => {
-                    info!("rfm_io: recording movement to {}", path.display());
+                    diag::info!(Launch, "rfm_io: recording movement to {}", path.display());
                     Some(recorder)
                 }
                 Err(error) => {
-                    error!("rfm_io: cannot create {}: {error}", path.display());
+                    diag::error!(Launch, "rfm_io: cannot create {}: {error}", path.display());
                     None
                 }
             });
         let driver = std::env::var_os(DRIVE_ENV)
             .map(PathBuf::from)
             .and_then(|path| create_driver(&path));
-        if recorder.is_none() && driver.is_none() {
+        let video = std::env::var_os(VIDEO_ENV)
+            .map(PathBuf::from)
+            .and_then(|dir| match VideoRecorder::create(&dir) {
+                Ok(video) => {
+                    diag::info!(Launch, "rfm_io: capturing video to {}", dir.display());
+                    Some(video)
+                }
+                Err(error) => {
+                    diag::error!(
+                        Launch,
+                        "rfm_io: cannot capture video to {}: {error}",
+                        dir.display()
+                    );
+                    None
+                }
+            });
+        if recorder.is_none() && driver.is_none() && video.is_none() {
             return;
         }
         app.init_resource::<FrameIndex>()
@@ -69,6 +87,14 @@ impl Plugin for RfmIoPlugin {
                 )
                 .add_systems(Last, drive::flush_drive_on_exit);
         }
+        if let Some(video) = video {
+            app.insert_resource(video)
+                .add_observer(video::on_captured)
+                .add_systems(
+                    Last,
+                    (video::request_capture, video::finish_on_exit).chain(),
+                );
+        }
     }
 }
 
@@ -76,12 +102,17 @@ fn create_driver(path: &std::path::Path) -> Option<Driver> {
     let source = match ActionFile::load(path) {
         Ok(source) => source,
         Err(error) => {
-            error!("rfm_io: cannot load actions {}: {error}", path.display());
+            diag::error!(
+                Launch,
+                "rfm_io: cannot load actions {}: {error}",
+                path.display()
+            );
             return None;
         }
     };
     let log = std::env::var_os(DRIVE_LOG_ENV).map(PathBuf::from);
-    info!(
+    diag::info!(
+        Launch,
         "rfm_io: driving the local player from {} ({} actions)",
         path.display(),
         source.len()
@@ -89,7 +120,7 @@ fn create_driver(path: &std::path::Path) -> Option<Driver> {
     match Driver::new(Box::new(source), log.as_deref()) {
         Ok(driver) => Some(driver),
         Err(error) => {
-            error!("rfm_io: cannot create the drive log: {error}");
+            diag::error!(Launch, "rfm_io: cannot create the drive log: {error}");
             None
         }
     }

@@ -67,7 +67,7 @@ Keep this list current. On a merge from upstream, check each entry survived.
 |---|---|---|
 | `Cargo.toml` | `crates/rfm_io` in `members` and `[workspace.dependencies]` | our crate |
 | `crates/bootstrap/Cargo.toml` | `rfm_io` dependency | registers the plugin |
-| `crates/bootstrap/src/plugins.rs` | `.add_plugins(rfm_io::RfmIoPlugin)` | the plugin is inert unless `IW4L_RFM_RECORD` or `IW4L_RFM_DRIVE` is set |
+| `crates/bootstrap/src/plugins.rs` | `.add_plugins(rfm_io::RfmIoPlugin)` | the plugin is inert unless `IW4L_RFM_RECORD`, `IW4L_RFM_DRIVE` or `IW4L_RFM_VIDEO` is set |
 | `crates/sim/src/world.rs` | `SimState::scales_for` `pub(crate)` → `pub` | `rfm_io` reads the weapon's move scales for the intended velocity |
 
 ## Upstream's contract

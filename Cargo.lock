@@ -5892,6 +5892,7 @@ name = "rfm_io"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "diag",
  "frame",
  "math_iw4",
  "movement_iw4",

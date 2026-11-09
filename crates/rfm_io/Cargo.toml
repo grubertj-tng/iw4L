@@ -3,10 +3,11 @@ name = "rfm_io"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Action and observation interfaces for training models on the game: per-frame recording of the local player's commands and movement state, and driving the player from actions."
+description = "Action and observation interfaces for training models on the game: per-frame recording of the local player's commands and movement state, driving the player from actions, and video of the rendered frames keyed by the same frame index."
 
 [dependencies]
 bevy.workspace = true
+diag.workspace = true
 frame.workspace = true
 math_iw4.workspace = true
 movement_iw4.workspace = true

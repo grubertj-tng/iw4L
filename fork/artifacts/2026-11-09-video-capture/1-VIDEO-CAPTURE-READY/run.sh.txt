@@ -1,0 +1,16 @@
+#!/bin/bash
+# usage: run.sh <outdir> <with_video 0|1> [extra env...]
+cd /home/innovation-hacking/modern-warfare/iw4L/context/mrs/video
+set -a; . ./.env; set +a
+S=/home/innovation-hacking/modern-warfare/iw4L/context/scratch-video-unlocked
+O=$1; shift; V=$1; shift
+rm -rf $O; mkdir -p $O
+VID=""; [ "$V" = 1 ] && VID="IW4L_RFM_VIDEO=$O"
+CMDS=${CMDS:-'wait world; spawn 0; force_match_start; wait 3s; look 0 0; wait 1s; look 90 0; wait 1s; look 180 0; wait 1s; look 270 0; wait 1s; look 0 30; wait 1s; mouserate 40 0; wait 1s; mouserate 0 0; wait 1s; finish_run'}
+env IW4L_PRESENT_MODE=${PRESENT:-AutoNoVsync} IW4L_SETTINGS_PATH=${SETTINGS:-$S/settings.cfg} IW4L_ACCOUNT_PATH=$S/account.dat IW4L_PROFILE_PATH=$S/profile.cfg \
+  IW4L_RFM_RECORD=$O/movement.csv $VID "$@" \
+  timeout 300 target/play/iw4l --cmds "$CMDS" map mp_boneyard > $O/stdout.log 2>&1
+echo exit $?
+cp $(head -1 $O/stdout.log | awk "{print \$2}") $O/game.log
+grep "rfm_io" $O/game.log $O/stdout.log | cut -c1-300
+grep "console" $O/game.log | grep -v "wait:" | tail -12
