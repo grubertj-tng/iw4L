@@ -1,12 +1,14 @@
 """Convert a raw recording session into a LeRobot v3 dataset (prototype).
 
 usage: python fork/tools/to_lerobot.py <session_dir> <out_dir> [--fps 20] [--repo-id local/iw4l]
-       [--task "..."] [--no-video]
+       [--task "..."] [--image-size 256x144] [--image-mode fit|stretch] [--no-video]
 
 <session_dir> holds what the game wrote with IW4L_RFM_RECORD (movement.csv) and
 what `rfm_roundtrip` wrote from it (roundtrip.csv: actions under the current
-definition). With video, it also holds the capture (frames.csv + mp4, keyed by
-FrameIndex) -- not wired yet: --no-video is required until video capture lands.
+definition), and what IW4L_RFM_VIDEO wrote (frames.csv + video.mp4 /
+video-<segment>.mp4, keyed by the same FrameIndex). Each step's image is the
+video frame of the step's observation frame, prepared by fork/tools/rfm_image.py,
+the transform inference uses too.
 
 Runs with the lerobot venv: context/venv-lerobot/bin/python.
 
@@ -26,6 +28,7 @@ at respawns (a change of delta_angles) and deaths.
 
 import argparse
 import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -102,6 +105,36 @@ def resample(ep: pd.DataFrame, fps: int):
     return steps
 
 
+def video_path(session: Path, segment: int) -> Path:
+    return session / ("video.mp4" if segment == 0 else f"video-{segment}.mp4")
+
+
+def decode_images(session: Path, frames: list[int], spec) -> dict[int, np.ndarray]:
+    """Prepared images for the given FrameIndex values, decoded from the capture."""
+    import av
+
+    from rfm_image import prepare
+
+    index = pd.read_csv(session / "frames.csv")
+    index = index[index.frame.isin(set(frames))]
+    missing = set(frames) - set(index.frame)
+    if missing:
+        raise SystemExit(f"{len(missing)} observation frames have no captured video frame, e.g. {sorted(missing)[:5]}")
+    images: dict[int, np.ndarray] = {}
+    for segment, rows in index.groupby("segment"):
+        wanted = dict(zip(rows.video_frame, rows.frame))
+        last = max(wanted)
+        with av.open(str(video_path(session, int(segment)))) as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            for n, picture in enumerate(container.decode(stream)):
+                if n in wanted:
+                    images[wanted[n]] = prepare(picture.to_ndarray(format="rgb24"), spec)
+                if n >= last:
+                    break
+    return images
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("session", type=Path)
@@ -109,37 +142,53 @@ def main():
     ap.add_argument("--fps", type=int, default=20)
     ap.add_argument("--repo-id", default="local/iw4l")
     ap.add_argument("--task", default="Play free-for-all against bots on mp_boneyard.")
+    ap.add_argument("--image-size", default="256x144")
+    ap.add_argument("--image-mode", default="fit", choices=["fit", "stretch"])
     ap.add_argument("--no-video", action="store_true")
     args = ap.parse_args()
-    if not args.no_video:
-        raise SystemExit("video capture is not wired into the converter yet; pass --no-video")
 
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from lerobot.datasets import LeRobotDataset
+    from rfm_image import ImageSpec
+
+    spec = ImageSpec.parse(args.image_size, args.image_mode)
+    cmds = load(args.session)
+    eps = [steps for steps in (resample(ep, args.fps) for ep in episodes(cmds)) if len(steps) >= 2]
+    images = {}
+    if not args.no_video:
+        wanted = [frame for steps in eps for frame, _, _ in steps]
+        images = decode_images(args.session, wanted, spec)
+        print(f"decoded {len(images)} images ({spec.describe()})")
 
     features = {
         "observation.state": {"dtype": "float32", "shape": (len(STATE_NAMES),), "names": STATE_NAMES},
         "action": {"dtype": "float32", "shape": (len(ACTION_NAMES),), "names": ACTION_NAMES},
         "game_frame": {"dtype": "int64", "shape": (1,), "names": None},
     }
+    if not args.no_video:
+        features["observation.images.main"] = {
+            "dtype": "video",
+            "shape": (spec.height, spec.width, 3),
+            "names": ["height", "width", "channels"],
+        }
     if args.out.exists():
         shutil.rmtree(args.out)
     ds = LeRobotDataset.create(
         repo_id=args.repo_id, fps=args.fps, features=features, root=args.out,
-        robot_type="iw4l_player", use_videos=False,
+        robot_type="iw4l_player", use_videos=not args.no_video,
     )
-    cmds = load(args.session)
     n_eps = n_steps = 0
-    for ep in episodes(cmds):
-        steps = resample(ep, args.fps)
-        if len(steps) < 2:
-            continue
+    for steps in eps:
         for frame, state, action in steps:
-            ds.add_frame({
+            row = {
                 "observation.state": state,
                 "action": action,
                 "game_frame": np.asarray([frame], np.int64),
                 "task": args.task,
-            })
+            }
+            if not args.no_video:
+                row["observation.images.main"] = images[frame]
+            ds.add_frame(row)
         ds.save_episode()
         n_eps += 1
         n_steps += len(steps)
@@ -149,7 +198,7 @@ def main():
     check = LeRobotDataset(args.repo_id, root=args.out)
     print("reloaded:", check.num_episodes, "episodes,", check.num_frames, "frames; features:", list(check.features))
     sample = check[0]
-    print("sample 0:", {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in sample.items()})
+    print("sample 0:", {k: (v.tolist() if hasattr(v, "tolist") and v.numel() < 32 else tuple(v.shape)) if hasattr(v, "shape") else v for k, v in sample.items()})
     stats = check.meta.stats["action"]
     for i, name in enumerate(ACTION_NAMES):
         print(f"  {name:20s} min {stats['min'][i]:9.2f}  max {stats['max'][i]:9.2f}  mean {stats['mean'][i]:8.3f}  std {stats['std'][i]:8.3f}")

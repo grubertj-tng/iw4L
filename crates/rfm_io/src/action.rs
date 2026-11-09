@@ -459,6 +459,42 @@ fn flat_ground_pml(msec: i32) -> Pml {
     }
 }
 
+/// View rates of a command stream. A command whose step takes no time cannot
+/// carry a rate; its angle change is carried into the next command that does,
+/// so the rates always integrate to the commanded angles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RateTracker {
+    base: Option<[i32; 3]>,
+}
+
+impl RateTracker {
+    /// `[pitch, yaw]` deg/s of the command with `angles` and step `msec`.
+    /// `reanchor` (spawn, teleport) starts over from these angles.
+    pub fn observe(&mut self, angles: [i32; 3], msec: i32, reanchor: bool) -> [f32; 2] {
+        match self.base {
+            Some(base) if !reanchor => {
+                if msec <= 0 {
+                    return [0.0, 0.0];
+                }
+                self.base = Some(angles);
+                let previous = UserCmd {
+                    angles: base,
+                    ..UserCmd::default()
+                };
+                let next = UserCmd {
+                    angles,
+                    ..UserCmd::default()
+                };
+                view_rate(&previous, &next, msec)
+            }
+            _ => {
+                self.base = Some(angles);
+                [0.0, 0.0]
+            }
+        }
+    }
+}
+
 /// Rotation between two commands in degrees per second, `[pitch, yaw]`.
 /// Positive pitch looks down, positive yaw turns left.
 #[must_use]

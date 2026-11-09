@@ -6,7 +6,7 @@ use bevy::prelude::*;
 use net::{ClientPredictionState, FrameClock, LocalPresentClient, PresentedSnapshot};
 use playerstate_iw4::{ENTITYNUM_NONE, UserCmd};
 
-use crate::action::{Basis, IntendedTracker, view_rate};
+use crate::action::{Basis, IntendedTracker, RateTracker};
 use crate::{FrameIndex, weapon_scales};
 
 const HEADER: &str = "frame,perf_frame,real_s,cg_time_ms,presented_tick,\
@@ -29,6 +29,7 @@ pub struct MovementRecorder {
     last_delta_angles: Option<[f32; 3]>,
     track: IntendedTracker,
     rate: [f32; 2],
+    rates: RateTracker,
 }
 
 impl MovementRecorder {
@@ -45,6 +46,7 @@ impl MovementRecorder {
             last_delta_angles: None,
             track: IntendedTracker::default(),
             rate: [0.0, 0.0],
+            rates: RateTracker::default(),
         })
     }
 
@@ -92,10 +94,7 @@ pub fn record_frame(
         let teleported = rec
             .last_delta_angles
             .is_some_and(|delta| delta != ps.delta_angles);
-        rec.rate = match rec.last_cmd {
-            Some(last) if !teleported => view_rate(&last, &cmd, msec),
-            _ => [0.0, 0.0],
-        };
+        rec.rate = rec.rates.observe(cmd.angles, msec, teleported);
         let scales = prediction.map(|p| weapon_scales(p.world(), ps.weapon));
         rec.track.observe(&ps, &cmd, msec, scales);
         rec.last_delta_angles = Some(ps.delta_angles);
