@@ -4,10 +4,10 @@ use std::path::Path;
 
 use bevy::prelude::*;
 use net::{ClientPredictionState, FrameClock, LocalPresentClient, PresentedSnapshot};
-use playerstate_iw4::{ENTITYNUM_NONE, PM_TYPE_DEAD, PM_TYPE_SPECTATOR, PlayerState, UserCmd};
+use playerstate_iw4::{ENTITYNUM_NONE, UserCmd};
 
-use crate::FrameIndex;
-use crate::action::{Basis, IntendedStep, IntendedVelocity, MoveFrame, MoveScales, view_rate};
+use crate::action::{Basis, IntendedTracker, view_rate};
+use crate::{FrameIndex, weapon_scales};
 
 const HEADER: &str = "frame,perf_frame,real_s,cg_time_ms,presented_tick,\
 cmd_new,server_time_ms,cmd_msec,buttons,forwardmove,rightmove,cmd_pitch,cmd_yaw,cmd_weapon,\
@@ -27,11 +27,8 @@ pub struct MovementRecorder {
     rows: u64,
     last_cmd: Option<UserCmd>,
     last_delta_angles: Option<[f32; 3]>,
-    intended: IntendedVelocity,
-    step: IntendedStep,
-    full_speed: f32,
+    track: IntendedTracker,
     rate: [f32; 2],
-    scales: MoveScales,
 }
 
 impl MovementRecorder {
@@ -46,15 +43,8 @@ impl MovementRecorder {
             rows: 0,
             last_cmd: None,
             last_delta_angles: None,
-            intended: IntendedVelocity::default(),
-            step: IntendedStep::default(),
-            full_speed: 0.0,
+            track: IntendedTracker::default(),
             rate: [0.0, 0.0],
-            scales: MoveScales {
-                weapon_move: 0.0,
-                weapon_ads_move: 0.0,
-                shellshock_affects_movement: false,
-            },
         })
     }
 
@@ -63,10 +53,6 @@ impl MovementRecorder {
             warn!("rfm_io: flushing the movement recording failed: {error}");
         }
     }
-}
-
-fn moves(ps: &PlayerState) -> bool {
-    ps.pm_type != PM_TYPE_SPECTATOR && ps.pm_type < PM_TYPE_DEAD
 }
 
 fn horizontal(v: [f32; 3]) -> [f32; 2] {
@@ -110,32 +96,8 @@ pub fn record_frame(
             Some(last) if !teleported => view_rate(&last, &cmd, msec),
             _ => [0.0, 0.0],
         };
-        if moves(&ps) {
-            if let Some(world) = prediction.map(net::ClientPrediction::world) {
-                let (weapon_move, weapon_ads_move, _) = world.scales_for(ps.weapon);
-                rec.scales = MoveScales {
-                    weapon_move,
-                    weapon_ads_move,
-                    shellshock_affects_movement: true,
-                };
-            }
-            let scales = rec.scales;
-            let frame = MoveFrame {
-                ps: &ps,
-                server_time: cmd.server_time,
-                msec,
-                scales,
-            };
-            rec.step = rec.intended.step(&frame, &cmd);
-            rec.full_speed = frame.full_speed();
-        } else {
-            rec.intended.reset(horizontal(ps.velocity));
-            rec.full_speed = 0.0;
-            rec.step = IntendedStep {
-                wish_speed: 0.0,
-                velocity: horizontal(ps.velocity),
-            };
-        }
+        let scales = prediction.map(|p| weapon_scales(p.world(), ps.weapon));
+        rec.track.observe(&ps, &cmd, msec, scales);
         rec.last_delta_angles = Some(ps.delta_angles);
     }
     if cmd_new {
@@ -203,8 +165,9 @@ pub fn record_frame(
             push(&ps.speed);
             push(&ps.move_speed_scale_multiplier);
             push(&ps.weapon);
-            push(&rec.scales.weapon_move);
-            push(&rec.scales.weapon_ads_move);
+            let scales = rec.track.scales();
+            push(&scales.weapon_move);
+            push(&scales.weapon_ads_move);
             push(&ps.pm_time);
             push(&ps.damage_timer);
             push(&ps.leanf);
@@ -214,12 +177,13 @@ pub fn record_frame(
             push(&ps.view_height_lerp_target);
             push(&ps.view_height_lerp_down);
             push(&ps.melee_charge_time);
-            push(&rec.full_speed);
-            push(&rec.step.wish_speed);
-            push(&rec.step.velocity[0]);
-            push(&rec.step.velocity[1]);
+            let step = rec.track.step();
+            push(&rec.track.full_speed());
+            push(&step.wish_speed);
+            push(&step.velocity[0]);
+            push(&step.velocity[1]);
             let basis = Basis::from_yaw(ps.viewangles[1]);
-            let intended = basis.project(rec.step.velocity);
+            let intended = basis.project(step.velocity);
             let actual = basis.project(horizontal(ps.velocity));
             push(&intended[0]);
             push(&intended[1]);

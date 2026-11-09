@@ -12,38 +12,14 @@
 //! * rotation: recorded rates → integrated command angles, compared with the
 //!   recorded angles; and how much a rate limit would cut.
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
-use playerstate_iw4::{PM_TYPE_DEAD, PM_TYPE_SPECTATOR, PlayerState};
+use playerstate_iw4::{PM_TYPE_DEAD, PM_TYPE_SPECTATOR};
 use rfm_io::action::{
     Basis, MoveFrame, MoveScales, PITCH_RATE_LIMIT_DPS, YAW_RATE_LIMIT_DPS, angles_after_rate,
 };
-
-struct Row {
-    cols: Vec<String>,
-}
-
-impl Row {
-    fn get(&self, index: &HashMap<String, usize>, name: &str) -> Option<&str> {
-        index
-            .get(name)
-            .and_then(|&i| self.cols.get(i))
-            .map(String::as_str)
-            .filter(|v| !v.is_empty())
-    }
-    fn f32(&self, index: &HashMap<String, usize>, name: &str) -> Option<f32> {
-        self.get(index, name).and_then(|v| v.parse().ok())
-    }
-    fn i64(&self, index: &HashMap<String, usize>, name: &str) -> Option<i64> {
-        self.get(index, name).and_then(|v| {
-            v.parse::<i64>()
-                .ok()
-                .or_else(|| v.parse::<f64>().ok().map(|f| f as i64))
-        })
-    }
-}
+use rfm_io::table::{Header, Row};
 
 #[derive(Default)]
 struct Stats {
@@ -69,30 +45,6 @@ fn percentile(values: &mut [f32], p: f32) -> f32 {
     values.sort_by(f32::total_cmp);
     let i = ((values.len() - 1) as f32 * p).round() as usize;
     values[i]
-}
-
-fn player_state(row: &Row, ix: &HashMap<String, usize>) -> PlayerState {
-    let mut ps = PlayerState::ZERO;
-    let int = |name: &str| row.i64(ix, name).unwrap_or(0);
-    let float = |name: &str| row.f32(ix, name).unwrap_or(0.0);
-    ps.pm_type = int("pm_type") as i32;
-    ps.pm_flags = int("pm_flags") as u32;
-    ps.velocity = [float("vel_x"), float("vel_y"), float("vel_z")];
-    ps.viewangles = [float("view_pitch"), float("view_yaw"), 0.0];
-    ps.delta_angles = [float("delta_pitch"), float("delta_yaw"), 0.0];
-    ps.speed = int("speed") as i32;
-    ps.move_speed_scale_multiplier = float("move_scale_mult");
-    ps.weapon = int("weapon") as u32;
-    ps.pm_time = int("pm_time") as i32;
-    ps.damage_timer = int("damage_timer") as i32;
-    ps.leanf = float("leanf");
-    ps.f_weapon_pos_frac = float("weapon_pos_frac");
-    ps.view_height_target = int("view_height_target") as i32;
-    ps.view_height_lerp_time = int("view_height_lerp_time") as i32;
-    ps.view_height_lerp_target = int("view_height_lerp_target") as i32;
-    ps.view_height_lerp_down = int("view_height_lerp_down") as i32;
-    ps.melee_charge_time = int("melee_charge_time") as i32;
-    ps
 }
 
 fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
@@ -122,12 +74,8 @@ fn main() -> std::io::Result<()> {
         eprintln!("empty recording");
         std::process::exit(2);
     };
-    let ix: HashMap<String, usize> = header
-        .split(',')
-        .enumerate()
-        .map(|(i, name)| (name.to_string(), i))
-        .collect();
-    let has_full_state = ix.contains_key("pm_time");
+    let ix = Header::parse(&header);
+    let has_full_state = ix.has("pm_time");
 
     let mut out = BufWriter::new(std::fs::File::create(&args[2])?);
     writeln!(
@@ -146,14 +94,12 @@ yaw_rate,pitch_rate,cmd_pitch,cmd_yaw,pitch_rt,yaw_rt,cmd_msec"
     let mut last_delta: Option<[f32; 2]> = None;
 
     for line in lines {
-        let row = Row {
-            cols: line?.split(',').map(str::to_string).collect(),
-        };
+        let row = Row::parse(&line?);
         if row.i64(&ix, "cmd_new") != Some(1) || row.i64(&ix, "ps_valid") != Some(1) {
             continue;
         }
         stats.commands += 1;
-        let ps = player_state(&row, &ix);
+        let ps = row.player_state(&ix);
         let f = row.i64(&ix, "forwardmove").unwrap_or(0) as i8;
         let r = row.i64(&ix, "rightmove").unwrap_or(0) as i8;
         let msec = row.i64(&ix, "cmd_msec").unwrap_or(0) as i32;

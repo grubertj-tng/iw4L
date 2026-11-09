@@ -2,7 +2,7 @@ use movement_iw4::{
     ANGLE2SHORT, CmdScaleWalkContext, Pml, SHORT2ANGLE, StanceSurface, accelerate, cmd_scale_walk,
     damage_scale_walk, friction, stance_surface_type,
 };
-use playerstate_iw4::{PlayerState, UserCmd, pm_flags};
+use playerstate_iw4::{PM_TYPE_DEAD, PM_TYPE_SPECTATOR, PlayerState, UserCmd, pm_flags};
 
 const BACK_SPEED_SCALE: f32 = 0.7;
 const STRAFE_SPEED_SCALE: f32 = 0.8;
@@ -15,6 +15,7 @@ const ACCEL_PRONE: f32 = 19.0;
 const ACCEL_MIN_WISH_SPEED: f32 = 100.0;
 
 const SEARCH_RADIUS: i32 = 2;
+const GRID_STEP: i32 = 8;
 
 pub const YAW_RATE_LIMIT_DPS: f32 = 1200.0;
 pub const PITCH_RATE_LIMIT_DPS: f32 = 240.0;
@@ -185,16 +186,30 @@ impl MoveFrame<'_> {
         target: [f32; 2],
         previous: (i8, i8),
     ) -> (i8, i8) {
-        let analytic = self.analytic_command(velocity, target);
+        self.command_for_bounded(velocity, target, previous, -127)
+    }
+
+    /// [`command_for`](Self::command_for) among the commands whose
+    /// `forwardmove` is at least `forward_min`.
+    #[must_use]
+    pub fn command_for_bounded(
+        &self,
+        velocity: [f32; 2],
+        target: [f32; 2],
+        previous: (i8, i8),
+        forward_min: i8,
+    ) -> (i8, i8) {
+        let bound = |cmd: (i8, i8)| (cmd.0.max(forward_min), cmd.1);
+        let analytic = bound(self.analytic_command(velocity, target));
         let error = |cmd: (i8, i8)| {
             let next = self.advance(velocity, cmd.0, cmd.1).velocity;
             let dx = next[0] - target[0];
             let dy = next[1] - target[1];
             dx * dx + dy * dy
         };
-        let mut best = previous;
-        let mut best_error = error(previous);
-        for candidate in [analytic, (0, 0)] {
+        let mut best = bound(previous);
+        let mut best_error = error(best);
+        for candidate in [analytic, bound((0, 0))] {
             let e = error(candidate);
             if e < best_error {
                 best = candidate;
@@ -203,9 +218,54 @@ impl MoveFrame<'_> {
         }
         for df in -SEARCH_RADIUS..=SEARCH_RADIUS {
             for dr in -SEARCH_RADIUS..=SEARCH_RADIUS {
-                let candidate = (
+                let candidate = bound((
                     clamp_i8(i32::from(analytic.0) + df),
                     clamp_i8(i32::from(analytic.1) + dr),
+                ));
+                let e = error(candidate);
+                if e < best_error {
+                    best = candidate;
+                    best_error = e;
+                }
+            }
+        }
+        if best_error > 0.0 {
+            best = Self::grid_search(error, forward_min, best, best_error);
+        }
+        best
+    }
+
+    /// An unreachable target can lie far from the analytic command's
+    /// neighbourhood: a coarse grid over all commands, then the cells around
+    /// its best.
+    fn grid_search(
+        error: impl Fn((i8, i8)) -> f32,
+        forward_min: i8,
+        mut best: (i8, i8),
+        mut best_error: f32,
+    ) -> (i8, i8) {
+        let axis = |low: i32| {
+            (low..=127)
+                .step_by(GRID_STEP as usize)
+                .chain(std::iter::once(127))
+        };
+        let mut coarse = best;
+        let mut coarse_error = f32::INFINITY;
+        for f in axis(i32::from(forward_min)) {
+            for r in axis(-127) {
+                let candidate = (f as i8, r as i8);
+                let e = error(candidate);
+                if e < coarse_error {
+                    coarse = candidate;
+                    coarse_error = e;
+                }
+            }
+        }
+        for df in -GRID_STEP + 1..GRID_STEP {
+            for dr in -GRID_STEP + 1..GRID_STEP {
+                let candidate = (
+                    clamp_i8(i32::from(coarse.0) + df).max(forward_min),
+                    clamp_i8(i32::from(coarse.1) + dr),
                 );
                 let e = error(candidate);
                 if e < best_error {
@@ -282,6 +342,93 @@ impl IntendedVelocity {
         let step = frame.advance(self.velocity, cmd.forwardmove, cmd.rightmove);
         self.velocity = step.velocity;
         step
+    }
+}
+
+/// Whether the sim moves the player at all (alive, not spectating).
+#[must_use]
+pub fn moves(ps: &PlayerState) -> bool {
+    ps.pm_type != PM_TYPE_SPECTATOR && ps.pm_type < PM_TYPE_DEAD
+}
+
+/// Intended velocity kept along a stream of commands, with the player state
+/// after each one. The recorder and the inference adapter both keep one and
+/// feed it the same commands, so their values agree bit for bit.
+#[derive(Clone, Copy, Debug)]
+pub struct IntendedTracker {
+    intended: IntendedVelocity,
+    scales: MoveScales,
+    step: IntendedStep,
+    full_speed: f32,
+}
+
+impl Default for IntendedTracker {
+    fn default() -> Self {
+        Self {
+            intended: IntendedVelocity::default(),
+            scales: MoveScales {
+                weapon_move: 0.0,
+                weapon_ads_move: 0.0,
+                shellshock_affects_movement: false,
+            },
+            step: IntendedStep::default(),
+            full_speed: 0.0,
+        }
+    }
+}
+
+impl IntendedTracker {
+    /// One command the sim ran: `ps` is the state after it, `msec` its step
+    /// length, `scales` the move scales of `ps.weapon` when known (otherwise
+    /// the last known ones stay).
+    pub fn observe(
+        &mut self,
+        ps: &PlayerState,
+        cmd: &UserCmd,
+        msec: i32,
+        scales: Option<MoveScales>,
+    ) {
+        if moves(ps) {
+            if let Some(scales) = scales {
+                self.scales = scales;
+            }
+            let frame = MoveFrame {
+                ps,
+                server_time: cmd.server_time,
+                msec,
+                scales: self.scales,
+            };
+            self.step = self.intended.step(&frame, cmd);
+            self.full_speed = frame.full_speed();
+        } else {
+            let velocity = [ps.velocity[0], ps.velocity[1]];
+            self.intended.reset(velocity);
+            self.full_speed = 0.0;
+            self.step = IntendedStep {
+                wish_speed: 0.0,
+                velocity,
+            };
+        }
+    }
+
+    #[must_use]
+    pub fn velocity(&self) -> [f32; 2] {
+        self.intended.velocity()
+    }
+
+    #[must_use]
+    pub fn step(&self) -> IntendedStep {
+        self.step
+    }
+
+    #[must_use]
+    pub fn full_speed(&self) -> f32 {
+        self.full_speed
+    }
+
+    #[must_use]
+    pub fn scales(&self) -> MoveScales {
+        self.scales
     }
 }
 
