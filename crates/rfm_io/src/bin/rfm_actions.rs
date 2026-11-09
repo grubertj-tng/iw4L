@@ -4,7 +4,8 @@
 //! usage: rfm_actions <movement.csv> <actions.csv>
 //!
 //! * intended velocity: the recorded `intended_fwd/right`;
-//! * rates: the recorded `pitch/yaw_rate_dps`;
+//! * yaw rate: recomputed from the command angles (`RateTracker`);
+//! * pitch: the recorded view pitch after the command (absolute target);
 //! * sprint and stance desired: the recorded `SPRINTING`, `PRONE`, `CROUCH`
 //!   state after the command;
 //! * buttons: the recorded bits out of `ACTION_BUTTONS`;
@@ -16,7 +17,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use playerstate_iw4::{buttons, pm_flags};
 use rfm_io::action::RateTracker;
-use rfm_io::action::{PITCH_RATE_LIMIT_DPS, YAW_RATE_LIMIT_DPS, moves};
+use rfm_io::action::{YAW_RATE_LIMIT_DPS, moves};
 use rfm_io::action_file::{format_row, header};
 use rfm_io::drive::{ACTION_BUTTONS, Action, Stance};
 use rfm_io::table::{Header, Row};
@@ -43,6 +44,7 @@ fn main() -> std::io::Result<()> {
     let mut last_delta: Option<[f32; 2]> = None;
     let mut origin: Option<i64> = None;
     let mut in_life = false;
+    let mut last_pitch = 0.0f32;
     let mut idle_rows = 0u64;
     for line in lines {
         let row = Row::parse(&line?);
@@ -65,7 +67,8 @@ fn main() -> std::io::Result<()> {
             if in_life && let Some(origin) = origin {
                 let idle = Action {
                     intended: [0.0, 0.0],
-                    rate: [0.0, 0.0],
+                    yaw_rate: 0.0,
+                    pitch: last_pitch,
                     sprint: false,
                     stance: Stance::Stand,
                     buttons: 0,
@@ -89,17 +92,18 @@ fn main() -> std::io::Result<()> {
                 row.f32(&ix, "intended_fwd").unwrap_or(0.0),
                 row.f32(&ix, "intended_right").unwrap_or(0.0),
             ],
-            rate,
+            yaw_rate: rate[1],
+            pitch: ps.viewangles[0],
             sprint: ps.pm_flags & pm_flags::SPRINTING != 0,
             stance: Stance::of(&ps),
             buttons: recorded & ACTION_BUTTONS,
             retrigger: 0,
             weapon: None,
         };
-        if action.rate[0].abs() > PITCH_RATE_LIMIT_DPS || action.rate[1].abs() > YAW_RATE_LIMIT_DPS
-        {
+        if action.yaw_rate.abs() > YAW_RATE_LIMIT_DPS {
             clipped += 1;
         }
+        last_pitch = action.pitch;
         sprinting += u64::from(action.sprint);
         crouched += u64::from(action.stance == Stance::Crouch);
         prone += u64::from(action.stance == Stance::Prone);
@@ -115,6 +119,6 @@ fn main() -> std::io::Result<()> {
     );
     println!("sprint desired {sprinting}, crouch {crouched}, prone {prone}");
     println!("commands with recorded bits outside the action buttons: {dropped_bits}");
-    println!("commands with a rate beyond the limits (the adapter clamps): {clipped}");
+    println!("commands with a yaw rate beyond the limit (the adapter clamps): {clipped}");
     Ok(())
 }

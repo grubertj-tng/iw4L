@@ -6,6 +6,8 @@ Owned by the user. Agents read this and change it only when asked.
 > model I/O will be decided with the user. Do not settle them on your own; ask.
 
 ## Vision
+LONG-TERM VISION:
+* transferable VLA utilities for other Bevy-ported games
 
 Infrastructure to train AI models to play the game. The focus is on robot
 foundation models (RFMs), especially vision-language-action models (VLAs).

@@ -1,6 +1,6 @@
 //! Round trip of a movement recording through the action interface.
 //!
-//! usage: rfm_roundtrip <recording.csv> <out.csv> [yaw_limit_dps] [pitch_limit_dps]
+//! usage: rfm_roundtrip <recording.csv> <out.csv> [yaw_limit_dps]
 //!
 //! For every recorded command:
 //! * forward: recorded command → intended velocity, compared with the value
@@ -9,16 +9,18 @@
 //! * inverse: that intended velocity → command → intended velocity, closed
 //!   loop on the inverse's own state (what an inference adapter does), and the
 //!   reconstructed command against the recorded one;
-//! * rotation: recorded rates → integrated command angles, compared with the
-//!   recorded angles; and how much a rate limit would cut.
+//! * rotation: yaw rates (recomputed from the command angles) → integrated
+//!   command yaw; pitch: the recorded view pitch (the absolute action) →
+//!   command pitch. Both compared with the recorded command angles; and how
+//!   much the yaw rate limit would cut.
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
+use movement_iw4::ANGLE2SHORT;
 use playerstate_iw4::{PM_TYPE_DEAD, PM_TYPE_SPECTATOR};
 use rfm_io::action::{
-    Basis, MoveFrame, MoveScales, PITCH_RATE_LIMIT_DPS, RateTracker, YAW_RATE_LIMIT_DPS,
-    angles_after_rate,
+    Basis, MoveFrame, MoveScales, RateTracker, YAW_RATE_LIMIT_DPS, angles_after_rate,
 };
 use rfm_io::table::{Header, Row};
 
@@ -34,10 +36,9 @@ struct Stats {
     angle_max_err_units: i64,
     reanchors: u64,
     zero_time: u64,
+    uncontrolled: u64,
     yaw_clipped: u64,
-    pitch_clipped: u64,
     yaw_cut_deg: f64,
-    pitch_cut_deg: f64,
 }
 
 fn percentile(values: &mut [f32], p: f32) -> f32 {
@@ -57,19 +58,13 @@ fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!(
-            "usage: rfm_roundtrip <recording.csv> <out.csv> [yaw_limit_dps] [pitch_limit_dps]"
-        );
+        eprintln!("usage: rfm_roundtrip <recording.csv> <out.csv> [yaw_limit_dps]");
         std::process::exit(2);
     }
     let yaw_limit: f32 = args
         .get(3)
         .and_then(|v| v.parse().ok())
         .unwrap_or(YAW_RATE_LIMIT_DPS);
-    let pitch_limit: f32 = args
-        .get(4)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(PITCH_RATE_LIMIT_DPS);
 
     let mut lines = BufReader::new(std::fs::File::open(&args[1])?).lines();
     let Some(header) = lines.next().transpose()? else {
@@ -156,19 +151,26 @@ yaw_rate,pitch_rate,cmd_pitch,cmd_yaw,pitch_rt,yaw_rt,cmd_msec"
         let teleported = last_delta.is_some_and(|d| d != delta);
         last_delta = Some(delta);
         let rate = rates.observe(cmd_angles, msec, teleported);
-        let rt = match angles_rt {
-            Some(previous) if !teleported => angles_after_rate(previous, rate, msec),
+        let pitch_from_view = (((ps.viewangles[0] - ps.delta_angles[0]) * ANGLE2SHORT).round()
+            as i32)
+            .wrapping_sub(cmd_angles[0]) as i16;
+        let mut rt = match angles_rt {
+            Some(previous) if !teleported => angles_after_rate(previous, [0.0, rate[1]], msec),
             Some(_) => {
                 stats.reanchors += 1;
                 cmd_angles
             }
             None => cmd_angles,
         };
+        rt[0] = cmd_angles[0].wrapping_add(i32::from(pitch_from_view));
         angles_rt = Some(rt);
         let err = i64::from((rt[0].wrapping_sub(cmd_angles[0]) as i16).unsigned_abs()).max(
             i64::from((rt[1].wrapping_sub(cmd_angles[1]) as i16).unsigned_abs()),
         );
-        if msec <= 0 {
+        let captured = row.i64(&ix, "input_captured") == Some(1);
+        if !moving || captured {
+            stats.uncontrolled += 1;
+        } else if msec <= 0 {
             stats.zero_time += 1;
         } else {
             if err != 0 {
@@ -181,10 +183,6 @@ yaw_rate,pitch_rate,cmd_pitch,cmd_yaw,pitch_rt,yaw_rt,cmd_msec"
         if rate[1].abs() > yaw_limit {
             stats.yaw_clipped += 1;
             stats.yaw_cut_deg += f64::from(rate[1].abs() - yaw_limit) * seconds;
-        }
-        if rate[0].abs() > pitch_limit {
-            stats.pitch_clipped += 1;
-            stats.pitch_cut_deg += f64::from(rate[0].abs() - pitch_limit) * seconds;
         }
 
         let basis = Basis::from_yaw(ps.viewangles[1]);
@@ -261,16 +259,17 @@ yaw_rate,pitch_rate,cmd_pitch,cmd_yaw,pitch_rt,yaw_rt,cmd_msec"
         stats.command_off_by[3],
     );
     println!(
-        "rotation: integrated angles differ from recorded on {} commands, max {} units ({:.4}°); re-anchored on {} teleports; {} zero-time commands carried into the next",
+        "rotation (commands under control): reconstructed angles differ from recorded on {} commands, max {} units ({:.4}°); re-anchored on {} teleports; {} zero-time commands carried into the next; {} commands not under control (dead, spectating, input captured) not compared",
         stats.angle_mismatch,
         stats.angle_max_err_units,
         stats.angle_max_err_units as f32 * movement_iw4::SHORT2ANGLE,
         stats.reanchors,
         stats.zero_time,
+        stats.uncontrolled,
     );
     println!(
-        "limits yaw ±{yaw_limit} pitch ±{pitch_limit} deg/s: clipped {} yaw / {} pitch commands, cutting {:.1}° yaw / {:.1}° pitch in total",
-        stats.yaw_clipped, stats.pitch_clipped, stats.yaw_cut_deg, stats.pitch_cut_deg,
+        "yaw rate limit ±{yaw_limit} deg/s: clipped {} commands, cutting {:.1}° in total",
+        stats.yaw_clipped, stats.yaw_cut_deg,
     );
     Ok(())
 }

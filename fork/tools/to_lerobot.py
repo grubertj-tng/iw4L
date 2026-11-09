@@ -16,8 +16,10 @@ Sampling. LeRobot assumes a constant rate (timestamp = frame_index / fps), the
 game does not. Step k of an episode is the last game frame at or before
 t0 + k/fps (by wall time). Its action covers the commands from that frame up to
 the next step's frame:
-  * yaw/pitch rate: total turn over the step ÷ step time (exact: integrates to
-    the same angle);
+  * yaw rate: total turn over the step ÷ step time (exact: integrates to the
+    same angle);
+  * pitch: absolute, the view pitch at the end of the step (degrees, positive
+    looks down);
   * intended velocity, sprint, stance, held buttons: value at the end of the step
     (hold_breath only counts while aiming: the sprint key sets the same bit);
   * momentary buttons (jump, reload, melee, frag, smoke, use): pressed at any
@@ -42,13 +44,13 @@ MOMENTARY = {"jump": 0x400, "reload": 0x10, "melee": 0x4, "use": 0x8, "frag": 0x
 PM_SPRINTING, PM_PRONE, PM_CROUCH = 0x4000, 0x1, 0x2
 
 ACTION_NAMES = (
-    ["intended_fwd_ups", "intended_right_ups", "yaw_rate_dps", "pitch_rate_dps", "sprint", "crouch", "prone"]
+    ["intended_fwd_ups", "intended_right_ups", "yaw_rate_dps", "pitch_deg", "sprint", "crouch", "prone"]
     + list(HELD)
     + list(MOMENTARY)
 )
 STATE_NAMES = [
     "vel_fwd_ups", "vel_right_ups", "vel_up_ups", "view_pitch_deg", "on_ground",
-    "sprinting", "crouched", "prone", "ads_frac", "max_speed_ups",
+    "sprinting", "crouched", "prone", "ads_frac", "max_speed_ups", "heading_sin", "heading_cos",
 ]
 
 
@@ -91,10 +93,9 @@ def resample(ep: pd.DataFrame, fps: int):
         end = ep.iloc[b]
         seconds = window.cmd_msec.sum() / 1000.0
         yaw = (window.yaw_rate * window.cmd_msec / 1000.0).sum() / seconds if seconds > 0 else 0.0
-        pitch = (window.pitch_rate * window.cmd_msec / 1000.0).sum() / seconds if seconds > 0 else 0.0
         flags = int(end.pm_flags)
         action = [
-            end.intended_fwd, end.intended_right, yaw, pitch,
+            end.intended_fwd, end.intended_right, yaw, end.view_pitch,
             float(flags & PM_SPRINTING != 0), float(flags & PM_CROUCH != 0), float(flags & PM_PRONE != 0),
         ]
         held = int(end.buttons)
@@ -107,6 +108,7 @@ def resample(ep: pd.DataFrame, fps: int):
             obs.actual_fwd, obs.actual_right, obs.vel_z, obs.view_pitch, float(obs.on_ground),
             float(int(obs.pm_flags) & PM_SPRINTING != 0), float(int(obs.pm_flags) & PM_CROUCH != 0),
             float(int(obs.pm_flags) & PM_PRONE != 0), obs.weapon_pos_frac, obs.full_speed,
+            np.sin(np.radians(obs.view_yaw)), np.cos(np.radians(obs.view_yaw)),
         ]
         steps.append((int(obs.frame), np.asarray(state, np.float32), np.asarray(action, np.float32)))
     return steps

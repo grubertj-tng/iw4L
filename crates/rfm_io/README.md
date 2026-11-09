@@ -77,7 +77,8 @@ no larger than needed. Numbers: `fork/artifacts/2026-11-09-video-capture`.
 | action | unit | definition | code |
 |---|---|---|---|
 | intended velocity `(fwd, right)` | u/s, player's yaw frame | the velocity the movement commands produce on unobstructed flat ground (see below) | `MoveFrame::advance` |
-| yaw rate, pitch rate | deg/s | command-angle change between consecutive commands ÷ the command's `msec`. Positive yaw turns left, positive pitch looks down | `view_rate`, `angles_after_rate` |
+| yaw rate | deg/s | command-yaw change between consecutive commands ÷ the command's `msec` (a zero-time command's turn is carried into the next). Positive turns left. Yaw wraps around and cannot be seen in the image, so it is relative | `RateTracker`, `angles_after_rate` |
+| pitch | degrees, absolute | the view pitch after the command; positive looks down, ±85° | the adapter steers to it (see below) |
 | sprint desired | bool | the recorded `SPRINTING` state | label from `pm_flags`; the adapter holds `SPRINT` while desired |
 | stance desired | stand / crouch / prone | the recorded `PRONE` / `CROUCH` state | label from `pm_flags`; the adapter sets the `PRONE` / `CROUCH` bits, which the sim reads as state |
 | other buttons | bits | `UserCmd.buttons` as recorded | — |
@@ -93,8 +94,10 @@ compares each command with the previous one (`old_buttons`):
   Ending forward intent, ADS, fire, reload and use end it too.
 
 **Units, not normalisation.** Actions are in physical units here. The
-inference adapter clamps the rates to their limits (yaw ±1200, pitch ±240
-deg/s: `YAW_RATE_LIMIT_DPS`, `PITCH_RATE_LIMIT_DPS`). Normalisation, its statistics and the control rate
+inference adapter clamps the yaw rate to ±1200 deg/s (`YAW_RATE_LIMIT_DPS`)
+and approaches a pitch target at most at ±240 deg/s (`PITCH_RATE_LIMIT_DPS`).
+The observation carries the world heading as `(sin, cos)` of the view yaw
+(LeRobot converter), so the ring has no seam there. Normalisation, its statistics and the control rate
 belong to the training side and are stored with the dataset. Recordings stay
 at the full frame rate, so actions can be recomputed and resampled offline.
 
@@ -191,7 +194,8 @@ Header by name; missing columns other than `t_ms` are 0:
 | `src_frame` | where the row came from (not used by the adapter) |
 | `t_ms` | start of the row, game milliseconds, non-decreasing. Replay starts at the first command driven |
 | `fwd`, `right` | intended velocity, u/s, player's yaw frame |
-| `pitch_rate`, `yaw_rate` | deg/s; positive pitch looks down, positive yaw turns left |
+| `pitch` | view pitch to reach by the end of the row, degrees, positive looks down. The adapter spreads the change over the row's remaining time (`Planned::remaining_ms`), at most 240 deg/s, clamped to ±85° |
+| `yaw_rate` | deg/s, positive turns left, clamped to ±1200 |
 | `sprint` | 0/1, sprint desired |
 | `stance` | `stand` / `crouch` / `prone` |
 | `attack`, `ads`, `reload`, `jump`, `use`, `melee`, `frag`, `smoke`, `breath`, `throw` | 0/1 held |
@@ -207,7 +211,7 @@ player did not move (death, spectating).
 
 `IW4L_RFM_DRIVE_LOG` writes one row per command the adapter built and the sim
 ran, keyed by `frame` like the recording: the action (`target_fwd`,
-`target_right`, clamped `pitch_rate`/`yaw_rate`, `sprint`, `stance`,
+`target_right`, `pitch_target`, clamped `yaw_rate`, `sprint`, `stance`,
 `action_buttons`), the rate the command angles actually carry
 (`pitch_rate_cmd`, `yaw_rate_cmd`), the step lengths planned and run, whether
 the command run equals the one built (`as_built`), the command's fields, the
@@ -239,7 +243,7 @@ Both scripts use the `context/venv` virtualenv (matplotlib, numpy, pandas).
 * **Command:** `cmd_new`, `server_time_ms`, `cmd_msec`, `buttons`,
   `forwardmove`, `rightmove`, `cmd_pitch`, `cmd_yaw` (65536 units per turn),
   `cmd_weapon`.
-* **Rates:** `pitch_rate_dps`, `yaw_rate_dps`.
+* **Rates:** `pitch_rate_dps`, `yaw_rate_dps` (raw, both axes; the pitch action is the absolute `view_pitch`).
 * **Player state after the command:** `ps_valid`, `pm_type`, `pm_flags`,
   `on_ground`, `origin_*`, `vel_*`, `view_pitch`, `view_yaw`, `delta_pitch`,
   `delta_yaw`, `speed`, `move_scale_mult`, `weapon`, `pm_time`,

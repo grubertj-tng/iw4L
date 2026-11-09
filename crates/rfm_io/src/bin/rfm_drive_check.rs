@@ -15,8 +15,10 @@
 //!   command existed under the recorded state), the rest being the inverse's
 //!   own search falling short of the exhaustive one. While sprint is desired only commands that keep the
 //!   sprint count, as in the adapter;
-//! * rates: recorded against the commanded rate, exact in angle units, and
-//!   against the action's clamped rate within one angle unit;
+//! * yaw rate: recorded against the commanded rate, exact in angle units, and
+//!   against the action's clamped rate within half an angle unit;
+//! * pitch: the recorded view pitch against the action's target, within half
+//!   an angle unit, unless the rate limit or the ±85° view limit held it;
 //! * sprint, stance: the state after the command against the desired one;
 //! * buttons: the action's buttons in the command.
 
@@ -94,6 +96,9 @@ struct Counts {
     rate_teleport: u64,
     rate_within_unit: u64,
     rate_pitch_limited: u64,
+    pitch_reached: u64,
+    pitch_rate_limited: u64,
+    pitch_spread: u64,
     rate_clamped: u64,
     sprint_agree: u64,
     sprint_desired: u64,
@@ -123,7 +128,7 @@ fn main() -> std::io::Result<()> {
             writeln!(
                 out,
                 "frame,msec,target_fwd,target_right,rec_fwd,rec_right,err,best_err,class,\
-pitch_rate,yaw_rate,rec_pitch_rate,rec_yaw_rate,sprint,sprinting,stance,stance_rec"
+pitch_target,yaw_rate,rec_pitch_rate,rec_yaw_rate,sprint,sprinting,stance,stance_rec"
             )?;
             Some(out)
         }
@@ -274,23 +279,31 @@ pitch_rate,yaw_rate,rec_pitch_rate,rec_yaw_rate,sprint,sprinting,stance,stance_r
             || prev.f32(&mh, "delta_yaw") != row.f32(&mh, "delta_yaw");
         let rec_rate = [mf("pitch_rate_dps"), mf("yaw_rate_dps")];
         let cmd_rate = [lf("pitch_rate_cmd"), lf("yaw_rate_cmd")];
-        let action_rate = [lf("pitch_rate"), lf("yaw_rate")];
+        let action_rate = [lf("pitch_target"), lf("yaw_rate")];
         if teleported {
             c.rate_teleport += 1;
         } else if rec_rate == cmd_rate {
             c.rate_equal += 1;
         }
         let unit = SHORT2ANGLE / (msec.max(1) as f32 * 0.001);
-        let within = |axis: usize| (cmd_rate[axis] - action_rate[axis]).abs() <= unit * 0.5 + 1e-3;
-        if within(0) && within(1) {
+        if (cmd_rate[1] - action_rate[1]).abs() <= unit * 0.5 + 1e-3 {
             c.rate_within_unit += 1;
-        } else if within(1) && mf("view_pitch").abs() >= 84.99 {
-            c.rate_pitch_limited += 1;
         }
-        if action_rate[0].abs() >= rfm_io::action::PITCH_RATE_LIMIT_DPS
-            || action_rate[1].abs() >= rfm_io::action::YAW_RATE_LIMIT_DPS
-        {
+        if action_rate[1].abs() >= rfm_io::action::YAW_RATE_LIMIT_DPS {
             c.rate_clamped += 1;
+        }
+        let pitch_before = prev.f32(&mh, "view_pitch").unwrap_or(0.0);
+        let pitch_now = mf("view_pitch");
+        if (pitch_now - action_rate[0]).abs() <= SHORT2ANGLE * 0.5 + 1e-3 {
+            c.pitch_reached += 1;
+        } else if (action_rate[0] - pitch_before).abs()
+            > rfm_io::action::PITCH_RATE_LIMIT_DPS * msec as f32 * 0.001
+        {
+            c.pitch_rate_limited += 1;
+        } else if pitch_now.abs() >= 84.99 {
+            c.rate_pitch_limited += 1;
+        } else {
+            c.pitch_spread += 1;
         }
 
         let sprint = li("sprint") == 1;
@@ -390,12 +403,15 @@ pitch_rate,yaw_rate,rec_pitch_rate,rec_yaw_rate,sprint,sprinting,stance,stance_r
         percentile(&mut gaps, 1.0),
     );
     println!(
-        "rates: recorded = commanded {:.2} % (+{} teleports, recorded as 0); commanded within half an angle unit of the action's clamped rate {:.2} %; pitch held at the view limit {}; action rate at a limit {}",
+        "yaw: recorded rate = commanded {:.2} % (+{} teleports); commanded within half an angle unit of the action's clamped rate {:.2} %; action rate at the limit {}\npitch: target reached {:.2} %; held by the rate limit {}; held at the view limit {}; still on the way (target spread over a longer action) {}",
         pct(c.rate_equal, n),
         c.rate_teleport,
         pct(c.rate_within_unit, n),
+        c.rate_clamped,
+        pct(c.pitch_reached, n),
+        c.pitch_rate_limited,
         c.rate_pitch_limited,
-        c.rate_clamped
+        c.pitch_spread
     );
     println!(
         "sprint state = desired {:.2} %; while desired {:.2} % of {}",

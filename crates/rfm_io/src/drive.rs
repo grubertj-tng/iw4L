@@ -100,9 +100,12 @@ pub struct Action {
     /// Intended velocity after the command, u/s, `(forward, right)` in the
     /// player's yaw frame.
     pub intended: [f32; 2],
-    /// deg/s, `[pitch, yaw]`. Positive pitch looks down, positive yaw turns
-    /// left. Clamped to `PITCH_RATE_LIMIT_DPS` / `YAW_RATE_LIMIT_DPS`.
-    pub rate: [f32; 2],
+    /// Yaw rate, deg/s; positive turns left. Clamped to `YAW_RATE_LIMIT_DPS`.
+    pub yaw_rate: f32,
+    /// View pitch to reach by the end of the action, degrees; positive looks
+    /// down. Clamped to ±`PITCH_LIMIT_DEGREES`, approached at most at
+    /// `PITCH_RATE_LIMIT_DPS`.
+    pub pitch: f32,
     pub sprint: bool,
     pub stance: Stance,
     /// Held buttons, out of [`ACTION_BUTTONS`].
@@ -122,19 +125,27 @@ pub struct DriveTick {
     pub msec: i32,
 }
 
+/// An action and the game time left until it ends, counted from the start of
+/// the command's step. The adapter spreads the pitch change over that time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Planned {
+    pub action: Action,
+    pub remaining_ms: i32,
+}
+
 /// Where actions come from. The adapter asks every frame while the player
 /// moves, with the game time of the command it builds; a source answers with
 /// the action valid at the start of that command's step (`server_time -
 /// msec`), or `None` when it has no more.
 pub trait ActionSource: Send + Sync + 'static {
-    fn current(&mut self, tick: &DriveTick) -> Option<Action>;
+    fn current(&mut self, tick: &DriveTick) -> Option<Planned>;
 
     /// Position of the current action in the source, for the drive log.
     fn cursor(&self) -> u64;
 }
 
 const LOG_HEADER: &str = "frame,cursor,server_time_ms,msec_built,msec_run,as_built,\
-target_fwd,target_right,pitch_rate,yaw_rate,pitch_rate_cmd,yaw_rate_cmd,\
+target_fwd,target_right,pitch_target,yaw_rate,pitch_rate_cmd,yaw_rate_cmd,\
 sprint,stance,action_buttons,buttons,forwardmove,rightmove,cmd_pitch,cmd_yaw,\
 before_pm_flags,guess_error";
 
@@ -198,6 +209,22 @@ impl Driver {
 
 fn view_pitch(pitch: i32, delta: f32) -> f32 {
     angle_subtract(pitch as f32 * SHORT2ANGLE + delta, 0.0)
+}
+
+/// Command pitch one step toward `target` (degrees): the remaining difference
+/// shared over the action's remaining time, at most `PITCH_RATE_LIMIT_DPS`.
+/// A step that ends the action lands on the target.
+fn pitch_toward(current: i32, target: f32, delta: f32, msec: i32, remaining_ms: i32) -> i32 {
+    let target_units = ((target - delta) * ANGLE2SHORT).round() as i32;
+    let difference = i32::from(target_units.wrapping_sub(current) as i16);
+    let share = if remaining_ms > msec {
+        msec as f32 / remaining_ms as f32
+    } else {
+        1.0
+    };
+    let max_step = (PITCH_RATE_LIMIT_DPS * msec.max(0) as f32 * 0.001 * ANGLE2SHORT) as i32;
+    let step = ((difference as f32 * share).round() as i32).clamp(-max_step, max_step);
+    current.wrapping_add(step)
 }
 
 fn clamp_pitch(pitch: i32, delta: f32) -> i32 {
@@ -286,7 +313,11 @@ pub fn drive_command(
         server_time,
         msec,
     };
-    let Some(action) = driver.source.current(&tick) else {
+    let Some(Planned {
+        action,
+        remaining_ms,
+    }) = driver.source.current(&tick)
+    else {
         driver.exhausted = true;
         driver.flush();
         info!(
@@ -298,12 +329,24 @@ pub fn drive_command(
 
     let mut cmd = template.cmd;
     cmd.server_time = server_time;
-    let rate = [
-        action.rate[0].clamp(-PITCH_RATE_LIMIT_DPS, PITCH_RATE_LIMIT_DPS),
-        action.rate[1].clamp(-YAW_RATE_LIMIT_DPS, YAW_RATE_LIMIT_DPS),
-    ];
-    let mut angles = angles_after_rate(previous.angles, rate, msec);
-    angles[0] = clamp_pitch(angles[0], ps.delta_angles[0]);
+    let pitch_target = action
+        .pitch
+        .clamp(-PITCH_LIMIT_DEGREES, PITCH_LIMIT_DEGREES);
+    let yaw_rate = action
+        .yaw_rate
+        .clamp(-YAW_RATE_LIMIT_DPS, YAW_RATE_LIMIT_DPS);
+    let rate = [pitch_target, yaw_rate];
+    let mut angles = angles_after_rate(previous.angles, [0.0, yaw_rate], msec);
+    angles[0] = clamp_pitch(
+        pitch_toward(
+            previous.angles[0],
+            pitch_target,
+            ps.delta_angles[0],
+            msec,
+            remaining_ms,
+        ),
+        ps.delta_angles[0],
+    );
     cmd.angles = angles;
 
     let world = prediction.world();

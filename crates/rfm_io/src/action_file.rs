@@ -7,7 +7,7 @@ use std::path::Path;
 
 use playerstate_iw4::buttons;
 
-use crate::drive::{Action, ActionSource, DriveTick, Stance};
+use crate::drive::{Action, ActionSource, DriveTick, Planned, Stance};
 
 pub const BUTTON_COLUMNS: [(&str, u32); 10] = [
     ("attack", buttons::ATTACK),
@@ -24,7 +24,7 @@ pub const BUTTON_COLUMNS: [(&str, u32); 10] = [
 
 #[must_use]
 pub fn header() -> String {
-    let mut header = String::from("src_frame,t_ms,fwd,right,pitch_rate,yaw_rate,sprint,stance");
+    let mut header = String::from("src_frame,t_ms,fwd,right,pitch,yaw_rate,sprint,stance");
     for (name, _) in BUTTON_COLUMNS {
         header.push(',');
         header.push_str(name);
@@ -39,8 +39,8 @@ pub fn format_row(src_frame: u64, t_ms: i64, action: &Action) -> String {
         "{src_frame},{t_ms},{},{},{},{},{},{}",
         action.intended[0],
         action.intended[1],
-        action.rate[0],
-        action.rate[1],
+        action.pitch,
+        action.yaw_rate,
         u8::from(action.sprint),
         action.stance.name(),
     );
@@ -67,7 +67,7 @@ fn parse_rows(text: impl BufRead) -> Result<Vec<(i64, Action)>, String> {
         .enumerate()
         .map(|(i, name)| (name.trim(), i))
         .collect();
-    for required in ["t_ms", "fwd", "right", "pitch_rate", "yaw_rate"] {
+    for required in ["t_ms", "fwd", "right", "pitch", "yaw_rate"] {
         if !index.contains_key(required) {
             return Err(format!("missing column {required}"));
         }
@@ -121,7 +121,8 @@ fn parse_rows(text: impl BufRead) -> Result<Vec<(i64, Action)>, String> {
             t_ms,
             Action {
                 intended: [float("fwd")?, float("right")?],
-                rate: [float("pitch_rate")?, float("yaw_rate")?],
+                yaw_rate: float("yaw_rate")?,
+                pitch: float("pitch")?,
                 sprint: int("sprint")? != 0,
                 stance,
                 buttons: held,
@@ -165,7 +166,7 @@ impl ActionFile {
 }
 
 impl ActionSource for ActionFile {
-    fn current(&mut self, tick: &DriveTick) -> Option<Action> {
+    fn current(&mut self, tick: &DriveTick) -> Option<Planned> {
         let (first, _) = *self.actions.first()?;
         let step_start = i64::from(tick.server_time) - i64::from(tick.msec);
         let origin = *self.origin.get_or_insert(step_start - first);
@@ -182,10 +183,17 @@ impl ActionSource for ActionFile {
             n if n >= 2 => last - self.actions[n - 2].0,
             _ => 0,
         };
-        if self.cursor + 1 == self.actions.len() && t >= last + tail.max(1) {
+        let end = self
+            .actions
+            .get(self.cursor + 1)
+            .map_or(last + tail.max(1), |(next, _)| *next);
+        if self.cursor + 1 == self.actions.len() && t >= end {
             return None;
         }
-        Some(self.actions[self.cursor].1)
+        Some(Planned {
+            action: self.actions[self.cursor].1,
+            remaining_ms: i32::try_from(end - t).unwrap_or(i32::MAX),
+        })
     }
 
     fn cursor(&self) -> u64 {
