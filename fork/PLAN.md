@@ -10,7 +10,7 @@ Why we do any of this: [`GOALS.md`](GOALS.md).
 
 | task | status | branch | journal | whose move | next |
 |---|---|---|---|---|---|
-| Action and vision interfaces (survey → recorder) | active | `rfm-io` | [2026-11-09-io-survey](artifacts/2026-11-09-io-survey/README.md) | user | choose next: in-game inference adapter or video capture keyed by frame |
+| Action and vision interfaces (survey → recorder → inference adapter) | active | `rfm-io-adapter` | [2026-11-09-io-survey](artifacts/2026-11-09-io-survey/README.md) | user | adapter landed on its branch: decide per-command vs time-based replay and the model I/O for the next action source |
 
 `status`: planned | active | blocked | done | dropped.
 `whose move`: agent | user, matching the suffix of the journal's newest
