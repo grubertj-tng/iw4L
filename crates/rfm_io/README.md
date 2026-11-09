@@ -1,8 +1,10 @@
 # `rfm_io` — action interface for training models on the game
 
-Fork-only crate. It records the local player's actions frame by frame, and
+Fork-only crate. It records the local player's actions frame by frame,
+captures the rendered frames as video keyed by the same frame index, and
 converts between the game's commands and the action representation used for
-training. The game is unchanged unless `IW4L_RFM_RECORD` is set.
+training. The game is unchanged unless `IW4L_RFM_RECORD` or `IW4L_RFM_VIDEO`
+is set.
 
 ## Recording
 
@@ -17,6 +19,57 @@ The recorder writes **one row per main-world frame** (`Update` pass), in
 `FrameIndex`, so rows with the same index in different streams belong to the
 same frame. `cmd_new = 1` marks the frame's freshly built command. While the
 player is alive, every frame has one.
+
+## Video
+
+```bash
+IW4L_RFM_RECORD=$OUT/movement.csv IW4L_RFM_VIDEO=$OUT target/play/iw4l map mp_boneyard
+```
+
+`IW4L_RFM_VIDEO=<dir>` captures **every main-world frame** of the game window
+(world, HUD and Bevy UI, at the window's physical size) and writes:
+
+* `video.mp4`: H.264, one video frame per captured game frame, in `frame`
+  order, at a nominal constant rate (`IW4L_RFM_VIDEO_FPS`, default 60). The
+  file's clock is not the game's: real time is in `frames.csv`.
+* `video-<n>.mp4`: a new segment whenever the window's size or format changes
+  (the first frame of a launch is usually at the requested size, before the
+  window manager resizes the window, so the gameplay is normally in
+  `video-1.mp4`).
+* `frames.csv`: one row per encoded video frame:
+  `segment, video_frame, frame, real_s, presented_tick, latency_frames,
+  latency_ms`. `frame` is `FrameIndex` and joins `movement.csv`; `real_s` is
+  the same clock as the recorder's. `latency_*` is the time from the request
+  to the pixels arriving on the main thread.
+* `ffmpeg.log`: the encoder's warnings and errors.
+
+`IW4L_RFM_VIDEO_CODEC`: `nvenc` (default, `h264_nvenc`, the GPU converts to
+4:2:0), `x264` (`libx264`, `yuv420p`, CPU) or `lossless` (`libx264rgb -qp 0`,
+decodes to exactly the captured RGB; CPU-bound, for checks at small sizes).
+`IW4L_FFMPEG` overrides the `ffmpeg` binary.
+
+**Attribution.** Each frame spawns a Bevy `Screenshot` of the primary window in
+`Last`, tagged with that frame's `FrameIndex`. The screenshot is extracted with
+the world of the frame that spawned it, so the image is the render of exactly
+that frame; pipelining only delays when it is drawn, not what. Measured: the
+image of `frame` N shows the view angles of `movement.csv` row N, with and
+without pipelined rendering (journal: `fork/artifacts/2026-11-09-video-capture`).
+
+**Losses never block the game.** A frame is missing from `frames.csv` (a gap in
+`frame`) when: 8 readbacks are already in flight; the game takes its own
+screenshot that frame (Bevy captures one per window and frame); the encoder
+queue (8 frames) is full — typically the first second after a segment opens,
+while the encoder starts, and whenever frames come faster than ffmpeg takes
+them; or a readback did not return within 120 frames. The exit log line
+(`rfm_io: video in …`) counts each kind.
+
+**Cost.** Every frame is a full-window copy (3840×1531 BGRA is 23.5 MB) plus
+an extra full-screen pass. At 60 fps the frame time is unchanged within noise
+(median 16.6 → 16.6–17.0 ms) and nothing is lost after the first second.
+Uncapped, capture costs about 0.9 ms per frame at 1280×720 and 1.9 ms at
+3840×1531, and the encoder keeps up with ~220 fps at 720p but only ~80 fps at
+3840×1531, dropping the rest. Record with the frame rate capped and a window
+no larger than needed. Numbers: `fork/artifacts/2026-11-09-video-capture`.
 
 ## The action representation
 

@@ -11,6 +11,7 @@ Why we do any of this: [`GOALS.md`](GOALS.md).
 | task | status | branch | journal | whose move | next |
 |---|---|---|---|---|---|
 | Action and vision interfaces (survey → recorder) | active | `rfm-io` | [2026-11-09-io-survey](artifacts/2026-11-09-io-survey/README.md) | user | choose next: in-game inference adapter or video capture keyed by frame |
+| Video capture keyed by `FrameIndex` | active | `rfm-io-video` | [2026-11-09-video-capture](artifacts/2026-11-09-video-capture/README.md) | user | watch a recording; decide capture size and frame cap for dataset runs |
 
 `status`: planned | active | blocked | done | dropped.
 `whose move`: agent | user, matching the suffix of the journal's newest

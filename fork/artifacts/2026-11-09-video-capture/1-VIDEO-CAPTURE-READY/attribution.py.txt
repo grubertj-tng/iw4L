@@ -1,0 +1,52 @@
+"""Frame attribution check: per-video-frame image change vs. recorder view/origin change.
+
+usage: attribution.py <recording dir> [segment]
+Decodes the video downscaled to 192 px wide grey, computes mean |frame - previous frame|,
+joins frames.csv (video_frame -> FrameIndex) and movement.csv (FrameIndex -> view angles),
+and for every frame where the recorder's view angles jump, prints the image change around it.
+"""
+import subprocess, sys
+import numpy as np, pandas as pd
+
+d = sys.argv[1]
+seg = int(sys.argv[2]) if len(sys.argv) > 2 else None
+f = pd.read_csv(f"{d}/frames.csv")
+if seg is None:
+    seg = f.segment.value_counts().idxmax()
+f = f[f.segment == seg].reset_index(drop=True)
+name = "video.mp4" if seg == 0 else f"video-{seg}.mp4"
+W = 192
+probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries",
+                        "stream=width,height", "-of", "csv=p=0", f"{d}/{name}"],
+                       capture_output=True, text=True).stdout.strip().split(",")
+w, h = int(probe[0]), int(probe[1])
+H = int(round(h * W / w / 2) * 2)
+raw = subprocess.run(["ffmpeg", "-v", "error", "-i", f"{d}/{name}", "-vf", f"scale={W}:{H}",
+                      "-f", "rawvideo", "-pix_fmt", "gray", "-"], capture_output=True).stdout
+frames = np.frombuffer(raw, np.uint8).reshape(-1, H, W).astype(np.float32)
+assert len(frames) == len(f), (len(frames), len(f))
+diff = np.r_[np.nan, np.abs(np.diff(frames, axis=0)).mean(axis=(1, 2))]
+f["img_diff"] = diff
+m = pd.read_csv(f"{d}/movement.csv")
+j = f.merge(m[["frame", "view_yaw", "view_pitch", "origin_x", "origin_y", "cmd_yaw", "yaw_rate_dps", "pm_type"]],
+            on="frame", how="left")
+j["view_change"] = (j.view_yaw.diff().abs() > 1) | (j.view_pitch.diff().abs() > 1)
+j["frame_gap"] = j.frame.diff()
+alive = j[j.pm_type == 0]
+base = alive.img_diff[~alive.view_change].median()
+print(f"segment {seg}: {len(f)} video frames, {name} {w}x{h}; median img diff while view still: {base:.2f}")
+# isolated jumps: a view change with no view change in the 5 frames before
+ev = []
+for i in alive.index[alive.view_change]:
+    if i >= 5 and not j.view_change[i - 5:i].any():
+        ev.append(i)
+print(f"{len(ev)} isolated view-change onsets (recorder)")
+offsets = []
+for i in ev:
+    win = j.loc[i - 3:i + 4]
+    k = win.img_diff.idxmax()
+    offsets.append(int(j.frame[k] - j.frame[i]))
+    print(f"\nrecorder view change at FrameIndex {j.frame[i]} (yaw {j.view_yaw[i-1]:.1f}->{j.view_yaw[i]:.1f}, pitch {j.view_pitch[i-1]:.1f}->{j.view_pitch[i]:.1f})"
+          f"; largest image change at FrameIndex {j.frame[k]} -> offset {offsets[-1]:+d}")
+    print(win[["video_frame", "frame", "frame_gap", "view_yaw", "view_pitch", "yaw_rate_dps", "img_diff"]].to_string(index=False))
+print("\noffsets (image change FrameIndex - recorder change FrameIndex):", offsets)

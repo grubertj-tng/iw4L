@@ -1,0 +1,15 @@
+"""Frame time while alive, from movement.csv real_s. usage: cost.py <dir>..."""
+import sys, pandas as pd
+for d in sys.argv[1:]:
+    m = pd.read_csv(f"{d}/movement.csv")
+    dt = m.real_s.diff() * 1e3
+    a = dt[(m.ps_valid == 1) & (m.pm_type == 0)]
+    line = f"{d.split('/')[-1]:24s} alive frames {len(a):5d}  frame ms median {a.median():6.2f}  p90 {a.quantile(.9):6.2f}  p99 {a.quantile(.99):6.2f}  max {a.max():7.2f}  fps {1e3/a.mean():6.1f}"
+    try:
+        f = pd.read_csv(f"{d}/frames.csv")
+        fa = f[f.frame.isin(m.frame[(m.ps_valid == 1) & (m.pm_type == 0)])]
+        miss = len(a) + 1 - len(fa)
+        line += f"  | captured alive {len(fa)} missing {miss}  latency ms med {fa.latency_ms.median():.1f} p99 {fa.latency_ms.quantile(.99):.1f}  frames med {fa.latency_frames.median():.0f} max {fa.latency_frames.max()}"
+    except FileNotFoundError:
+        pass
+    print(line)
