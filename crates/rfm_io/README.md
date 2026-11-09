@@ -174,17 +174,22 @@ Per command:
 
 When the source runs out, the client's own input drives again.
 
-The action source is a trait (`ActionSource`: `current`, `advance`,
-`cursor`). `ActionFile` replays a CSV; a model behind a socket or shared memory
-implements the same trait.
+The action source is a trait (`ActionSource`: `current`, `cursor`). The
+adapter asks it every frame with the command's game time and step length, and
+it answers with the action valid at the **start of the command's step**
+(`server_time - msec`). Actions therefore follow game time, not frame count:
+a 1 s hold lasts 1 s at any frame rate. `ActionFile` replays a CSV; a model
+behind a socket or shared memory implements the same trait.
 
 ### Action file
 
-One row per command the sim runs, header by name, missing columns are 0:
+Rows in game time; each row holds from its `t_ms` until the next row's.
+Header by name; missing columns other than `t_ms` are 0:
 
 | column | meaning |
 |---|---|
 | `src_frame` | where the row came from (not used by the adapter) |
+| `t_ms` | start of the row, game milliseconds, non-decreasing. Replay starts at the first command driven |
 | `fwd`, `right` | intended velocity, u/s, player's yaw frame |
 | `pitch_rate`, `yaw_rate` | deg/s; positive pitch looks down, positive yaw turns left |
 | `sprint` | 0/1, sprint desired |
@@ -193,7 +198,10 @@ One row per command the sim runs, header by name, missing columns are 0:
 | `retrigger` | `UserCmd.buttons` bits that start a new activation |
 | `weapon` | weapon index, 0 keeps the client's selection |
 
-`rfm_actions <movement.csv> <actions.csv>` makes one from a recording.
+`rfm_actions <movement.csv> <actions.csv>` makes one from a recording: a row
+per recorded command at its step start, rates recomputed from the command
+angles (`RateTracker`). An idle row marks the start of each stretch where the
+player did not move (death, spectating).
 
 ### Drive log
 
@@ -224,6 +232,10 @@ Both scripts use the `context/venv` virtualenv (matplotlib, numpy, pandas).
 
 * **Frame and time:** `frame`, `perf_frame`, `real_s`, `cg_time_ms`,
   `presented_tick`.
+* **Input capture:** `input_captured` (1 when anything below takes the
+  player's input), `console_or_chat`, `script_menu`, `ui_overlay`,
+  `window_focused`. The LeRobot converter ends an episode where
+  `input_captured` is 1.
 * **Command:** `cmd_new`, `server_time_ms`, `cmd_msec`, `buttons`,
   `forwardmove`, `rightmove`, `cmd_pitch`, `cmd_yaw` (65536 units per turn),
   `cmd_weapon`.

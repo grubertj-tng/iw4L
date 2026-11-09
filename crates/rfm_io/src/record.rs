@@ -10,6 +10,7 @@ use crate::action::{Basis, IntendedTracker, RateTracker};
 use crate::{FrameIndex, weapon_scales};
 
 const HEADER: &str = "frame,perf_frame,real_s,cg_time_ms,presented_tick,\
+input_captured,console_or_chat,script_menu,ui_overlay,window_focused,\
 cmd_new,server_time_ms,cmd_msec,buttons,forwardmove,rightmove,cmd_pitch,cmd_yaw,cmd_weapon,\
 pitch_rate_dps,yaw_rate_dps,\
 ps_valid,pm_type,pm_flags,on_ground,origin_x,origin_y,origin_z,vel_x,vel_y,vel_z,\
@@ -62,6 +63,17 @@ fn horizontal(v: [f32; 3]) -> [f32; 2] {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Whether something other than the game has the player's input: the
+/// console or chat, a script menu, a UI overlay, or another window.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct InputCapture<'w> {
+    hud: Option<Res<'w, frame::HudInputView>>,
+    menus: hud::MenuState<'w>,
+    overlay: Option<Res<'w, frame::UiOverlayInput>>,
+    devices: Option<Res<'w, frame::InputDevices>>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn record_frame(
     mut rec: ResMut<MovementRecorder>,
     frame: Res<FrameIndex>,
@@ -70,6 +82,7 @@ pub fn record_frame(
     presented: Option<Res<PresentedSnapshot>>,
     local: Option<Res<LocalPresentClient>>,
     prediction: Option<Res<ClientPredictionState>>,
+    capture: InputCapture,
 ) {
     let prediction = prediction.as_deref().map(|p| &p.0);
     let ps = prediction
@@ -124,6 +137,17 @@ pub fn record_frame(
         None => push(&blank),
     }
 
+    let console_or_chat = capture.hud.as_deref().is_some_and(|h| h.console_open);
+    let script_menu = capture.menus.is_some_and(hud::ScriptMenus::captures_input);
+    let ui_overlay = capture.overlay.as_deref().is_some_and(|o| o.0);
+    let window_focused = capture.devices.as_deref().is_none_or(|d| d.focused);
+    push(&u8::from(
+        console_or_chat || script_menu || ui_overlay || !window_focused,
+    ));
+    push(&u8::from(console_or_chat));
+    push(&u8::from(script_menu));
+    push(&u8::from(ui_overlay));
+    push(&u8::from(window_focused));
     push(&u8::from(cmd_new));
     match cmd {
         Some(cmd) => {

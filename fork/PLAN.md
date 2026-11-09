@@ -10,7 +10,7 @@ Why we do any of this: [`GOALS.md`](GOALS.md).
 
 | task | status | branch | journal | whose move | next |
 |---|---|---|---|---|---|
-| Action and vision interfaces (survey → recorder → inference adapter → video → LeRobot) | active | `rfm-io` | [2026-11-09-io-survey](artifacts/2026-11-09-io-survey/README.md) | agent | cut menu/console/chat frames from episodes; open for the user: model input size, HUD, storage, adapter replay by command vs time |
+| Action and vision interfaces (survey → recorder → inference adapter → video → LeRobot) | active | `rfm-io` | [2026-11-09-io-survey](artifacts/2026-11-09-io-survey/README.md) | user | short focused session opening the pause menu to confirm the cut; then the user's movement-recording question; open: model input size, HUD |
 | Video capture keyed by `FrameIndex` | active | `rfm-io` | [2026-11-09-video-capture](artifacts/2026-11-09-video-capture/README.md) | user | watch a recording; decide capture size and frame cap for dataset runs |
 
 `status`: planned | active | blocked | done | dropped.

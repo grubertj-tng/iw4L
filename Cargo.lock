@@ -5894,6 +5894,7 @@ dependencies = [
  "bevy",
  "diag",
  "frame",
+ "hud",
  "math_iw4",
  "movement_iw4",
  "net",

@@ -1,4 +1,5 @@
-//! Actions as CSV, one row per command, in the interface's physical units.
+//! Actions as CSV in the interface's physical units. Each row holds from its
+//! `t_ms` (game time, ms) until the next row's.
 
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -23,7 +24,7 @@ pub const BUTTON_COLUMNS: [(&str, u32); 10] = [
 
 #[must_use]
 pub fn header() -> String {
-    let mut header = String::from("src_frame,fwd,right,pitch_rate,yaw_rate,sprint,stance");
+    let mut header = String::from("src_frame,t_ms,fwd,right,pitch_rate,yaw_rate,sprint,stance");
     for (name, _) in BUTTON_COLUMNS {
         header.push(',');
         header.push_str(name);
@@ -33,9 +34,9 @@ pub fn header() -> String {
 }
 
 #[must_use]
-pub fn format_row(src_frame: u64, action: &Action) -> String {
+pub fn format_row(src_frame: u64, t_ms: i64, action: &Action) -> String {
     let mut row = format!(
-        "{src_frame},{},{},{},{},{},{}",
+        "{src_frame},{t_ms},{},{},{},{},{},{}",
         action.intended[0],
         action.intended[1],
         action.rate[0],
@@ -55,7 +56,7 @@ pub fn format_row(src_frame: u64, action: &Action) -> String {
     row
 }
 
-fn parse_rows(text: impl BufRead) -> Result<Vec<Action>, String> {
+fn parse_rows(text: impl BufRead) -> Result<Vec<(i64, Action)>, String> {
     let mut lines = text.lines();
     let header = lines
         .next()
@@ -66,7 +67,7 @@ fn parse_rows(text: impl BufRead) -> Result<Vec<Action>, String> {
         .enumerate()
         .map(|(i, name)| (name.trim(), i))
         .collect();
-    for required in ["fwd", "right", "pitch_rate", "yaw_rate"] {
+    for required in ["t_ms", "fwd", "right", "pitch_rate", "yaw_rate"] {
         if !index.contains_key(required) {
             return Err(format!("missing column {required}"));
         }
@@ -109,30 +110,47 @@ fn parse_rows(text: impl BufRead) -> Result<Vec<Action>, String> {
             }
         }
         let weapon = int("weapon")?;
-        actions.push(Action {
-            intended: [float("fwd")?, float("right")?],
-            rate: [float("pitch_rate")?, float("yaw_rate")?],
-            sprint: int("sprint")? != 0,
-            stance,
-            buttons: held,
-            retrigger: int("retrigger")?,
-            weapon: (weapon != 0).then_some(weapon as u16),
-        });
+        let t_ms: i64 = at("t_ms")
+            .ok_or(format!("line {row}: missing t_ms"))?
+            .parse()
+            .map_err(|_| format!("line {row}: bad t_ms"))?;
+        if actions.last().is_some_and(|(last, _)| *last > t_ms) {
+            return Err(format!("line {row}: t_ms goes backwards"));
+        }
+        actions.push((
+            t_ms,
+            Action {
+                intended: [float("fwd")?, float("right")?],
+                rate: [float("pitch_rate")?, float("yaw_rate")?],
+                sprint: int("sprint")? != 0,
+                stance,
+                buttons: held,
+                retrigger: int("retrigger")?,
+                weapon: (weapon != 0).then_some(weapon as u16),
+            },
+        ));
     }
     Ok(actions)
 }
 
-/// Replays an action file, one row per command the sim runs.
+/// Replays an action file by game time: a command gets the row valid at the
+/// start of its step, counted from the first command driven. Durations follow
+/// game time whatever the frame rate.
 pub struct ActionFile {
-    actions: Vec<Action>,
+    actions: Vec<(i64, Action)>,
     cursor: usize,
+    origin: Option<i64>,
 }
 
 impl ActionFile {
     pub fn load(path: &Path) -> Result<Self, String> {
         let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
         let actions = parse_rows(std::io::BufReader::new(file))?;
-        Ok(Self { actions, cursor: 0 })
+        Ok(Self {
+            actions,
+            cursor: 0,
+            origin: None,
+        })
     }
 
     #[must_use]
@@ -147,12 +165,27 @@ impl ActionFile {
 }
 
 impl ActionSource for ActionFile {
-    fn current(&mut self, _tick: &DriveTick) -> Option<Action> {
-        self.actions.get(self.cursor).copied()
-    }
-
-    fn advance(&mut self) {
-        self.cursor += 1;
+    fn current(&mut self, tick: &DriveTick) -> Option<Action> {
+        let (first, _) = *self.actions.first()?;
+        let step_start = i64::from(tick.server_time) - i64::from(tick.msec);
+        let origin = *self.origin.get_or_insert(step_start - first);
+        let t = step_start - origin;
+        while self
+            .actions
+            .get(self.cursor + 1)
+            .is_some_and(|(next, _)| *next <= t)
+        {
+            self.cursor += 1;
+        }
+        let (last, _) = *self.actions.last()?;
+        let tail = match self.actions.len() {
+            n if n >= 2 => last - self.actions[n - 2].0,
+            _ => 0,
+        };
+        if self.cursor + 1 == self.actions.len() && t >= last + tail.max(1) {
+            return None;
+        }
+        Some(self.actions[self.cursor].1)
     }
 
     fn cursor(&self) -> u64 {

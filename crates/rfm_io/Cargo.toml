@@ -9,6 +9,7 @@ description = "Action and observation interfaces for training models on the game
 bevy.workspace = true
 diag.workspace = true
 frame.workspace = true
+hud.workspace = true
 math_iw4.workspace = true
 movement_iw4.workspace = true
 net.workspace = true

@@ -23,7 +23,10 @@ the next step's frame:
   * momentary buttons (jump, reload, melee, frag, smoke, use): pressed at any
     command in the step.
 Episodes are lives: contiguous runs of commands while the player moves, split
-at respawns (a change of delta_angles) and deaths.
+at respawns (a change of delta_angles) and deaths, and ended whenever something
+else has the input (menu, console, chat, another window: `input_captured`);
+play after it starts a new episode. Episodes shorter than --min-seconds are
+dropped.
 """
 
 import argparse
@@ -65,6 +68,10 @@ def load(session: Path) -> pd.DataFrame:
 
 def episodes(cmds: pd.DataFrame):
     alive = cmds.moving == 1
+    if "input_captured" in cmds:
+        alive &= cmds.input_captured == 0
+    else:
+        print("note: recording has no input_captured column; menus are not cut")
     respawn = (cmds.delta_yaw != cmds.delta_yaw.shift()) | (cmds.delta_pitch != cmds.delta_pitch.shift())
     breaks = (~alive) | respawn
     seg = breaks.cumsum()
@@ -142,6 +149,7 @@ def main():
     ap.add_argument("--fps", type=int, default=20)
     ap.add_argument("--repo-id", default="local/iw4l")
     ap.add_argument("--task", default="Play free-for-all against bots on mp_boneyard.")
+    ap.add_argument("--min-seconds", type=float, default=1.0)
     ap.add_argument("--image-size", default="256x144")
     ap.add_argument("--image-mode", default="fit", choices=["fit", "stretch"])
     ap.add_argument("--no-video", action="store_true")
@@ -153,7 +161,8 @@ def main():
 
     spec = ImageSpec.parse(args.image_size, args.image_mode)
     cmds = load(args.session)
-    eps = [steps for steps in (resample(ep, args.fps) for ep in episodes(cmds)) if len(steps) >= 2]
+    min_steps = max(2, round(args.min_seconds * args.fps))
+    eps = [steps for steps in (resample(ep, args.fps) for ep in episodes(cmds)) if len(steps) >= min_steps]
     images = {}
     if not args.no_video:
         wanted = [frame for steps in eps for frame, _, _ in steps]

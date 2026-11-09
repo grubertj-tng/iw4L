@@ -123,12 +123,11 @@ pub struct DriveTick {
 }
 
 /// Where actions come from. The adapter asks every frame while the player
-/// moves; the action of the last call before the sim runs the command is the
-/// one in it, and `advance` follows.
+/// moves, with the game time of the command it builds; a source answers with
+/// the action valid at the start of that command's step (`server_time -
+/// msec`), or `None` when it has no more.
 pub trait ActionSource: Send + Sync + 'static {
     fn current(&mut self, tick: &DriveTick) -> Option<Action>;
-
-    fn advance(&mut self);
 
     /// Position of the current action in the source, for the drive log.
     fn cursor(&self) -> u64;
@@ -419,7 +418,6 @@ pub fn commit_command(
     driver.deferred = built.deferred;
     driver.driven += 1;
     let cursor = driver.source.cursor();
-    driver.source.advance();
 
     let Some(log) = driver.log.as_mut() else {
         return;
