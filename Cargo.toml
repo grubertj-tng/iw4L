@@ -63,6 +63,7 @@ members = [
     "crates/render_material",
     "crates/render_scene",
     "crates/replay",
+    "crates/rfm_io",
     "crates/theater",
     "crates/session",
     "crates/sim",
@@ -170,6 +171,7 @@ render_material = { path = "crates/render_material" }
 render_scene = { path = "crates/render_scene" }
 session = { path = "crates/session" }
 replay = { path = "crates/replay" }
+rfm_io = { path = "crates/rfm_io" }
 theater = { path = "crates/theater" }
 sim = { path = "crates/sim" }
 trace_iw4 = { path = "crates/trace_iw4" }

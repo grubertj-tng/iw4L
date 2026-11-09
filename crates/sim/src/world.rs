@@ -2727,7 +2727,8 @@ impl SimState {
         self.events.push_pellet_fx(record);
     }
 
-    pub(crate) fn scales_for(&self, weapon: u32) -> (f32, f32, f32) {
+    // fork: public so rfm_io can read the weapon's move scales (intended velocity).
+    pub fn scales_for(&self, weapon: u32) -> (f32, f32, f32) {
         self.content
             .weapons()
             .weapon_def_scales

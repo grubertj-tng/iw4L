@@ -2202,6 +2202,7 @@ dependencies = [
  "render_frontend",
  "render_gpu",
  "replay",
+ "rfm_io",
  "serde_json",
  "session",
  "sha2",
@@ -5884,6 +5885,20 @@ dependencies = [
  "wayland-protocols",
  "web-sys",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rfm_io"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "frame",
+ "math_iw4",
+ "movement_iw4",
+ "net",
+ "perf",
+ "playerstate_iw4",
+ "sim",
 ]
 
 [[package]]

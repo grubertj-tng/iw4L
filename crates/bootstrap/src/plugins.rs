@@ -46,7 +46,8 @@ pub fn add_runtime_plugins_with_role(app: &mut App, role: RuntimeRole) {
         .add_plugins(ReplayPlugin)
         .add_plugins(theater::TheaterPlugin)
         .add_plugins(RenderPlugin)
-        .add_plugins(SessionPlugin);
+        .add_plugins(SessionPlugin)
+        .add_plugins(rfm_io::RfmIoPlugin);
 
     if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
         // Measured: multithreaded render schedules compete with camera prepare's own
