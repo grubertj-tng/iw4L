@@ -1,9 +1,8 @@
 # Setting up IW4L from our fork (agent runbook)
 
 Read this file top to bottom and run the steps on a Linux machine. The fork is
-`grubertj-tng/iw4L`; `master` here is plain IW4L, identical to upstream
-`vladtrc/iw4L`. The Unitree G1 robot work lives on the `g1-robot` branch (last
-section), not on `master`.
+`grubertj-tng/iw4L`; `master` is upstream `vladtrc/iw4L` plus our own work. How
+agents work in this repository is in `AGENTS.md`.
 
 ## 1. System packages
 
@@ -39,8 +38,6 @@ Then, once:
 ```bash
 git remote add upstream https://github.com/vladtrc/iw4L.git
 git remote set-url --push upstream DISABLED        # nothing may be pushed to the original project
-git config user.name "Jakob Grubert"
-git config user.email "jakob.grubert@tngtech.com"
 ```
 
 ## 4. Game data
@@ -87,27 +84,8 @@ process ended with `process_exit … code=0`.
 Optional checks: `make publish-check` and `cargo clippy --workspace --all-targets`.
 The repo forbids unit tests in tracked files, so there is no `cargo test` step.
 
-## 7. The G1 robot (branch `g1-robot`, optional)
-
-It is not on `master`. To use it:
-
-```bash
-git checkout g1-robot
-git clone --depth 1 --filter=blob:none --sparse https://github.com/unitreerobotics/unitree_ros.git context/externals/unitree_ros
-git -C context/externals/unitree_ros sparse-checkout set robots/g1_description
-```
-
-Add to `.env` (absolute path):
-
-```bash
-IW4L_ROBOT_URDF=/…/iw4L/context/externals/unitree_ros/robots/g1_description/g1_29dof_rev_1_0.urdf
-IW4L_ROBOT_BODY=all      # optional: all | allies | axis, those soldiers are robots
-IW4L_ROBOT_PROP=off      # optional: no standing robot in front of the spawn
-```
-
-Run the same `make map` command. `latest.log` then has `urdf robot …` lines.
-`docs/ROBOT.md` explains the rest. The meshes live under `context/`, which git
-ignores, so every machine fetches them itself.
+`context/` is machine-local and starts empty on a new machine; the task
+journals in `fork/artifacts/` come with the clone.
 
 ## Traps
 
@@ -116,7 +94,6 @@ ignores, so every machine fetches them itself.
 * For screenshot or test runs, point `IW4L_SETTINGS_PATH`,
   `IW4L_ACCOUNT_PATH` and `IW4L_PROFILE_PATH` at scratch files. Otherwise
   commands like `thirdperson 1` are saved into `~/.config/iw4l/settings.cfg`.
-* Every machine in a multiplayer match must run the same build and the same
-  `IW4L_ROBOT_*` settings.
-* Pull upstream changes with `git fetch upstream && git merge --ff-only upstream/master`
+* Every machine in a multiplayer match must run the same build.
+* Pull upstream changes with `git fetch upstream && git merge upstream/master`
   on `master`; never push to `upstream`.
